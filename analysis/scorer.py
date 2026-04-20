@@ -123,7 +123,7 @@ def score_contract(iv: float, rv: float, vol_oi_ratio: float, dte: int) -> float
 def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | None]:
     symbol = symbol.upper().strip()
 
-    eligible, cap = check_market_cap(symbol)
+    eligible, cap, company_name = check_market_cap(symbol)
     if not eligible:
         cap_fmt = f"${cap/1e9:.2f}B" if cap >= 1e9 else f"${cap/1e6:.0f}M"
         return None, [], f"{symbol} market cap ({cap_fmt}) is below the $100M minimum"
@@ -198,6 +198,7 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
 
         rows.append({
             "symbol": symbol,
+            "company_name": company_name,
             "type": row["type"],
             "strike": float(row["strike"]),
             "expiry": row["expiry"],

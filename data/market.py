@@ -6,19 +6,22 @@ from datetime import datetime
 MIN_MARKET_CAP = 100_000_000  # $100M
 
 
-def get_market_cap(symbol: str) -> float | None:
+def get_ticker_meta(symbol: str) -> tuple[float | None, str]:
+    """Single info call returning (market_cap, company_name). Avoids duplicate API hits."""
     try:
         info = yf.Ticker(symbol).info
-        return info.get("marketCap") or info.get("market_cap")
+        cap = info.get("marketCap") or info.get("market_cap")
+        name = info.get("longName") or info.get("shortName") or symbol
+        return cap, name
     except Exception:
-        return None
+        return None, symbol
 
 
-def check_market_cap(symbol: str) -> tuple[bool, float | None]:
-    cap = get_market_cap(symbol)
+def check_market_cap(symbol: str) -> tuple[bool, float | None, str]:
+    cap, name = get_ticker_meta(symbol)
     if cap is None:
-        return True, None  # can't confirm, allow through
-    return cap >= MIN_MARKET_CAP, cap
+        return True, None, name
+    return cap >= MIN_MARKET_CAP, cap, name
 
 
 def get_current_price(symbol: str) -> float | None:
