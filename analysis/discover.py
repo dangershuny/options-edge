@@ -68,7 +68,7 @@ def _quick_scan_ticker(symbol: str, prices: pd.Series) -> dict | None:
     }
 
 
-def run_discovery(top_n: int = 20, max_workers: int = 12) -> pd.DataFrame:
+def run_discovery(top_n: int = 10, max_workers: int = 12) -> pd.DataFrame:
     """
     Scan the universe and return the top_n tickers ranked by
     absolute IV vs RV mismatch.

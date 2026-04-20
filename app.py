@@ -99,19 +99,13 @@ tab_watchlist, tab_discover = st.tabs(["📋 Watchlist", "🔭 Discover"])
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_discover:
     st.markdown(
-        "Scans ~100 high-liquidity tickers and surfaces the biggest mismatches "
-        "between implied vol and what the market has actually been doing. "
-        "Takes ~60–90 seconds."
+        "Scans ~100 high-liquidity tickers. Returns the **top 10** by IV vs RV mismatch — "
+        "each with the **top 3 contracts** for full analysis. Takes ~60–90 seconds."
     )
-    dcol1, dcol2 = st.columns([1, 3])
-    with dcol1:
-        top_n = st.number_input("Top N results", min_value=5, max_value=50, value=20, step=5)
-    with dcol2:
-        st.caption(" ")  # vertical align
 
     if st.button("🔭 Run Discovery Scan", type="primary"):
         with st.spinner("Batch-downloading price history and scanning options chains…"):
-            disc_df = run_discovery(top_n=int(top_n))
+            disc_df = run_discovery(top_n=10)
 
         if disc_df.empty:
             st.error("Discovery scan returned no results. Try again later.")

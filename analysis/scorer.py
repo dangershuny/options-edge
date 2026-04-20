@@ -219,5 +219,10 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             **trade,
         })
 
-    result_df = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    result_df = (
+        pd.DataFrame(rows)
+        .sort_values("score", ascending=False)
+        .head(3)
+        .reset_index(drop=True)
+    )
     return result_df, news, None
