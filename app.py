@@ -8,6 +8,7 @@ from analysis.discover import run_discovery
 from data.news import news_tool_status
 from data.macro import get_vix_context, reset_cache as reset_vix_cache
 from sentinel_bridge import sentinel_status
+from risk.config import RISK
 
 WATCHLIST_FILE = "watchlist.json"
 
@@ -106,6 +107,14 @@ with st.sidebar:
         st.markdown("**Tickers:**")
         for t in watchlist:
             st.markdown(f"• `{t}`")
+
+    st.divider()
+    st.subheader("Risk Settings")
+    st.caption(f"Portfolio: **${RISK['portfolio_size']:,}**")
+    st.caption(f"Max risk / trade: **${RISK['max_cost_per_trade']}**")
+    st.caption(f"Max total open risk: **${RISK['max_total_open_risk']:,}**")
+    st.caption(f"Min score to trade: **{RISK['min_score_to_trade']}**")
+    st.caption("Edit `risk/config.py` to adjust limits")
 
     st.divider()
     st.caption("**Signal guide**")
@@ -301,6 +310,16 @@ with tab_watchlist:
             st.caption(f"Score: **{score_str}**  |  Flow: **{row['flow_signal']}**")
             if detail_line:
                 st.caption(detail_line)
+            # Sizing recommendation
+            n_ct  = row.get("suggested_contracts")
+            r_dlr = row.get("suggested_risk_dollar")
+            if n_ct and r_dlr:
+                ct_label = f"{n_ct} contract{'s' if n_ct != 1 else ''}"
+                trade_ok = score_str and float(row["score"]) >= RISK["min_score_to_trade"]
+                if trade_ok:
+                    st.caption(f"📐 Size: **{ct_label}** (~${r_dlr:.0f} at risk)")
+                else:
+                    st.caption(f"📐 Size: {ct_label} — ⚠️ score below auto-trade threshold")
             if div_flag != "—":
                 if sent_dlt > 0:
                     st.success(f"{div_flag} — aligns ↑ {sent_dlt:+.0f} pts", icon=None)

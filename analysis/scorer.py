@@ -9,6 +9,7 @@ from analysis.skew import calculate_skew
 from analysis.gamma import calculate_gex
 from analysis.earnings_vol import analyze_earnings_edge
 from sentinel_bridge import get_divergence, divergence_score_adjustment
+from risk.sizer import size_trade
 
 
 OTM_LIMIT = 0.10
@@ -258,6 +259,10 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
         sentiment_delta = divergence_score_adjustment(divergence, vol_signal)
         final_score = round(min(max(base_score + sentiment_delta, 0), 100), 1)
 
+        # Position sizing (uses max_loss from trade detail)
+        max_loss = trade.get("max_loss_per_contract") or 0
+        sizing = size_trade(max_loss_per_contract=max_loss, score=final_score) if max_loss > 0 else None
+
         divergence_flag = "—"
         if divergence and divergence.get("direction"):
             if divergence["direction"] == "bearish_divergence":
@@ -299,6 +304,10 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             "gex_summary":   gex.get("gex_summary", "—"),
             "gamma_wall":    gex.get("gamma_wall"),
             "gamma_flip":    gex.get("gamma_flip"),
+            # Position sizing
+            "suggested_contracts": sizing["contracts"] if sizing else None,
+            "suggested_risk_dollar": sizing["risk_dollar"] if sizing else None,
+            "sizing_rationale": sizing["rationale"] if sizing else "—",
             **trade,
         })
 
