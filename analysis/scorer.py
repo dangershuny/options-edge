@@ -2,9 +2,10 @@ import pandas as pd
 from datetime import datetime
 
 from data.market import get_current_price, get_historical_prices, get_options_chain, check_market_cap
+from data.news import get_news
 from analysis.vol import calculate_rv, iv_rv_signal, iv_percentile_label
 from analysis.flow import enrich_flow, classify_flow
-from sentinel_bridge import scan_ticker, divergence_score_adjustment
+from sentinel_bridge import get_divergence, divergence_score_adjustment
 
 
 OTM_LIMIT = 0.10
@@ -128,33 +129,12 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
     if err:
         return None, [], err
 
-    # Trigger news sentinel scan (uses cached DB data if fresh)
-    sentinel_data = scan_ticker(symbol)
-    divergence = sentinel_data["divergence"]
+    news = get_news(symbol)
 
-    # Build news list from sentinel articles for display in app
-    news = []
-    for a in sentinel_data["articles"]:
-        news.append({
-            "title": a["headline"],
-            "link": a["url"] or "",
-            "published": a["published_at"],
-            "summary": (a["body"] or "")[:250] if a.get("body") else "",
-            "sentiment_score": a["sentiment_score"],
-            "sentiment_label": a["sentiment_label"],
-        })
-    # Add social posts to news list
-    for p in sentinel_data["social"]:
-        news.append({
-            "title": f"[{p['platform'].upper()}] {p['text'][:120]}",
-            "link": p["url"] or "",
-            "published": p["published_at"],
-            "summary": "",
-            "sentiment_score": p["sentiment_score"],
-            "sentiment_label": p["sentiment_label"],
-        })
+    # Pull divergence from news sentinel (non-blocking — returns {} if server offline)
+    divergence = get_divergence(symbol)
 
-    # Filter options chain
+    # Filter: ATM range, DTE, volume
     lower = price * (1 - OTM_LIMIT)
     upper = price * (1 + OTM_LIMIT)
     chain = chain[
@@ -209,11 +189,10 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
         final_score = round(min(max(base_score + sentiment_delta, 0), 100), 1)
 
         divergence_flag = "—"
-        if divergence:
-            direction = divergence["direction"]
-            if direction == "bearish_divergence":
+        if divergence and divergence.get("direction"):
+            if divergence["direction"] == "bearish_divergence":
                 divergence_flag = "⚠️ BEAR DIV"
-            elif direction == "bullish_divergence":
+            elif divergence["direction"] == "bullish_divergence":
                 divergence_flag = "📈 BULL DIV"
 
         rows.append({
@@ -241,5 +220,10 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             **trade,
         })
 
-    result_df = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    result_df = (
+        pd.DataFrame(rows)
+        .sort_values("score", ascending=False)
+        .head(3)
+        .reset_index(drop=True)
+    )
     return result_df, news, None
