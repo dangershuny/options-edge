@@ -3,8 +3,11 @@ from datetime import datetime
 
 from data.market import get_current_price, get_historical_prices, get_options_chain, check_market_cap
 from data.news import get_news
-from analysis.vol import calculate_rv, iv_rv_signal, iv_percentile_label
+from analysis.vol import calculate_rv, iv_rv_signal, iv_percentile_label, iv_rank
 from analysis.flow import enrich_flow, classify_flow
+from analysis.skew import calculate_skew
+from analysis.gamma import calculate_gex
+from analysis.earnings_vol import analyze_earnings_edge
 from sentinel_bridge import get_divergence, divergence_score_adjustment
 
 
@@ -88,20 +91,73 @@ def _spread_trade_detail(short_row: pd.Series, long_row: pd.Series) -> dict:
     }
 
 
-def score_contract(iv: float, rv: float, vol_oi_ratio: float, dte: int) -> float:
-    vol_signal, _, vol_strength = iv_rv_signal(iv, rv)
+def score_contract(
+    iv: float,
+    rv: float,
+    vol_oi_ratio: float,
+    dte: int,
+    skew: dict | None = None,
+    gex: dict | None = None,
+    ivr: dict | None = None,
+    vol_signal: str = "NEUTRAL",
+) -> float:
+    """
+    Composite score 0–100.
+
+    Base components (unchanged):
+      vol mismatch × 50 pts
+      flow signal   up to 35 pts
+      DTE bonus     up to 10 pts
+
+    New enhancement bonuses (additive, capped at 100 total):
+      +8  IV rank confirms signal direction
+      +7  skew direction aligns with vol signal
+      +5  GEX EXPLOSIVE regime (dealers amplify moves → options plays pay more)
+      -5  GEX PINNED (price clamped by gamma wall → opts may expire worthless)
+    """
+    vol_sig, _, vol_strength = iv_rv_signal(iv, rv)
     flow_sig = classify_flow(vol_oi_ratio)
+
     score = 0.0
-    if vol_signal != "NEUTRAL":
+
+    # ── Base ──────────────────────────────────────────────────────────────────
+    if vol_sig != "NEUTRAL":
         score += vol_strength * 50
+
     if flow_sig == "STRONG":
         score += 35
     elif flow_sig == "ELEVATED":
         score += 15
+
     if 21 <= dte <= 45:
         score += 10
     elif 14 <= dte <= 60:
         score += 5
+
+    # ── IV rank alignment ─────────────────────────────────────────────────────
+    if ivr and ivr.get("iv_rank") is not None:
+        rank = ivr["iv_rank"]
+        if vol_signal == "BUY VOL" and rank < 0.30:
+            score += 8   # IV cheap historically → confirms buy-vol thesis
+        elif vol_signal == "SELL VOL" and rank > 0.70:
+            score += 8   # IV rich historically → confirms sell-vol thesis
+
+    # ── Skew alignment ────────────────────────────────────────────────────────
+    if skew:
+        skew_sig = skew.get("skew_signal", "NEUTRAL")
+        if vol_signal == "BUY VOL" and skew_sig == "BULLISH":
+            score += 7
+        elif vol_signal == "SELL VOL" and skew_sig == "BEARISH":
+            score += 7
+
+    # ── GEX regime ────────────────────────────────────────────────────────────
+    if gex:
+        g_sig = gex.get("gex_signal", "NEUTRAL")
+        if g_sig == "EXPLOSIVE":
+            score += 5   # moves amplify → long options pay
+        elif g_sig == "PINNED":
+            score -= 5   # gamma wall suppresses movement
+
     return round(min(score, 100), 1)
 
 
@@ -125,23 +181,35 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
     if rv is None:
         return None, [], f"Not enough price history to calculate realized vol for {symbol}"
 
-    chain, earnings_date, err = get_options_chain(symbol)
+    # IV rank (uses full price history)
+    ivr = iv_rank(rv, prices)   # uses current rv as the IV proxy for ranking
+
+    chain_filtered, earnings_date, err = get_options_chain(symbol)
     if err:
         return None, [], err
 
-    news = get_news(symbol)
+    # Need full unfiltered chain for skew + GEX + earnings edge
+    # get_options_chain already filters earnings-adjacent expiries but keeps all strikes
+    chain_full = chain_filtered.copy()
 
-    # Pull divergence from news sentinel (non-blocking — returns {} if server offline)
+    news = get_news(symbol)
     divergence = get_divergence(symbol)
 
-    # Filter: ATM range, DTE, volume
+    # ── Skew + GEX from full chain ─────────────────────────────────────────────
+    skew = calculate_skew(chain_full, price)
+    gex  = calculate_gex(chain_full, price)
+
+    # ── Earnings edge ─────────────────────────────────────────────────────────
+    earnings_edge = analyze_earnings_edge(symbol, chain_full, price, earnings_date)
+
+    # ── Filter chain for tradeable contracts ──────────────────────────────────
     lower = price * (1 - OTM_LIMIT)
     upper = price * (1 + OTM_LIMIT)
-    chain = chain[
-        (chain["strike"] >= lower) &
-        (chain["strike"] <= upper) &
-        (chain["dte"] >= MIN_DTE) &
-        (chain["dte"] <= MAX_DTE)
+    chain = chain_filtered[
+        (chain_filtered["strike"] >= lower) &
+        (chain_filtered["strike"] <= upper) &
+        (chain_filtered["dte"] >= MIN_DTE) &
+        (chain_filtered["dte"] <= MAX_DTE)
     ].copy()
 
     chain = chain[chain["impliedVolatility"].notna() & (chain["impliedVolatility"] > 0.001)]
@@ -184,7 +252,9 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             trade["trade_detail"] = "—"
             action = "WATCH"
 
-        base_score = score_contract(iv, rv, vol_oi, dte)
+        base_score = score_contract(iv, rv, vol_oi, dte,
+                                    skew=skew, gex=gex, ivr=ivr,
+                                    vol_signal=vol_signal)
         sentiment_delta = divergence_score_adjustment(divergence, vol_signal)
         final_score = round(min(max(base_score + sentiment_delta, 0), 100), 1)
 
@@ -196,35 +266,48 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
                 divergence_flag = "📈 BULL DIV"
 
         rows.append({
-            "symbol": symbol,
-            "company_name": company_name,
-            "type": row["type"],
-            "strike": float(row["strike"]),
-            "expiry": row["expiry"],
-            "dte": dte,
-            "stock_price": round(price, 2),
-            "bid": round(float(row.get("bid") or 0), 2),
-            "ask": round(float(row.get("ask") or 0), 2),
-            "iv_pct": round(iv * 100, 1),
-            "rv_pct": round(rv * 100, 1),
-            "iv_rv_spread": round(iv_rv_spread * 100, 1),
-            "vol_signal": vol_signal,
-            "action": action,
-            "volume": int(row["volume"]),
+            "symbol":        symbol,
+            "company_name":  company_name,
+            "type":          row["type"],
+            "strike":        float(row["strike"]),
+            "expiry":        row["expiry"],
+            "dte":           dte,
+            "stock_price":   round(price, 2),
+            "bid":           round(float(row.get("bid") or 0), 2),
+            "ask":           round(float(row.get("ask") or 0), 2),
+            "iv_pct":        round(iv * 100, 1),
+            "rv_pct":        round(rv * 100, 1),
+            "iv_rv_spread":  round(iv_rv_spread * 100, 1),
+            "vol_signal":    vol_signal,
+            "action":        action,
+            "volume":        int(row["volume"]),
             "open_interest": int(row["openInterest"]),
-            "vol_oi_ratio": vol_oi,
-            "flow_signal": row["flow_signal"],
-            "score": final_score,
+            "vol_oi_ratio":  vol_oi,
+            "flow_signal":   row["flow_signal"],
+            "score":         final_score,
             "sentiment_delta": sentiment_delta,
             "divergence_flag": divergence_flag,
-            "earnings": earnings_date.strftime("%Y-%m-%d") if earnings_date else "—",
+            "earnings":      earnings_date.strftime("%Y-%m-%d") if earnings_date else "—",
+            # ── New surface / regime data ──────────────────────────────────────
+            "iv_rank_label": ivr.get("iv_rank_label", "N/A"),
+            "iv_rank":       ivr.get("iv_rank"),
+            "skew_signal":   skew.get("skew_signal", "NEUTRAL"),
+            "skew_summary":  skew.get("skew_summary", "—"),
+            "pc_ratio":      skew.get("pc_ratio"),
+            "risk_reversal": skew.get("risk_reversal"),
+            "gex_signal":    gex.get("gex_signal", "NEUTRAL"),
+            "gex_summary":   gex.get("gex_summary", "—"),
+            "gamma_wall":    gex.get("gamma_wall"),
+            "gamma_flip":    gex.get("gamma_flip"),
             **trade,
         })
 
+    # Attach earnings edge at ticker level (same for all contracts of this ticker)
     result_df = (
         pd.DataFrame(rows)
         .sort_values("score", ascending=False)
         .head(3)
         .reset_index(drop=True)
     )
-    return result_df, news, None
+
+    return result_df, news, None, earnings_edge

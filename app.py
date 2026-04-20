@@ -6,6 +6,7 @@ import pandas as pd
 from analysis.scorer import analyze_ticker
 from analysis.discover import run_discovery
 from data.news import news_tool_status
+from data.macro import get_vix_context, reset_cache as reset_vix_cache
 from sentinel_bridge import sentinel_status
 
 WATCHLIST_FILE = "watchlist.json"
@@ -35,7 +36,7 @@ st.markdown("""
 def load_watchlist() -> list[str]:
     if os.path.exists(WATCHLIST_FILE):
         try:
-            with open(WATCHLIST_FILE) as f:
+            with open(WATCHLIST_FILE, encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
@@ -43,7 +44,7 @@ def load_watchlist() -> list[str]:
 
 
 def save_watchlist(tickers: list[str]) -> None:
-    with open(WATCHLIST_FILE, "w") as f:
+    with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
         json.dump(tickers, f)
 
 
@@ -53,6 +54,35 @@ with st.sidebar:
     st.caption("IV vs RV · Unusual Flow · Sentiment Divergence")
     st.divider()
 
+    # ── Market context (VIX) ─────────────────────────────────────────────────
+    vix_ctx = get_vix_context()
+    regime  = vix_ctx["regime"]
+    vix_val = vix_ctx["vix"]
+
+    regime_color = {
+        "LOW": "🟢", "NORMAL": "⚪", "ELEVATED": "🟡", "FEAR": "🔴", "UNKNOWN": "⚫",
+    }.get(regime, "⚫")
+
+    st.subheader("Market Context")
+    if vix_val:
+        st.markdown(f"{regime_color} **VIX {vix_val:.1f}** — {regime}")
+        if vix_ctx.get("vix9d"):
+            slope = vix_ctx["term_slope"] or 0
+            struct = "backwardation ⚠️" if slope < -2 else ("contango" if slope > 2 else "flat")
+            st.caption(f"VIX9D {vix_ctx['vix9d']:.1f}  ·  term {struct}")
+        lean = vix_ctx["lean"]
+        if lean == "BUY VOL":
+            st.caption("Regime lean: **buy vol / long options**")
+        elif lean == "SELL VOL":
+            st.caption("Regime lean: **sell vol / credit spreads**")
+    else:
+        st.caption("VIX unavailable")
+
+    if st.button("🔄 Refresh VIX", use_container_width=True):
+        reset_vix_cache()
+        st.rerun()
+
+    st.divider()
     st.subheader("Watchlist")
     watchlist = load_watchlist()
 
@@ -182,19 +212,22 @@ with tab_watchlist:
     # ── Run analysis ──────────────────────────────────────────────────────────
     all_results: list[pd.DataFrame] = []
     all_news: dict[str, list] = {}
+    all_earnings_edge: dict[str, dict] = {}
     errors: list[str] = []
 
     progress_bar = st.progress(0, text="Initializing…")
 
     for i, ticker in enumerate(tickers_to_scan):
         progress_bar.progress(i / len(tickers_to_scan), text=f"Scanning {ticker}…")
-        df, news, err = analyze_ticker(ticker)
+        df, news, err, earn_edge = analyze_ticker(ticker)
         if err:
             errors.append(f"**{ticker}**: {err}")
         else:
             all_results.append(df)
             if news:
                 all_news[ticker] = news
+            if earn_edge:
+                all_earnings_edge[ticker] = earn_edge
 
     progress_bar.progress(1.0, text="Done.")
 
@@ -217,13 +250,20 @@ with tab_watchlist:
         if len(bull_divs):
             st.success(f"📈 **Bullish divergence** detected: {', '.join(bull_divs)}")
 
+    # ── Earnings edge alerts ──────────────────────────────────────────────────
+    for sym, ee in all_earnings_edge.items():
+        if ee["signal"] == "STRADDLE BUY":
+            st.info(f"🎯 **{sym} earnings edge**: {ee['reason']} — {ee['days_to_earnings']}d to earnings")
+        elif ee["signal"] == "IV RICH":
+            st.warning(f"💰 **{sym} earnings IV rich**: {ee['reason']} — {ee['days_to_earnings']}d to earnings")
+
     # ── Summary bar ────────────────────────────────────────────────────────────
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Tickers", len(combined["symbol"].unique()))
     col2.metric("Contracts", len(combined))
     col3.metric("Buy Signals", int((combined["vol_signal"] == "BUY VOL").sum()))
     col4.metric("Strong Flow", int((combined["flow_signal"] == "STRONG").sum()))
-    st.caption("Score = vol mismatch (50) + flow (35) + DTE bonus (10) ± sentiment divergence (±15). Max OTM 10%.")
+    st.caption("Score = vol mismatch (50) + flow (35) + DTE bonus (10) + IV rank (8) + skew align (7) + GEX (±5) ± sentiment (±15). Max OTM 10%.")
 
     st.divider()
 
@@ -283,7 +323,55 @@ with tab_watchlist:
             f"Earnings: **{tkr['earnings'].iloc[0]}**"
         )
 
-        # News dropdown
+        # ── Surface signals row ───────────────────────────────────────────────
+        first = tkr.iloc[0]
+        ivr_label   = first.get("iv_rank_label", "N/A")
+        skew_sig    = first.get("skew_signal", "—")
+        skew_summ   = first.get("skew_summary", "—")
+        gex_sig     = first.get("gex_signal", "—")
+        gex_summ    = first.get("gex_summary", "—")
+        gamma_wall  = first.get("gamma_wall")
+        gamma_flip  = first.get("gamma_flip")
+
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            ivr_icon = "🔴" if "HIGH" in ivr_label else ("🟢" if "LOW" in ivr_label else "⚪")
+            st.caption(f"**IV Rank:** {ivr_icon} {ivr_label}")
+        with sc2:
+            sk_icon = "🟢" if skew_sig == "BULLISH" else ("🔴" if skew_sig == "BEARISH" else "⚪")
+            st.caption(f"**Skew:** {sk_icon} {skew_summ}")
+        with sc3:
+            gx_icon = "⚡" if gex_sig == "EXPLOSIVE" else ("🧲" if gex_sig == "PINNED" else "🛡️")
+            gex_detail = gex_summ
+            if gamma_wall:
+                gex_detail += f"  ·  wall ${gamma_wall:.0f}"
+            if gamma_flip:
+                gex_detail += f"  ·  flip ${gamma_flip:.0f}"
+            st.caption(f"**GEX:** {gx_icon} {gex_detail}")
+
+        # ── Earnings edge banner ──────────────────────────────────────────────
+        ee = all_earnings_edge.get(symbol)
+        if ee:
+            ee_cols = st.columns([3, 1])
+            with ee_cols[0]:
+                if ee["signal"] == "STRADDLE BUY":
+                    st.success(
+                        f"🎯 **Earnings edge** ({ee['days_to_earnings']}d): {ee['reason']}  "
+                        f"|  Historical moves: {', '.join(f'{m:.1f}%' for m in ee['historical_moves'][:4])}",
+                        icon=None,
+                    )
+                elif ee["signal"] == "IV RICH":
+                    st.warning(
+                        f"💰 **Earnings IV rich** ({ee['days_to_earnings']}d): {ee['reason']}  "
+                        f"|  Historical moves: {', '.join(f'{m:.1f}%' for m in ee['historical_moves'][:4])}",
+                        icon=None,
+                    )
+                else:
+                    st.caption(
+                        f"📅 Earnings in {ee['days_to_earnings']}d: {ee['reason']}"
+                    )
+
+        # ── News dropdown ─────────────────────────────────────────────────────
         articles = all_news.get(symbol, [])
         src   = articles[0].get("source", "rss") if articles else "rss"
         badge = "🔗 sentinel" if src not in ("rss",) else "📰 RSS"
@@ -302,7 +390,7 @@ with tab_watchlist:
                 if a.get("summary"):
                     st.caption(a["summary"])
 
-        # Contracts split by strategy
+        # ── Contracts split by strategy ───────────────────────────────────────
         buys    = tkr[tkr["vol_signal"] == "BUY VOL"]
         spreads = tkr[tkr["vol_signal"] == "SELL VOL"]
         watches = tkr[tkr["vol_signal"] == "NEUTRAL"]
