@@ -2,9 +2,9 @@ import pandas as pd
 from datetime import datetime
 
 from data.market import get_current_price, get_historical_prices, get_options_chain, check_market_cap
-from data.news import get_news
 from analysis.vol import calculate_rv, iv_rv_signal, iv_percentile_label
 from analysis.flow import enrich_flow, classify_flow
+from sentinel_bridge import scan_ticker, divergence_score_adjustment
 
 
 OTM_LIMIT = 0.10
@@ -20,26 +20,19 @@ def _midpoint(bid: float, ask: float) -> float:
 
 
 def _find_protection_leg(short_row: pd.Series, group: pd.DataFrame) -> pd.Series | None:
-    """
-    For a credit spread, find the nearest OTM strike to use as the long (protection) leg.
-    Calls: buy the next higher strike. Puts: buy the next lower strike.
-    """
     strike = float(short_row["strike"])
     if short_row["type"] == "call":
         candidates = group[group["strike"] > strike].sort_values("strike")
     else:
         candidates = group[group["strike"] < strike].sort_values("strike", ascending=False)
-
     return candidates.iloc[0] if not candidates.empty else None
 
 
 def _buy_trade_detail(row: pd.Series) -> dict:
-    """For BUY VOL: recommend the identified contract directly."""
     bid = float(row.get("bid") or 0)
     ask = float(row.get("ask") or 0)
     entry = _midpoint(bid, ask)
     max_loss = round(entry * 100, 2)
-
     return {
         "leg1_strike": float(row["strike"]),
         "leg1_action": "BUY",
@@ -59,11 +52,9 @@ def _buy_trade_detail(row: pd.Series) -> dict:
 
 
 def _spread_trade_detail(short_row: pd.Series, long_row: pd.Series) -> dict:
-    """For SELL VOL: credit spread with defined max loss."""
     short_bid = float(short_row.get("bid") or 0)
     long_ask  = float(long_row.get("ask") or 0)
     net_credit = round(short_bid - long_ask, 2)
-
     spread_width = round(abs(float(short_row["strike"]) - float(long_row["strike"])), 2)
     max_loss = round((spread_width - max(net_credit, 0)) * 100, 2)
     max_profit = round(max(net_credit, 0) * 100, 2)
@@ -71,23 +62,16 @@ def _spread_trade_detail(short_row: pd.Series, long_row: pd.Series) -> dict:
     opt_type = short_row["type"]
     if opt_type == "call":
         breakeven = round(float(short_row["strike"]) + net_credit, 2)
-        leg_desc = (
-            f"SELL ${short_row['strike']:.0f} CALL  /  "
-            f"BUY ${long_row['strike']:.0f} CALL"
-        )
+        leg_desc = f"SELL ${short_row['strike']:.0f} CALL  /  BUY ${long_row['strike']:.0f} CALL"
     else:
         breakeven = round(float(short_row["strike"]) - net_credit, 2)
-        leg_desc = (
-            f"SELL ${short_row['strike']:.0f} PUT  /  "
-            f"BUY ${long_row['strike']:.0f} PUT"
-        )
+        leg_desc = f"SELL ${short_row['strike']:.0f} PUT  /  BUY ${long_row['strike']:.0f} PUT"
 
     credit_str = f"${net_credit:.2f} credit" if net_credit > 0 else f"${abs(net_credit):.2f} debit (legs too wide)"
     detail = (
         f"{leg_desc}  |  {credit_str}  |  "
         f"Max profit: ${max_profit:.0f}  |  Max loss: ${max_loss:.0f}  |  BE: ${breakeven:.2f}"
     )
-
     return {
         "leg1_strike": float(short_row["strike"]),
         "leg1_action": "SELL",
@@ -144,9 +128,33 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
     if err:
         return None, [], err
 
-    news = get_news(symbol)
+    # Trigger news sentinel scan (uses cached DB data if fresh)
+    sentinel_data = scan_ticker(symbol)
+    divergence = sentinel_data["divergence"]
 
-    # Filter: ATM range, DTE, volume
+    # Build news list from sentinel articles for display in app
+    news = []
+    for a in sentinel_data["articles"]:
+        news.append({
+            "title": a["headline"],
+            "link": a["url"] or "",
+            "published": a["published_at"],
+            "summary": (a["body"] or "")[:250] if a.get("body") else "",
+            "sentiment_score": a["sentiment_score"],
+            "sentiment_label": a["sentiment_label"],
+        })
+    # Add social posts to news list
+    for p in sentinel_data["social"]:
+        news.append({
+            "title": f"[{p['platform'].upper()}] {p['text'][:120]}",
+            "link": p["url"] or "",
+            "published": p["published_at"],
+            "summary": "",
+            "sentiment_score": p["sentiment_score"],
+            "sentiment_label": p["sentiment_label"],
+        })
+
+    # Filter options chain
     lower = price * (1 - OTM_LIMIT)
     upper = price * (1 + OTM_LIMIT)
     chain = chain[
@@ -196,6 +204,18 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             trade["trade_detail"] = "—"
             action = "WATCH"
 
+        base_score = score_contract(iv, rv, vol_oi, dte)
+        sentiment_delta = divergence_score_adjustment(divergence, vol_signal)
+        final_score = round(min(max(base_score + sentiment_delta, 0), 100), 1)
+
+        divergence_flag = "—"
+        if divergence:
+            direction = divergence["direction"]
+            if direction == "bearish_divergence":
+                divergence_flag = "⚠️ BEAR DIV"
+            elif direction == "bullish_divergence":
+                divergence_flag = "📈 BULL DIV"
+
         rows.append({
             "symbol": symbol,
             "type": row["type"],
@@ -214,7 +234,9 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             "open_interest": int(row["openInterest"]),
             "vol_oi_ratio": vol_oi,
             "flow_signal": row["flow_signal"],
-            "score": score_contract(iv, rv, vol_oi, dte),
+            "score": final_score,
+            "sentiment_delta": sentiment_delta,
+            "divergence_flag": divergence_flag,
             "earnings": earnings_date.strftime("%Y-%m-%d") if earnings_date else "—",
             **trade,
         })
