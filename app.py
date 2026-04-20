@@ -208,173 +208,118 @@ with tab_watchlist:
     combined = pd.concat(all_results, ignore_index=True).sort_values("score", ascending=False)
 
     # ── Divergence alerts ─────────────────────────────────────────────────────
-    if "divergence_flag" in combined.columns:
+    has_div = "divergence_flag" in combined.columns
+    if has_div:
         bear_divs = combined[combined["divergence_flag"] == "⚠️ BEAR DIV"]["symbol"].unique()
         bull_divs = combined[combined["divergence_flag"] == "📈 BULL DIV"]["symbol"].unique()
         if len(bear_divs):
-            st.warning(f"⚠️ **Bearish divergence** — market bullish, news/social bearish: {', '.join(bear_divs)}")
+            st.warning(f"⚠️ **Bearish divergence** detected: {', '.join(bear_divs)}")
         if len(bull_divs):
-            st.success(f"📈 **Bullish divergence** — market bearish, news/social bullish: {', '.join(bull_divs)}")
+            st.success(f"📈 **Bullish divergence** detected: {', '.join(bull_divs)}")
 
-    # ── Results header ────────────────────────────────────────────────────────
+    # ── Summary bar ────────────────────────────────────────────────────────────
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Contracts Found", len(combined))
-    col2.metric("Buy Signals", int((combined["vol_signal"] == "BUY VOL").sum()))
-    col3.metric("Strong Flow", int((combined["flow_signal"] == "STRONG").sum()))
-    col4.metric("Tickers Scanned", len(all_results))
+    col1.metric("Tickers", len(combined["symbol"].unique()))
+    col2.metric("Contracts", len(combined))
+    col3.metric("Buy Signals", int((combined["vol_signal"] == "BUY VOL").sum()))
+    col4.metric("Strong Flow", int((combined["flow_signal"] == "STRONG").sum()))
+    st.caption("Score = vol mismatch (50) + flow (35) + DTE bonus (10) ± sentiment divergence (±15). Max OTM 10%.")
 
     st.divider()
 
-    # ── Filter controls ───────────────────────────────────────────────────────
-    st.subheader("Results")
-    fcol1, fcol2, fcol3 = st.columns(3)
-    with fcol1:
-        min_score = st.slider("Min score", 0, 100, 0, 5)
-    with fcol2:
-        sig_filter = st.multiselect(
-            "Vol signal",
-            ["BUY VOL", "SELL VOL", "NEUTRAL"],
-            default=["BUY VOL", "SELL VOL", "NEUTRAL"],
-        )
-    with fcol3:
-        type_filter = st.multiselect("Type", ["call", "put"], default=["call", "put"])
+    # ── Per-ticker cards ───────────────────────────────────────────────────────
+    def _render_contract(row, rank):
+        sig      = row["vol_signal"]
+        opt_type = row["type"].upper()
+        c_icon   = "🟢" if sig == "BUY VOL" else "🔴"
+        div_flag = row.get("divergence_flag", "—") if has_div else "—"
+        sent_dlt = row.get("sentiment_delta", 0.0) if has_div else 0.0
+        score_str = f"{row['score']}" + (f" ({sent_dlt:+.0f})" if sent_dlt != 0 else "")
 
-    filtered = combined[
-        (combined["score"] >= min_score) &
-        (combined["vol_signal"].isin(sig_filter)) &
-        (combined["type"].isin(type_filter))
-    ]
-
-    if filtered.empty:
-        st.info("No contracts match the current filters.")
-    else:
-        has_divergence = "divergence_flag" in filtered.columns
-
-        summary_cols = [
-            "symbol", "type", "strike", "expiry", "dte", "stock_price",
-            "iv_pct", "rv_pct", "iv_rv_spread",
-            "vol_signal", "action",
-            "volume", "open_interest", "vol_oi_ratio", "flow_signal",
-            "score",
-        ]
-        col_labels = {
-            "symbol": "Ticker", "type": "Type", "strike": "Strike",
-            "expiry": "Expiry", "dte": "DTE", "stock_price": "Stock $",
-            "iv_pct": "IV %", "rv_pct": "RV %", "iv_rv_spread": "IV−RV",
-            "vol_signal": "Vol Signal", "action": "Action",
-            "volume": "Vol", "open_interest": "OI", "vol_oi_ratio": "Vol/OI",
-            "flow_signal": "Flow", "score": "Score",
-            "sentiment_delta": "Sent Δ", "divergence_flag": "Divergence",
-            "earnings": "Earnings",
-        }
-        if has_divergence:
-            summary_cols += ["sentiment_delta", "divergence_flag"]
-        summary_cols.append("earnings")
-
-        def color_row(row):
-            styles = [""] * len(row)
-            col_list = list(row.index)
-            rules = [
-                ("Score",      lambda v: "color: #00e676; font-weight: bold" if v >= 70 else ("color: #ffab40" if v >= 40 else "")),
-                ("Vol Signal", lambda v: "color: #00e676; font-weight: bold" if v == "BUY VOL" else ("color: #ff5252; font-weight: bold" if v == "SELL VOL" else "")),
-                ("Flow",       lambda v: "color: #ffd740; font-weight: bold" if v == "STRONG" else ("color: #ffe082" if v == "ELEVATED" else "")),
-                ("Action",     lambda v: "color: #00e676; font-weight: bold" if str(v).startswith("BUY") else ("color: #ff7043" if str(v).startswith("SPREAD") else "")),
-            ]
-            if has_divergence:
-                rules += [
-                    ("Divergence", lambda v: "color: #ff5252; font-weight: bold" if "BEAR" in str(v) else ("color: #00e676; font-weight: bold" if "BULL" in str(v) else "")),
-                    ("Sent Δ",     lambda v: "color: #00e676" if v > 0 else ("color: #ff5252" if v < 0 else "")),
-                ]
-            for field, fn in rules:
-                if field in col_list:
-                    styles[col_list.index(field)] = fn(row[field])
-            return styles
-
-        display_df = filtered[summary_cols].rename(columns=col_labels)
-        st.dataframe(display_df.style.apply(color_row, axis=1), use_container_width=True, height=420, hide_index=True)
-        st.caption(
-            "**Score** = vol mismatch (50) + flow (35) + DTE bonus (10) ± sentiment divergence (±15 when sentinel running). "
-            "Earnings-adjacent expiries excluded. Max OTM: 10%."
-        )
-
-        # ── Trade recommendations ─────────────────────────────────────────────
-        st.divider()
-        st.subheader("Trade Recommendations")
-        st.caption("Click any row below to expand the full trade detail.")
-
-        actionable = filtered[filtered["vol_signal"] != "NEUTRAL"].sort_values("score", ascending=False)
-
-        if actionable.empty:
-            st.info("No actionable signals — all contracts are NEUTRAL.")
+        if sig == "BUY VOL":
+            option_price = f"${row['entry_price']:.2f}" if row.get("entry_price") else f"${row['ask']:.2f} ask"
+            price_label  = "Option price (mid)"
+            detail_line  = f"Max loss / contract: **${row['max_loss_per_contract']:.0f}**" if row.get("max_loss_per_contract") else ""
         else:
-            for _, row in actionable.iterrows():
-                detail = row.get("trade_detail") or "—"
-                sig = row["vol_signal"]
-                score = row["score"]
-                div_flag = row.get("divergence_flag", "—") if has_divergence else "—"
-                sent_delta = row.get("sentiment_delta", 0.0) if has_divergence else 0.0
+            option_price = f"${row['net_credit']:.2f} credit" if row.get("net_credit") is not None else "—"
+            price_label  = "Net credit"
+            parts = []
+            if row.get("max_profit") is not None:
+                parts.append(f"Max profit: **${row['max_profit']:.0f}**")
+            if row.get("max_loss_per_contract") is not None:
+                parts.append(f"Max loss: **${row['max_loss_per_contract']:.0f}**")
+            if row.get("breakeven") is not None:
+                parts.append(f"BE: **${row['breakeven']:.2f}**")
+            detail_line = "  |  ".join(parts)
 
-                icon = "🟢" if sig == "BUY VOL" else ("🔴" if sig == "SELL VOL" else "🟡")
-                div_label = f" &nbsp;|&nbsp; {div_flag}" if div_flag != "—" else ""
-                delta_label = f" ({sent_delta:+.0f})" if sent_delta != 0 else ""
+        r1, r2, r3, r4, r5 = st.columns([1, 1, 1, 1, 2])
+        r1.metric(f"#{rank} {c_icon} {opt_type}", f"${row['strike']:.0f} strike")
+        r2.metric("Action", row["action"])
+        r3.metric("Expiry", f"{row['expiry']} ({row['dte']}d)")
+        r4.metric(price_label, option_price)
+        with r5:
+            st.caption(f"Score: **{score_str}**  |  Flow: **{row['flow_signal']}**")
+            if detail_line:
+                st.caption(detail_line)
+            if div_flag != "—":
+                if sent_dlt > 0:
+                    st.success(f"{div_flag} — aligns ↑ {sent_dlt:+.0f} pts", icon=None)
+                else:
+                    st.warning(f"{div_flag} — contradicts ↓ {sent_dlt:+.0f} pts", icon=None)
 
-                header = (
-                    f"{icon} **{row['symbol']}** &nbsp;|&nbsp; "
-                    f"{row['action']} &nbsp;|&nbsp; "
-                    f"Score: **{score}**{delta_label}{div_label} &nbsp;|&nbsp; "
-                    f"Expiry: {row['expiry']} ({row['dte']} DTE)"
-                )
-                with st.expander(header):
-                    st.markdown(f"#### `{detail}`")
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Stock Price", f"${row['stock_price']:.2f}")
-                    c2.metric("IV", f"{row['iv_pct']}%")
-                    c3.metric("30d RV", f"{row['rv_pct']}%")
-                    c4.metric("IV − RV", f"{row['iv_rv_spread']:+.1f}%")
+    for symbol in combined["symbol"].unique():
+        tkr    = combined[combined["symbol"] == symbol]
+        name   = tkr["company_name"].iloc[0]
+        px     = tkr["stock_price"].iloc[0]
+        top_iv = tkr["iv_rv_spread"].iloc[0]
+        top_sg = tkr["vol_signal"].iloc[0]
+        hdr_icon = "🟢" if top_sg == "BUY VOL" else ("🔴" if top_sg == "SELL VOL" else "🟡")
 
-                    c5, c6, c7, c8 = st.columns(4)
-                    if sig == "BUY VOL":
-                        c5.metric("Entry (midpoint)", f"${row['entry_price']:.2f}" if row.get("entry_price") else "—")
-                        c6.metric("Max Loss / contract", f"${row['max_loss_per_contract']:.0f}" if row.get("max_loss_per_contract") else "—")
-                        c7.metric("Volume", f"{int(row['volume']):,}")
-                        c8.metric("Flow", row["flow_signal"])
-                    else:
-                        c5.metric("Net Credit", f"${row['net_credit']:.2f}" if row.get("net_credit") is not None else "—")
-                        c6.metric("Max Profit / contract", f"${row['max_profit']:.0f}" if row.get("max_profit") is not None else "—")
-                        c7.metric("Max Loss / contract", f"${row['max_loss_per_contract']:.0f}" if row.get("max_loss_per_contract") is not None else "—")
-                        c8.metric("Breakeven", f"${row['breakeven']:.2f}" if row.get("breakeven") is not None else "—")
+        st.markdown(f"## {hdr_icon} {symbol} &nbsp;·&nbsp; {name}")
+        st.caption(
+            f"Stock: **${px:.2f}** &nbsp;·&nbsp; "
+            f"IV vs 30d RV: **{top_iv:+.1f}%** &nbsp;·&nbsp; "
+            f"Signal: **{top_sg}** &nbsp;·&nbsp; "
+            f"Earnings: **{tkr['earnings'].iloc[0]}**"
+        )
 
-                    if div_flag != "—" and sent_delta != 0:
-                        if sent_delta > 0:
-                            st.success(f"{div_flag} — Sentiment aligns with signal. Score boosted {sent_delta:+.0f} pts.")
-                        else:
-                            st.warning(f"{div_flag} — Sentiment contradicts signal. Score penalized {sent_delta:+.0f} pts.")
-
-    # ── News & Social ─────────────────────────────────────────────────────────
-    if all_news:
-        st.divider()
-        st.subheader("Recent News & Social")
-        for ticker, articles in all_news.items():
+        # News dropdown
+        articles = all_news.get(symbol, [])
+        src   = articles[0].get("source", "rss") if articles else "rss"
+        badge = "🔗 sentinel" if src not in ("rss",) else "📰 RSS"
+        with st.expander(f"📰 News — {len(articles)} item(s)  {badge}" if articles else "📰 News — none found"):
             if not articles:
-                continue
-            src = articles[0].get("source", "rss") if articles else "rss"
-            badge = "🔗 sentinel" if src not in ("rss",) else "📰 RSS"
-            with st.expander(f"{ticker} — {len(articles)} item(s)  {badge}"):
-                for a in articles:
-                    pub = a["published"] if isinstance(a["published"], str) else (
-                        a["published"].strftime("%b %d, %Y %H:%M UTC") if a["published"] else "Unknown"
-                    )
-                    sent = a.get("sentiment")
-                    if sent is not None:
-                        sent_str = f" 🟢 {sent:+.2f}" if sent > 0.2 else (f" 🔴 {sent:+.2f}" if sent < -0.2 else f" ⚪ {sent:+.2f}")
-                    else:
-                        sent_str = ""
-                    link = a.get("link", "")
-                    title = a["title"]
-                    if link:
-                        st.markdown(f"**[{title}]({link})** &nbsp; `{pub}`{sent_str}")
-                    else:
-                        st.markdown(f"**{title}** &nbsp; `{pub}`{sent_str}")
-                    if a.get("summary"):
-                        st.caption(a["summary"])
-                    st.divider()
+                st.caption("No recent news found.")
+            for a in articles:
+                pub = a["published"] if isinstance(a["published"], str) else (
+                    a["published"].strftime("%b %d  %H:%M UTC") if a["published"] else "—"
+                )
+                sent = a.get("sentiment")
+                sent_str = (f" 🟢 {sent:+.2f}" if sent > 0.2 else (f" 🔴 {sent:+.2f}" if sent < -0.2 else f" ⚪ {sent:+.2f}")) if sent is not None else ""
+                link  = a.get("link", "")
+                title = a["title"]
+                st.markdown(f"**[{title}]({link})** &nbsp; `{pub}`{sent_str}" if link else f"**{title}** &nbsp; `{pub}`{sent_str}")
+                if a.get("summary"):
+                    st.caption(a["summary"])
+
+        # Contracts split by strategy
+        buys    = tkr[tkr["vol_signal"] == "BUY VOL"]
+        spreads = tkr[tkr["vol_signal"] == "SELL VOL"]
+        watches = tkr[tkr["vol_signal"] == "NEUTRAL"]
+
+        if not buys.empty:
+            st.markdown("**🟢 Buy Options**")
+            for rank, (_, row) in enumerate(buys.iterrows(), start=1):
+                _render_contract(row, rank)
+
+        if not spreads.empty:
+            st.markdown("**🔴 Credit Spreads** *(IV rich — sell the expensive vol, buy protection)*")
+            for rank, (_, row) in enumerate(spreads.iterrows(), start=1):
+                _render_contract(row, rank)
+
+        if not watches.empty and buys.empty and spreads.empty:
+            st.markdown("**🟡 Watch Only**")
+            for rank, (_, row) in enumerate(watches.iterrows(), start=1):
+                _render_contract(row, rank)
+
+        st.divider()
