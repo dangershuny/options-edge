@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 
 from analysis.scorer import analyze_ticker
+from analysis.discover import run_discovery
 from data.news import news_tool_status
 
 WATCHLIST_FILE = "watchlist.json"
@@ -90,203 +91,257 @@ with st.sidebar:
 # ── Main ──────────────────────────────────────────────────────────────────────
 st.title("Options Edge Scanner")
 
-if not watchlist:
-    st.info("Add at least one ticker in the sidebar to begin.")
-    st.stop()
+tab_watchlist, tab_discover = st.tabs(["📋 Watchlist", "🔭 Discover"])
 
-col_scan, col_sel = st.columns([1, 3])
-with col_scan:
-    scan_all = st.button("🔍 Scan All", type="primary", use_container_width=True)
-with col_sel:
-    selected = st.multiselect(
-        "Or choose specific tickers:",
-        watchlist,
-        default=watchlist,
-        label_visibility="collapsed",
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DISCOVER TAB — autonomous universe scan
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_discover:
+    st.markdown(
+        "Scans ~100 high-liquidity tickers and surfaces the biggest mismatches "
+        "between implied vol and what the market has actually been doing. "
+        "Takes ~60–90 seconds."
     )
+    dcol1, dcol2 = st.columns([1, 3])
+    with dcol1:
+        top_n = st.number_input("Top N results", min_value=5, max_value=50, value=20, step=5)
+    with dcol2:
+        st.caption(" ")  # vertical align
 
-tickers_to_scan = watchlist if scan_all else selected
+    if st.button("🔭 Run Discovery Scan", type="primary"):
+        with st.spinner("Batch-downloading price history and scanning options chains…"):
+            disc_df = run_discovery(top_n=int(top_n))
 
-if not tickers_to_scan:
-    st.warning("Select at least one ticker to scan.")
-    st.stop()
+        if disc_df.empty:
+            st.error("Discovery scan returned no results. Try again later.")
+        else:
+            st.success(f"Found {len(disc_df)} tickers with significant vol mismatches.")
 
-if not (scan_all or st.button("🔍 Scan Selected", use_container_width=False)):
-    st.stop()
+            def color_disc(row):
+                styles = [""] * len(row)
+                col_list = list(row.index)
+                for field, fn in [
+                    ("vol_signal", lambda v: "color: #00e676; font-weight: bold" if v == "BUY VOL" else "color: #ff5252; font-weight: bold"),
+                    ("iv_rv_spread", lambda v: "color: #00e676" if v < 0 else "color: #ff5252"),
+                ]:
+                    if field in col_list:
+                        styles[col_list.index(field)] = fn(row[field])
+                return styles
 
-# ── Run analysis ──────────────────────────────────────────────────────────────
-all_results: list[pd.DataFrame] = []
-all_news: dict[str, list] = {}
-errors: list[str] = []
-
-progress_bar = st.progress(0, text="Initializing…")
-
-for i, ticker in enumerate(tickers_to_scan):
-    progress_bar.progress((i) / len(tickers_to_scan), text=f"Scanning {ticker}…")
-    df, news, err = analyze_ticker(ticker)
-    if err:
-        errors.append(f"**{ticker}**: {err}")
-    else:
-        all_results.append(df)
-        if news:
-            all_news[ticker] = news
-
-progress_bar.progress(1.0, text="Done.")
-
-for e in errors:
-    st.warning(e)
-
-if not all_results:
-    st.error("No actionable contracts found across all tickers. Try different tickers or check the warnings above.")
-    st.stop()
-
-combined = pd.concat(all_results, ignore_index=True).sort_values("score", ascending=False)
-
-# ── Results header ────────────────────────────────────────────────────────────
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Contracts Found", len(combined))
-col2.metric("Buy Signals", int((combined["vol_signal"] == "BUY VOL").sum()))
-col3.metric("Strong Flow", int((combined["flow_signal"] == "STRONG").sum()))
-col4.metric("Tickers Scanned", len(all_results))
-
-st.divider()
-
-# ── Filter controls ───────────────────────────────────────────────────────────
-st.subheader("Results")
-fcol1, fcol2, fcol3 = st.columns(3)
-with fcol1:
-    min_score = st.slider("Min score", 0, 100, 0, 5)
-with fcol2:
-    sig_filter = st.multiselect(
-        "Vol signal",
-        ["BUY VOL", "SELL VOL", "NEUTRAL"],
-        default=["BUY VOL", "SELL VOL", "NEUTRAL"],
-    )
-with fcol3:
-    type_filter = st.multiselect("Type", ["call", "put"], default=["call", "put"])
-
-filtered = combined[
-    (combined["score"] >= min_score) &
-    (combined["vol_signal"].isin(sig_filter)) &
-    (combined["type"].isin(type_filter))
-]
-
-if filtered.empty:
-    st.info("No contracts match the current filters.")
-else:
-    # ── Summary table (scannable) ─────────────────────────────────────────────
-    summary_cols = [
-        "symbol", "type", "strike", "expiry", "dte", "stock_price",
-        "iv_pct", "rv_pct", "iv_rv_spread",
-        "vol_signal", "action",
-        "volume", "open_interest", "vol_oi_ratio", "flow_signal",
-        "score", "earnings",
-    ]
-    col_labels = {
-        "symbol": "Ticker", "type": "Type", "strike": "Strike",
-        "expiry": "Expiry", "dte": "DTE", "stock_price": "Stock $",
-        "iv_pct": "IV %", "rv_pct": "RV %", "iv_rv_spread": "IV−RV",
-        "vol_signal": "Vol Signal", "action": "Action",
-        "volume": "Vol", "open_interest": "OI", "vol_oi_ratio": "Vol/OI",
-        "flow_signal": "Flow", "score": "Score", "earnings": "Earnings",
-    }
-
-    def color_row(row):
-        styles = [""] * len(row)
-        col_list = list(row.index)
-        for field, rules in [
-            ("score",      lambda v: "color: #00e676; font-weight: bold" if v >= 70 else ("color: #ffab40" if v >= 40 else "")),
-            ("vol_signal", lambda v: "color: #00e676; font-weight: bold" if v == "BUY VOL" else ("color: #ff5252; font-weight: bold" if v == "SELL VOL" else "")),
-            ("flow_signal",lambda v: "color: #ffd740; font-weight: bold" if v == "STRONG" else ("color: #ffe082" if v == "ELEVATED" else "")),
-            ("action",     lambda v: "color: #00e676; font-weight: bold" if str(v).startswith("BUY") else ("color: #ff7043" if str(v).startswith("SPREAD") else "")),
-        ]:
-            if field in col_list:
-                styles[col_list.index(field)] = rules(row[field])
-        return styles
-
-    display_df = filtered[summary_cols].rename(columns=col_labels)
-    styled = display_df.style.apply(color_row, axis=1)
-    st.dataframe(styled, use_container_width=True, height=420, hide_index=True)
-
-    st.caption(
-        "**Score** = vol mismatch (up to 50) + unusual flow (up to 35) + DTE sweet-spot bonus (up to 10). "
-        "Earnings-adjacent expiries excluded. Max OTM: 10%."
-    )
-
-    # ── Trade recommendations ─────────────────────────────────────────────────
-    st.divider()
-    st.subheader("Trade Recommendations")
-    st.caption("Click any row below to expand the full trade detail.")
-
-    actionable = filtered[filtered["vol_signal"] != "NEUTRAL"].sort_values("score", ascending=False)
-
-    if actionable.empty:
-        st.info("No actionable signals — all contracts are NEUTRAL.")
-    else:
-        for _, row in actionable.iterrows():
-            detail = row.get("trade_detail") or "—"
-            sig = row["vol_signal"]
-            score = row["score"]
-
-            if sig == "BUY VOL":
-                icon = "🟢"
-                color = "#00e676"
-            elif sig == "SELL VOL":
-                icon = "🔴"
-                color = "#ff7043"
-            else:
-                icon = "🟡"
-                color = "#ffab40"
-
-            header = (
-                f"{icon} **{row['symbol']}** &nbsp;|&nbsp; "
-                f"{row['action']} &nbsp;|&nbsp; "
-                f"Score: **{score}** &nbsp;|&nbsp; "
-                f"Expiry: {row['expiry']} ({row['dte']} DTE)"
+            show_cols = ["symbol", "price", "iv_pct", "rv_pct", "iv_rv_spread", "vol_signal"]
+            labels = {"symbol": "Ticker", "price": "Price", "iv_pct": "IV %",
+                      "rv_pct": "RV %", "iv_rv_spread": "IV−RV", "vol_signal": "Signal"}
+            st.dataframe(
+                disc_df[show_cols].rename(columns=labels).style.apply(color_disc, axis=1),
+                use_container_width=True, hide_index=True,
             )
-            with st.expander(header):
-                st.markdown(f"#### `{detail}`")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Stock Price", f"${row['stock_price']:.2f}")
-                c2.metric("IV", f"{row['iv_pct']}%")
-                c3.metric("30d RV", f"{row['rv_pct']}%")
-                c4.metric("IV − RV", f"{row['iv_rv_spread']:+.1f}%")
 
-                c5, c6, c7, c8 = st.columns(4)
-                if sig == "BUY VOL":
-                    c5.metric("Entry (midpoint)", f"${row['entry_price']:.2f}" if row.get('entry_price') else "—")
-                    c6.metric("Max Loss / contract", f"${row['max_loss_per_contract']:.0f}" if row.get('max_loss_per_contract') else "—")
-                    c7.metric("Volume", f"{int(row['volume']):,}")
-                    c8.metric("Flow", row["flow_signal"])
-                else:
-                    c5.metric("Net Credit", f"${row['net_credit']:.2f}" if row.get('net_credit') is not None else "—")
-                    c6.metric("Max Profit / contract", f"${row['max_profit']:.0f}" if row.get('max_profit') is not None else "—")
-                    c7.metric("Max Loss / contract", f"${row['max_loss_per_contract']:.0f}" if row.get('max_loss_per_contract') is not None else "—")
-                    c8.metric("Breakeven", f"${row['breakeven']:.2f}" if row.get('breakeven') is not None else "—")
+            st.divider()
+            st.subheader("Add discoveries to watchlist")
+            to_add = st.multiselect(
+                "Select tickers to add to your watchlist for full analysis:",
+                disc_df["symbol"].tolist(),
+            )
+            if st.button("➕ Add to Watchlist") and to_add:
+                for t in to_add:
+                    if t not in watchlist:
+                        watchlist.append(t)
+                save_watchlist(watchlist)
+                st.success(f"Added {', '.join(to_add)} to watchlist. Switch to the Watchlist tab to scan.")
+                st.rerun()
 
-# ── News ──────────────────────────────────────────────────────────────────────
-if all_news:
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WATCHLIST TAB — targeted scan on user's list
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_watchlist:
+
+    if not watchlist:
+        st.info("Add tickers in the sidebar, or use the Discover tab to find candidates.")
+        st.stop()
+
+    col_scan, col_sel = st.columns([1, 3])
+    with col_scan:
+        scan_all = st.button("🔍 Scan All", type="primary", use_container_width=True)
+    with col_sel:
+        selected = st.multiselect(
+            "Or choose specific tickers:",
+            watchlist,
+            default=watchlist,
+            label_visibility="collapsed",
+        )
+
+    tickers_to_scan = watchlist if scan_all else selected
+
+    if not tickers_to_scan:
+        st.warning("Select at least one ticker to scan.")
+        st.stop()
+
+    if not (scan_all or st.button("🔍 Scan Selected", use_container_width=False)):
+        st.stop()
+
+    # ── Run analysis ──────────────────────────────────────────────────────────
+    all_results: list[pd.DataFrame] = []
+    all_news: dict[str, list] = {}
+    errors: list[str] = []
+
+    progress_bar = st.progress(0, text="Initializing…")
+
+    for i, ticker in enumerate(tickers_to_scan):
+        progress_bar.progress((i) / len(tickers_to_scan), text=f"Scanning {ticker}…")
+        df, news, err = analyze_ticker(ticker)
+        if err:
+            errors.append(f"**{ticker}**: {err}")
+        else:
+            all_results.append(df)
+            if news:
+                all_news[ticker] = news
+
+    progress_bar.progress(1.0, text="Done.")
+
+    for e in errors:
+        st.warning(e)
+
+    if not all_results:
+        st.error("No actionable contracts found. Try different tickers or check warnings above.")
+        st.stop()
+
+    combined = pd.concat(all_results, ignore_index=True).sort_values("score", ascending=False)
+
+    # ── Results header ─────────────────────────────────────────────────────────
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Contracts Found", len(combined))
+    col2.metric("Buy Signals", int((combined["vol_signal"] == "BUY VOL").sum()))
+    col3.metric("Strong Flow", int((combined["flow_signal"] == "STRONG").sum()))
+    col4.metric("Tickers Scanned", len(all_results))
+
     st.divider()
-    st.subheader("Recent News")
-    for ticker, articles in all_news.items():
-        if not articles:
-            continue
-        src = articles[0].get("source", "rss") if articles else "rss"
-        badge = "🔗 news-tool" if src == "news-tool" else "📰 RSS"
-        with st.expander(f"{ticker} — {len(articles)} article(s)  {badge}"):
-            for a in articles:
-                pub = a["published"].strftime("%b %d, %Y %H:%M UTC") if a["published"] else "Unknown date"
-                sent = a.get("sentiment")
-                if sent is not None:
-                    if sent > 0.2:
-                        sent_str = f" 🟢 {sent:+.2f}"
-                    elif sent < -0.2:
-                        sent_str = f" 🔴 {sent:+.2f}"
+
+    # ── Filter controls ────────────────────────────────────────────────────────
+    st.subheader("Results")
+    fcol1, fcol2, fcol3 = st.columns(3)
+    with fcol1:
+        min_score = st.slider("Min score", 0, 100, 0, 5)
+    with fcol2:
+        sig_filter = st.multiselect(
+            "Vol signal",
+            ["BUY VOL", "SELL VOL", "NEUTRAL"],
+            default=["BUY VOL", "SELL VOL", "NEUTRAL"],
+        )
+    with fcol3:
+        type_filter = st.multiselect("Type", ["call", "put"], default=["call", "put"])
+
+    filtered = combined[
+        (combined["score"] >= min_score) &
+        (combined["vol_signal"].isin(sig_filter)) &
+        (combined["type"].isin(type_filter))
+    ]
+
+    if filtered.empty:
+        st.info("No contracts match the current filters.")
+    else:
+        summary_cols = [
+            "symbol", "type", "strike", "expiry", "dte", "stock_price",
+            "iv_pct", "rv_pct", "iv_rv_spread",
+            "vol_signal", "action",
+            "volume", "open_interest", "vol_oi_ratio", "flow_signal",
+            "score", "earnings",
+        ]
+        col_labels = {
+            "symbol": "Ticker", "type": "Type", "strike": "Strike",
+            "expiry": "Expiry", "dte": "DTE", "stock_price": "Stock $",
+            "iv_pct": "IV %", "rv_pct": "RV %", "iv_rv_spread": "IV−RV",
+            "vol_signal": "Vol Signal", "action": "Action",
+            "volume": "Vol", "open_interest": "OI", "vol_oi_ratio": "Vol/OI",
+            "flow_signal": "Flow", "score": "Score", "earnings": "Earnings",
+        }
+
+        def color_row(row):
+            styles = [""] * len(row)
+            col_list = list(row.index)
+            for field, rules in [
+                ("score",       lambda v: "color: #00e676; font-weight: bold" if v >= 70 else ("color: #ffab40" if v >= 40 else "")),
+                ("vol_signal",  lambda v: "color: #00e676; font-weight: bold" if v == "BUY VOL" else ("color: #ff5252; font-weight: bold" if v == "SELL VOL" else "")),
+                ("flow_signal", lambda v: "color: #ffd740; font-weight: bold" if v == "STRONG" else ("color: #ffe082" if v == "ELEVATED" else "")),
+                ("action",      lambda v: "color: #00e676; font-weight: bold" if str(v).startswith("BUY") else ("color: #ff7043" if str(v).startswith("SPREAD") else "")),
+            ]:
+                if field in col_list:
+                    styles[col_list.index(field)] = rules(row[field])
+            return styles
+
+        display_df = filtered[summary_cols].rename(columns=col_labels)
+        styled = display_df.style.apply(color_row, axis=1)
+        st.dataframe(styled, use_container_width=True, height=420, hide_index=True)
+        st.caption(
+            "**Score** = vol mismatch (up to 50) + unusual flow (up to 35) + DTE sweet-spot bonus (up to 10). "
+            "Earnings-adjacent expiries excluded. Max OTM: 10%."
+        )
+
+        # ── Trade recommendations ──────────────────────────────────────────────
+        st.divider()
+        st.subheader("Trade Recommendations")
+        st.caption("Click any row below to expand the full trade detail.")
+
+        actionable = filtered[filtered["vol_signal"] != "NEUTRAL"].sort_values("score", ascending=False)
+
+        if actionable.empty:
+            st.info("No actionable signals — all contracts are NEUTRAL.")
+        else:
+            for _, row in actionable.iterrows():
+                detail = row.get("trade_detail") or "—"
+                sig = row["vol_signal"]
+                score = row["score"]
+                icon = "🟢" if sig == "BUY VOL" else ("🔴" if sig == "SELL VOL" else "🟡")
+                header = (
+                    f"{icon} **{row['symbol']}** &nbsp;|&nbsp; "
+                    f"{row['action']} &nbsp;|&nbsp; "
+                    f"Score: **{score}** &nbsp;|&nbsp; "
+                    f"Expiry: {row['expiry']} ({row['dte']} DTE)"
+                )
+                with st.expander(header):
+                    st.markdown(f"#### `{detail}`")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Stock Price", f"${row['stock_price']:.2f}")
+                    c2.metric("IV", f"{row['iv_pct']}%")
+                    c3.metric("30d RV", f"{row['rv_pct']}%")
+                    c4.metric("IV − RV", f"{row['iv_rv_spread']:+.1f}%")
+
+                    c5, c6, c7, c8 = st.columns(4)
+                    if sig == "BUY VOL":
+                        c5.metric("Entry (midpoint)", f"${row['entry_price']:.2f}" if row.get('entry_price') else "—")
+                        c6.metric("Max Loss / contract", f"${row['max_loss_per_contract']:.0f}" if row.get('max_loss_per_contract') else "—")
+                        c7.metric("Volume", f"{int(row['volume']):,}")
+                        c8.metric("Flow", row["flow_signal"])
                     else:
-                        sent_str = f" ⚪ {sent:+.2f}"
-                else:
-                    sent_str = ""
-                st.markdown(f"**[{a['title']}]({a['link']})** &nbsp; `{pub}`{sent_str}")
-                if a["summary"]:
-                    st.caption(a["summary"])
-                st.divider()
+                        c5.metric("Net Credit", f"${row['net_credit']:.2f}" if row.get('net_credit') is not None else "—")
+                        c6.metric("Max Profit / contract", f"${row['max_profit']:.0f}" if row.get('max_profit') is not None else "—")
+                        c7.metric("Max Loss / contract", f"${row['max_loss_per_contract']:.0f}" if row.get('max_loss_per_contract') is not None else "—")
+                        c8.metric("Breakeven", f"${row['breakeven']:.2f}" if row.get('breakeven') is not None else "—")
+
+    # ── News ──────────────────────────────────────────────────────────────────
+    if all_news:
+        st.divider()
+        st.subheader("Recent News")
+        for ticker, articles in all_news.items():
+            if not articles:
+                continue
+            src = articles[0].get("source", "rss") if articles else "rss"
+            badge = "🔗 news-tool" if src == "news-tool" else "📰 RSS"
+            with st.expander(f"{ticker} — {len(articles)} article(s)  {badge}"):
+                for a in articles:
+                    pub = a["published"].strftime("%b %d, %Y %H:%M UTC") if a["published"] else "Unknown date"
+                    sent = a.get("sentiment")
+                    if sent is not None:
+                        if sent > 0.2:
+                            sent_str = f" 🟢 {sent:+.2f}"
+                        elif sent < -0.2:
+                            sent_str = f" 🔴 {sent:+.2f}"
+                        else:
+                            sent_str = f" ⚪ {sent:+.2f}"
+                    else:
+                        sent_str = ""
+                    st.markdown(f"**[{a['title']}]({a['link']})** &nbsp; `{pub}`{sent_str}")
+                    if a["summary"]:
+                        st.caption(a["summary"])
+                    st.divider()
