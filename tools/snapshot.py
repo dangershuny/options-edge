@@ -103,8 +103,8 @@ def run_and_save(tickers: list[str] | None = None) -> None:
         "trades": [],
     }
 
-    # Only log BUY VOL — no naked/spread selling
-    for _, row in df_all[df_all["vol_signal"] == "BUY VOL"].iterrows():
+    # Log BUY VOL and FLOW BUY — no naked/spread selling
+    for _, row in df_all[df_all["vol_signal"].isin(["BUY VOL", "FLOW BUY"])].iterrows():
         trade = {
             "symbol":           row["symbol"],
             "company_name":     row["company_name"],
@@ -148,13 +148,15 @@ def run_and_save(tickers: list[str] | None = None) -> None:
 
 def _print_catalogue(df: pd.DataFrame, snap_date: str) -> None:
     # Only show buy-side — no naked/spread selling
-    df = df[df["vol_signal"] == "BUY VOL"].copy()
+    df = df[df["vol_signal"].isin(["BUY VOL", "FLOW BUY"])].copy()
     if df.empty:
         print("\n  No BUY VOL signals found in this scan.")
         return
 
     print(f"\n{'═'*72}")
-    print(f"  CATALOGUE — {len(df)} BUY contracts across {df['symbol'].nunique()} tickers")
+    buy_ct  = int((df["vol_signal"] == "BUY VOL").sum())
+    flow_ct = int((df["vol_signal"] == "FLOW BUY").sum())
+    print(f"  CATALOGUE — {len(df)} contracts across {df['symbol'].nunique()} tickers  ({buy_ct} BUY VOL, {flow_ct} FLOW BUY)")
     print(f"  All prices as of last close ({snap_date})")
     print(f"  Buying 1 contract = 100 shares exposure  |  Max loss = premium paid")
     print(f"{'═'*72}")

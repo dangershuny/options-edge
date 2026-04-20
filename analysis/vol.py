@@ -1,9 +1,21 @@
+"""
+Volatility calculations: realized vol, IV rank, directional semi-deviation,
+and DTE-matched window selection.
+"""
+
 import numpy as np
 import pandas as pd
 
 
+# ── Signal thresholds ──────────────────────────────────────────────────────────
+# Relaxed from -20%/-25% to surface more tradeable candidates.
+# Score does the ranking; thresholds just gate eligibility.
+BUY_VOL_THRESHOLD  = -0.10   # IV is 10%+ below RV  → cheap options, buy
+SELL_VOL_THRESHOLD =  0.15   # IV is 15%+ above RV  → expensive options, sell/spread
+
+
 def calculate_rv(prices: pd.Series, window: int = 30) -> float | None:
-    """Annualized realized volatility from the last `window` trading days of close prices."""
+    """Annualized realized vol from the last `window` trading days of close prices."""
     log_returns = np.log(prices / prices.shift(1)).dropna()
     if len(log_returns) < window:
         return None
@@ -11,24 +23,105 @@ def calculate_rv(prices: pd.Series, window: int = 30) -> float | None:
     return rv
 
 
-def iv_rv_signal(iv: float, rv: float) -> tuple[str, float, float]:
+def calculate_rv_for_dte(prices: pd.Series, dte: int) -> float | None:
+    """
+    Pick a RV window that matches the option's time horizon.
+
+    Comparing a 7-DTE option's IV against 30-day RV overstates the
+    mismatch — the 7-day realized vol is the right benchmark.
+    """
+    if dte <= 14:
+        window = 10
+    elif dte <= 30:
+        window = 20
+    elif dte <= 60:
+        window = 30
+    else:
+        window = 45
+    return calculate_rv(prices, window)
+
+
+def calculate_directional_rv(prices: pd.Series, window: int = 30) -> dict:
+    """
+    Directional semi-deviation: separate upside and downside realized vol.
+
+    For CALL options, compare IV to upside_rv.
+    For PUT options, compare IV to downside_rv.
+
+    Method: RMS (root-mean-square) of the relevant signed returns,
+    annualized.  ×√2 corrects for using half the return distribution.
+
+    Returns:
+        upside_rv   float | None  — annualized vol of positive-return days
+        downside_rv float | None  — annualized vol of negative-return days
+        combined_rv float | None  — standard 2-sided RV for reference
+    """
+    log_returns = np.log(prices / prices.shift(1)).dropna().tail(window)
+
+    if len(log_returns) < window // 2:
+        return {"upside_rv": None, "downside_rv": None, "combined_rv": None}
+
+    pos = log_returns[log_returns > 0]
+    neg = log_returns[log_returns < 0]
+
+    # RMS × √(annualisation) × √2 (half-sample correction)
+    upside_rv   = float(np.sqrt(np.mean(pos ** 2)) * np.sqrt(252) * np.sqrt(2)) if len(pos) > 3 else None
+    downside_rv = float(np.sqrt(np.mean(neg ** 2)) * np.sqrt(252) * np.sqrt(2)) if len(neg) > 3 else None
+    combined_rv = float(log_returns.std() * np.sqrt(252))
+
+    return {
+        "upside_rv":   round(upside_rv,   4) if upside_rv   else None,
+        "downside_rv": round(downside_rv, 4) if downside_rv else None,
+        "combined_rv": round(combined_rv, 4),
+    }
+
+
+def iv_rv_signal(iv: float, rv: float, threshold_buy: float = BUY_VOL_THRESHOLD,
+                 threshold_sell: float = SELL_VOL_THRESHOLD) -> tuple[str, float, float]:
     """
     Compare implied vol to realized vol.
 
     Returns:
         signal:   'BUY VOL' | 'SELL VOL' | 'NEUTRAL'
-        spread:   IV - RV (annualized, as a decimal)
+        spread:   IV - RV  (annualized decimal)
         strength: 0.0–1.0
     """
-    spread = iv - rv
+    spread   = iv - rv
     pct_diff = spread / rv if rv > 0 else 0.0
 
-    if pct_diff > 0.25:
+    if pct_diff > threshold_sell:
         return "SELL VOL", spread, min(abs(pct_diff), 1.0)
-    elif pct_diff < -0.20:
+    elif pct_diff < threshold_buy:
         return "BUY VOL", spread, min(abs(pct_diff), 1.0)
     else:
         return "NEUTRAL", spread, 0.0
+
+
+def iv_rv_signal_directional(
+    iv: float,
+    opt_type: str,
+    directional: dict,
+    dte: int,
+) -> tuple[str, float, float]:
+    """
+    Direction-aware signal: compares call IV to upside RV, put IV to downside RV.
+    Falls back to combined_rv if directional data is missing.
+
+    Args:
+        iv:          implied vol of this specific contract
+        opt_type:    'call' or 'put'
+        directional: output of calculate_directional_rv()
+        dte:         days to expiry (used for additional DTE-match weighting)
+    """
+    if opt_type.lower() == "call":
+        rv = directional.get("upside_rv") or directional.get("combined_rv")
+    else:
+        rv = directional.get("downside_rv") or directional.get("combined_rv")
+
+    if rv is None or rv <= 0:
+        return "NEUTRAL", 0.0, 0.0
+
+    return iv_rv_signal(iv, rv)
 
 
 def iv_percentile_label(iv: float, rv: float) -> str:
@@ -46,12 +139,8 @@ def iv_rank(iv: float, prices: pd.Series) -> dict:
     Approximate IV rank: where does current IV sit relative to the range of
     30-day realized vols over the available price history?
 
-    IV Rank > 0.8  → historically expensive  → lean sell vol / spreads
-    IV Rank < 0.2  → historically cheap       → lean buy vol
-
-    This is a proxy (uses RV history, not IV history) but directionally
-    correct: when RV has been low, options that price in that RV are cheap;
-    when RV has spiked, options are expensive.
+    IV Rank > 0.8  → historically expensive → lean sell vol / spreads
+    IV Rank < 0.2  → historically cheap      → lean buy vol
 
     Returns:
         iv_rank        float 0–1 | None
@@ -60,7 +149,6 @@ def iv_rank(iv: float, prices: pd.Series) -> dict:
     """
     log_returns = np.log(prices / prices.shift(1)).dropna()
 
-    # Compute 30-day rolling RV at each point
     rolling_rv = []
     for i in range(30, len(log_returns) + 1):
         window = log_returns.iloc[i - 30: i]
@@ -73,7 +161,7 @@ def iv_rank(iv: float, prices: pd.Series) -> dict:
     if hi <= lo:
         return {"iv_rank": 0.5, "iv_rank_pct": 50.0, "iv_rank_label": "N/A"}
 
-    rank = max(0.0, min(1.0, (iv - lo) / (hi - lo)))
+    rank     = max(0.0, min(1.0, (iv - lo) / (hi - lo)))
     rank_pct = round(rank * 100, 1)
 
     if rank > 0.80:

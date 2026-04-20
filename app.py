@@ -270,9 +270,9 @@ with tab_watchlist:
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Tickers", len(combined["symbol"].unique()))
     col2.metric("Contracts", len(combined))
-    col3.metric("Buy Signals", int((combined["vol_signal"] == "BUY VOL").sum()))
+    col3.metric("Buy Signals", int(combined["vol_signal"].isin(["BUY VOL", "FLOW BUY"]).sum()))
     col4.metric("Strong Flow", int((combined["flow_signal"] == "STRONG").sum()))
-    st.caption("Score = vol mismatch (50) + flow (35) + DTE bonus (10) + IV rank (8) + skew align (7) + GEX (±5) ± sentiment (±15). Max OTM 10%.")
+    st.caption("Score = vol mismatch (50) + flow (35) + DTE bonus (10) + IV rank (8) + skew (7) + GEX (±5) ± sentiment (±15). OTM ≤15%. BUY VOL = IV 10%+ below RV. FLOW BUY = unusual activity + explosive GEX.")
 
     st.divider()
 
@@ -332,7 +332,7 @@ with tab_watchlist:
         px     = tkr["stock_price"].iloc[0]
         top_iv = tkr["iv_rv_spread"].iloc[0]
         top_sg = tkr["vol_signal"].iloc[0]
-        hdr_icon = "🟢" if top_sg == "BUY VOL" else ("🔴" if top_sg == "SELL VOL" else "🟡")
+        hdr_icon = "🟢" if top_sg == "BUY VOL" else ("⚡" if top_sg == "FLOW BUY" else ("🔴" if top_sg == "SELL VOL" else "🟡"))
 
         st.markdown(f"## {hdr_icon} {symbol} &nbsp;·&nbsp; {name}")
         st.caption(
@@ -410,13 +410,19 @@ with tab_watchlist:
                     st.caption(a["summary"])
 
         # ── Contracts split by strategy ───────────────────────────────────────
-        buys    = tkr[tkr["vol_signal"] == "BUY VOL"]
-        spreads = tkr[tkr["vol_signal"] == "SELL VOL"]
-        watches = tkr[tkr["vol_signal"] == "NEUTRAL"]
+        buys     = tkr[tkr["vol_signal"] == "BUY VOL"]
+        flow_buys = tkr[tkr["vol_signal"] == "FLOW BUY"]
+        spreads  = tkr[tkr["vol_signal"] == "SELL VOL"]
+        watches  = tkr[tkr["vol_signal"] == "NEUTRAL"]
 
         if not buys.empty:
-            st.markdown("**🟢 Buy Options**")
+            st.markdown("**🟢 Buy Options** *(IV cheap vs realized vol)*")
             for rank, (_, row) in enumerate(buys.iterrows(), start=1):
+                _render_contract(row, rank)
+
+        if not flow_buys.empty:
+            st.markdown("**⚡ Flow Buy** *(unusual institutional activity — smart money positioning)*")
+            for rank, (_, row) in enumerate(flow_buys.iterrows(), start=1):
                 _render_contract(row, rank)
 
         if not spreads.empty:
@@ -424,7 +430,7 @@ with tab_watchlist:
             for rank, (_, row) in enumerate(spreads.iterrows(), start=1):
                 _render_contract(row, rank)
 
-        if not watches.empty and buys.empty and spreads.empty:
+        if not watches.empty and buys.empty and spreads.empty and flow_buys.empty:
             st.markdown("**🟡 Watch Only**")
             for rank, (_, row) in enumerate(watches.iterrows(), start=1):
                 _render_contract(row, rank)

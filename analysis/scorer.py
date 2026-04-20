@@ -1,9 +1,23 @@
+"""
+Ticker analysis and contract scoring.
+
+Signal hierarchy (all are BUY-side only — no naked selling):
+  BUY VOL    IV is 10%+ below directional RV (cheap options)
+  FLOW BUY   STRONG unusual flow + EXPLOSIVE GEX regardless of IV level
+             Smart money is positioning; IV may not be cheap yet but
+             the activity itself signals informed directional conviction.
+  NEUTRAL    No strong signal — tracked but not recommended
+"""
+
 import pandas as pd
 from datetime import datetime
 
 from data.market import get_current_price, get_historical_prices, get_options_chain, check_market_cap
 from data.news import get_news
-from analysis.vol import calculate_rv, iv_rv_signal, iv_percentile_label, iv_rank
+from analysis.vol import (
+    calculate_rv, calculate_rv_for_dte, calculate_directional_rv,
+    iv_rv_signal, iv_rv_signal_directional, iv_rank,
+)
 from analysis.flow import enrich_flow, classify_flow
 from analysis.skew import calculate_skew
 from analysis.gamma import calculate_gex
@@ -12,10 +26,15 @@ from sentinel_bridge import get_divergence, divergence_score_adjustment
 from risk.sizer import size_trade
 
 
-OTM_LIMIT = 0.10
-MIN_VOLUME = 25
-MIN_DTE = 7
-MAX_DTE = 90
+# ── Filters ────────────────────────────────────────────────────────────────────
+OTM_LIMIT  = 0.15   # 15% OTM (was 10%) — captures more directional plays
+MIN_VOLUME = 10     # (was 25) — lower bar; flow signals need fewer contracts
+MIN_DTE    = 7
+MAX_DTE    = 90
+
+# FLOW BUY composite signal: unusual activity even without IV<RV edge
+FLOW_BUY_MIN_VOL_OI  = 1.5   # vol/OI ≥ 1.5× = very strong unusual activity
+FLOW_BUY_GEX_SIGNALS = {"EXPLOSIVE"}  # GEX regime that amplifies moves
 
 
 def _midpoint(bid: float, ask: float) -> float:
@@ -34,8 +53,8 @@ def _find_protection_leg(short_row: pd.Series, group: pd.DataFrame) -> pd.Series
 
 
 def _buy_trade_detail(row: pd.Series) -> dict:
-    bid = float(row.get("bid") or 0)
-    ask = float(row.get("ask") or 0)
+    bid   = float(row.get("bid") or 0)
+    ask   = float(row.get("ask") or 0)
     entry = _midpoint(bid, ask)
     max_loss = round(entry * 100, 2)
     return {
@@ -44,11 +63,11 @@ def _buy_trade_detail(row: pd.Series) -> dict:
         "leg2_strike": None,
         "leg2_action": None,
         "entry_price": entry,
-        "net_credit": None,
+        "net_credit":  None,
         "spread_width": None,
-        "max_profit": None,
+        "max_profit":   None,
         "max_loss_per_contract": max_loss,
-        "breakeven": None,
+        "breakeven":    None,
         "trade_detail": (
             f"BUY ${row['strike']:.0f} {row['type'].upper()} "
             f"@ ~${entry:.2f}  |  Max loss: ${max_loss:.0f}/contract"
@@ -57,20 +76,20 @@ def _buy_trade_detail(row: pd.Series) -> dict:
 
 
 def _spread_trade_detail(short_row: pd.Series, long_row: pd.Series) -> dict:
-    short_bid = float(short_row.get("bid") or 0)
-    long_ask  = float(long_row.get("ask") or 0)
-    net_credit = round(short_bid - long_ask, 2)
+    short_bid    = float(short_row.get("bid") or 0)
+    long_ask     = float(long_row.get("ask") or 0)
+    net_credit   = round(short_bid - long_ask, 2)
     spread_width = round(abs(float(short_row["strike"]) - float(long_row["strike"])), 2)
-    max_loss = round((spread_width - max(net_credit, 0)) * 100, 2)
-    max_profit = round(max(net_credit, 0) * 100, 2)
+    max_loss     = round((spread_width - max(net_credit, 0)) * 100, 2)
+    max_profit   = round(max(net_credit, 0) * 100, 2)
 
     opt_type = short_row["type"]
     if opt_type == "call":
         breakeven = round(float(short_row["strike"]) + net_credit, 2)
-        leg_desc = f"SELL ${short_row['strike']:.0f} CALL  /  BUY ${long_row['strike']:.0f} CALL"
+        leg_desc  = f"SELL ${short_row['strike']:.0f} CALL  /  BUY ${long_row['strike']:.0f} CALL"
     else:
         breakeven = round(float(short_row["strike"]) - net_credit, 2)
-        leg_desc = f"SELL ${short_row['strike']:.0f} PUT  /  BUY ${long_row['strike']:.0f} PUT"
+        leg_desc  = f"SELL ${short_row['strike']:.0f} PUT  /  BUY ${long_row['strike']:.0f} PUT"
 
     credit_str = f"${net_credit:.2f} credit" if net_credit > 0 else f"${abs(net_credit):.2f} debit (legs too wide)"
     detail = (
@@ -83,11 +102,11 @@ def _spread_trade_detail(short_row: pd.Series, long_row: pd.Series) -> dict:
         "leg2_strike": float(long_row["strike"]),
         "leg2_action": "BUY",
         "entry_price": None,
-        "net_credit": net_credit,
+        "net_credit":  net_credit,
         "spread_width": spread_width,
-        "max_profit": max_profit,
+        "max_profit":   max_profit,
         "max_loss_per_contract": max_loss,
-        "breakeven": breakeven,
+        "breakeven":   breakeven,
         "trade_detail": detail,
     }
 
@@ -97,28 +116,25 @@ def score_contract(
     rv: float,
     vol_oi_ratio: float,
     dte: int,
+    vol_signal: str = "NEUTRAL",
     skew: dict | None = None,
     gex: dict | None = None,
     ivr: dict | None = None,
-    vol_signal: str = "NEUTRAL",
 ) -> float:
     """
     Composite score 0–100.
 
-    Base components (unchanged):
-      vol mismatch × 50 pts
-      flow signal   up to 35 pts
-      DTE bonus     up to 10 pts
+    Base (unchanged):
+      vol mismatch × 50  |  flow up to 35  |  DTE bonus up to 10
 
-    New enhancement bonuses (additive, capped at 100 total):
-      +8  IV rank confirms signal direction
-      +7  skew direction aligns with vol signal
-      +5  GEX EXPLOSIVE regime (dealers amplify moves → options plays pay more)
-      -5  GEX PINNED (price clamped by gamma wall → opts may expire worthless)
+    Bonuses:
+      +8   IV rank confirms signal direction
+      +7   skew direction aligns with vol signal
+      +5   GEX EXPLOSIVE (moves amplify → options pay)
+      -5   GEX PINNED (gamma wall suppresses movement)
     """
     vol_sig, _, vol_strength = iv_rv_signal(iv, rv)
     flow_sig = classify_flow(vol_oi_ratio)
-
     score = 0.0
 
     # ── Base ──────────────────────────────────────────────────────────────────
@@ -135,75 +151,93 @@ def score_contract(
     elif 14 <= dte <= 60:
         score += 5
 
-    # ── IV rank alignment ─────────────────────────────────────────────────────
+    # FLOW BUY gets its own base contribution
+    if vol_signal == "FLOW BUY":
+        score = max(score, 30.0)  # floor at 30 — it's a signal, not just noise
+
+    # ── Enhancement bonuses ───────────────────────────────────────────────────
     if ivr and ivr.get("iv_rank") is not None:
         rank = ivr["iv_rank"]
         if vol_signal == "BUY VOL" and rank < 0.30:
-            score += 8   # IV cheap historically → confirms buy-vol thesis
-        elif vol_signal == "SELL VOL" and rank > 0.70:
-            score += 8   # IV rich historically → confirms sell-vol thesis
+            score += 8
+        elif vol_signal in ("SELL VOL", "FLOW BUY") and rank > 0.70:
+            score += 8
 
-    # ── Skew alignment ────────────────────────────────────────────────────────
     if skew:
         skew_sig = skew.get("skew_signal", "NEUTRAL")
         if vol_signal == "BUY VOL" and skew_sig == "BULLISH":
             score += 7
-        elif vol_signal == "SELL VOL" and skew_sig == "BEARISH":
+        elif vol_signal in ("SELL VOL",) and skew_sig == "BEARISH":
             score += 7
+        elif vol_signal == "FLOW BUY":
+            if skew_sig in ("BULLISH", "BEARISH"):
+                score += 5   # flow aligns with any strong skew
 
-    # ── GEX regime ────────────────────────────────────────────────────────────
     if gex:
         g_sig = gex.get("gex_signal", "NEUTRAL")
         if g_sig == "EXPLOSIVE":
-            score += 5   # moves amplify → long options pay
+            score += 5
         elif g_sig == "PINNED":
-            score -= 5   # gamma wall suppresses movement
+            score -= 5
 
     return round(min(score, 100), 1)
 
 
-def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | None]:
+def _is_flow_buy(vol_oi_ratio: float, gex: dict | None) -> bool:
+    """
+    Composite FLOW BUY: unusual institutional/smart-money activity signal.
+    Triggers when:
+      - vol/OI ≥ 1.5 (very fresh, aggressive positioning) AND
+      - GEX is EXPLOSIVE (dealer hedging amplifies the move)
+    """
+    if vol_oi_ratio < FLOW_BUY_MIN_VOL_OI:
+        return False
+    if gex and gex.get("gex_signal") in FLOW_BUY_GEX_SIGNALS:
+        return True
+    return False
+
+
+def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | None, dict | None]:
     symbol = symbol.upper().strip()
 
     eligible, cap, company_name = check_market_cap(symbol)
     if not eligible:
         cap_fmt = f"${cap/1e9:.2f}B" if cap >= 1e9 else f"${cap/1e6:.0f}M"
-        return None, [], f"{symbol} market cap ({cap_fmt}) is below the $100M minimum"
+        return None, [], f"{symbol} market cap ({cap_fmt}) is below the $100M minimum", None
 
     price = get_current_price(symbol)
     if price is None:
-        return None, [], f"Could not fetch price for {symbol}"
+        return None, [], f"Could not fetch price for {symbol}", None
 
     prices = get_historical_prices(symbol, days=90)
     if prices is None:
-        return None, [], f"Could not fetch historical prices for {symbol}"
+        return None, [], f"Could not fetch historical prices for {symbol}", None
 
-    rv = calculate_rv(prices, window=30)
-    if rv is None:
-        return None, [], f"Not enough price history to calculate realized vol for {symbol}"
+    rv30 = calculate_rv(prices, window=30)
+    if rv30 is None:
+        return None, [], f"Not enough price history to calculate realized vol for {symbol}", None
 
-    # IV rank (uses full price history)
-    ivr = iv_rank(rv, prices)   # uses current rv as the IV proxy for ranking
+    # Directional RV (upside for calls, downside for puts)
+    dir_rv = calculate_directional_rv(prices, window=30)
+
+    # IV rank proxy
+    ivr = iv_rank(rv30, prices)
 
     chain_filtered, earnings_date, err = get_options_chain(symbol)
     if err:
-        return None, [], err
+        return None, [], err, None
 
-    # Need full unfiltered chain for skew + GEX + earnings edge
-    # get_options_chain already filters earnings-adjacent expiries but keeps all strikes
     chain_full = chain_filtered.copy()
 
-    news = get_news(symbol)
+    news      = get_news(symbol)
     divergence = get_divergence(symbol)
 
-    # ── Skew + GEX from full chain ─────────────────────────────────────────────
     skew = calculate_skew(chain_full, price)
     gex  = calculate_gex(chain_full, price)
 
-    # ── Earnings edge ─────────────────────────────────────────────────────────
     earnings_edge = analyze_earnings_edge(symbol, chain_full, price, earnings_date)
 
-    # ── Filter chain for tradeable contracts ──────────────────────────────────
+    # ── Filter to tradeable contracts ─────────────────────────────────────────
     lower = price * (1 - OTM_LIMIT)
     upper = price * (1 + OTM_LIMIT)
     chain = chain_filtered[
@@ -218,31 +252,54 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
     chain = chain[chain["volume"] >= MIN_VOLUME].reset_index(drop=True)
 
     if chain.empty:
-        return None, news, f"No contracts passed filters for {symbol} (price=${price:.2f}, RV={rv*100:.1f}%)"
+        return None, news, f"No contracts passed filters for {symbol} (price=${price:.2f}, RV={rv30*100:.1f}%)", None
 
     rows = []
     for _, row in chain.iterrows():
-        iv = float(row["impliedVolatility"])
-        vol_oi = float(row["vol_oi_ratio"])
-        dte = int(row["dte"])
-        vol_signal, iv_rv_spread, _ = iv_rv_signal(iv, rv)
+        iv      = float(row["impliedVolatility"])
+        vol_oi  = float(row["vol_oi_ratio"])
+        dte     = int(row["dte"])
+        opt_type = row["type"]
 
-        if vol_signal == "BUY VOL":
-            trade = _buy_trade_detail(row)
-            action = f"BUY {row['type'].upper()}"
+        # DTE-matched RV for accurate per-contract comparison
+        rv_dte = calculate_rv_for_dte(prices, dte)
+        if rv_dte is None:
+            rv_dte = rv30
+
+        # Directional IV vs RV signal
+        dir_signal, dir_spread, _ = iv_rv_signal_directional(iv, opt_type, dir_rv, dte)
+        # Also run combined signal as tiebreaker / cross-check
+        combined_signal, combined_spread, _ = iv_rv_signal(iv, rv_dte)
+
+        # Prefer directional signal; if neutral, check combined
+        if dir_signal != "NEUTRAL":
+            vol_signal   = dir_signal
+            iv_rv_spread = dir_spread
+        else:
+            vol_signal   = combined_signal
+            iv_rv_spread = combined_spread
+
+        # FLOW BUY override: unusual activity even without IV edge
+        if vol_signal == "NEUTRAL" and _is_flow_buy(vol_oi, gex):
+            vol_signal = "FLOW BUY"
+
+        # Build trade detail
+        if vol_signal in ("BUY VOL", "FLOW BUY"):
+            trade  = _buy_trade_detail(row)
+            action = f"BUY {opt_type.upper()}"
         elif vol_signal == "SELL VOL":
-            group = chain[(chain["expiry"] == row["expiry"]) & (chain["type"] == row["type"])]
+            group    = chain[(chain["expiry"] == row["expiry"]) & (chain["type"] == opt_type)]
             long_leg = _find_protection_leg(row, group)
             if long_leg is not None:
-                trade = _spread_trade_detail(row, long_leg)
-                action = f"SPREAD ({row['type'].upper()} credit)"
+                trade  = _spread_trade_detail(row, long_leg)
+                action = f"SPREAD ({opt_type.upper()} credit)"
             else:
                 trade = {k: None for k in [
                     "leg1_strike", "leg1_action", "leg2_strike", "leg2_action",
                     "entry_price", "net_credit", "spread_width", "max_profit",
                     "max_loss_per_contract", "breakeven",
                 ]}
-                trade["trade_detail"] = f"SELL VOL — no protection leg available for ${row['strike']:.0f}"
+                trade["trade_detail"] = f"SELL VOL — no protection leg for ${row['strike']:.0f}"
                 action = "SELL VOL (no spread)"
         else:
             trade = {k: None for k in [
@@ -253,15 +310,10 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             trade["trade_detail"] = "—"
             action = "WATCH"
 
-        base_score = score_contract(iv, rv, vol_oi, dte,
-                                    skew=skew, gex=gex, ivr=ivr,
-                                    vol_signal=vol_signal)
+        base_score     = score_contract(iv, rv_dte, vol_oi, dte,
+                                        vol_signal=vol_signal, skew=skew, gex=gex, ivr=ivr)
         sentiment_delta = divergence_score_adjustment(divergence, vol_signal)
-        final_score = round(min(max(base_score + sentiment_delta, 0), 100), 1)
-
-        # Position sizing (uses max_loss from trade detail)
-        max_loss = trade.get("max_loss_per_contract") or 0
-        sizing = size_trade(max_loss_per_contract=max_loss, score=final_score) if max_loss > 0 else None
+        final_score    = round(min(max(base_score + sentiment_delta, 0), 100), 1)
 
         divergence_flag = "—"
         if divergence and divergence.get("direction"):
@@ -270,10 +322,13 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             elif divergence["direction"] == "bullish_divergence":
                 divergence_flag = "📈 BULL DIV"
 
+        max_loss = trade.get("max_loss_per_contract") or 0
+        sizing   = size_trade(max_loss_per_contract=max_loss, score=final_score) if max_loss > 0 else None
+
         rows.append({
             "symbol":        symbol,
             "company_name":  company_name,
-            "type":          row["type"],
+            "type":          opt_type,
             "strike":        float(row["strike"]),
             "expiry":        row["expiry"],
             "dte":           dte,
@@ -281,7 +336,7 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             "bid":           round(float(row.get("bid") or 0), 2),
             "ask":           round(float(row.get("ask") or 0), 2),
             "iv_pct":        round(iv * 100, 1),
-            "rv_pct":        round(rv * 100, 1),
+            "rv_pct":        round(rv_dte * 100, 1),
             "iv_rv_spread":  round(iv_rv_spread * 100, 1),
             "vol_signal":    vol_signal,
             "action":        action,
@@ -293,7 +348,6 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             "sentiment_delta": sentiment_delta,
             "divergence_flag": divergence_flag,
             "earnings":      earnings_date.strftime("%Y-%m-%d") if earnings_date else "—",
-            # ── New surface / regime data ──────────────────────────────────────
             "iv_rank_label": ivr.get("iv_rank_label", "N/A"),
             "iv_rank":       ivr.get("iv_rank"),
             "skew_signal":   skew.get("skew_signal", "NEUTRAL"),
@@ -304,19 +358,16 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             "gex_summary":   gex.get("gex_summary", "—"),
             "gamma_wall":    gex.get("gamma_wall"),
             "gamma_flip":    gex.get("gamma_flip"),
-            # Position sizing
-            "suggested_contracts": sizing["contracts"] if sizing else None,
+            "suggested_contracts":   sizing["contracts"] if sizing else None,
             "suggested_risk_dollar": sizing["risk_dollar"] if sizing else None,
-            "sizing_rationale": sizing["rationale"] if sizing else "—",
+            "sizing_rationale":      sizing["rationale"] if sizing else "—",
             **trade,
         })
 
-    # Attach earnings edge at ticker level (same for all contracts of this ticker)
     result_df = (
         pd.DataFrame(rows)
         .sort_values("score", ascending=False)
-        .head(3)
+        .head(5)           # was 3; show top 5 per ticker
         .reset_index(drop=True)
     )
-
     return result_df, news, None, earnings_edge
