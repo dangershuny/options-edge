@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 
 from analysis.scorer import analyze_ticker
+from data.news import news_tool_status
 
 WATCHLIST_FILE = "watchlist.json"
 
@@ -82,6 +83,8 @@ with st.sidebar:
     st.caption("🟡 WATCH — No strong vol mismatch yet")
     st.caption("⚡ STRONG flow — Vol/OI ≥ 1×")
     st.caption("⚠️ Earnings-adjacent expiries are excluded automatically")
+    st.divider()
+    st.caption(f"📡 News: **{news_tool_status()}**")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -268,10 +271,22 @@ if all_news:
     for ticker, articles in all_news.items():
         if not articles:
             continue
-        with st.expander(f"{ticker} — {len(articles)} article(s)"):
+        src = articles[0].get("source", "rss") if articles else "rss"
+        badge = "🔗 news-tool" if src == "news-tool" else "📰 RSS"
+        with st.expander(f"{ticker} — {len(articles)} article(s)  {badge}"):
             for a in articles:
                 pub = a["published"].strftime("%b %d, %Y %H:%M UTC") if a["published"] else "Unknown date"
-                st.markdown(f"**[{a['title']}]({a['link']})** &nbsp; `{pub}`")
+                sent = a.get("sentiment")
+                if sent is not None:
+                    if sent > 0.2:
+                        sent_str = f" 🟢 {sent:+.2f}"
+                    elif sent < -0.2:
+                        sent_str = f" 🔴 {sent:+.2f}"
+                    else:
+                        sent_str = f" ⚪ {sent:+.2f}"
+                else:
+                    sent_str = ""
+                st.markdown(f"**[{a['title']}]({a['link']})** &nbsp; `{pub}`{sent_str}")
                 if a["summary"]:
                     st.caption(a["summary"])
                 st.divider()
