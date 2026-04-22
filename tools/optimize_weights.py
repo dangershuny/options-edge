@@ -39,7 +39,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from analysis.weights import WEIGHTS, write_overrides
+from analysis.weights import WEIGHTS, DEFAULTS, write_overrides
 
 SEP = "=" * 78
 SUB = "-" * 78
@@ -100,7 +100,7 @@ def compute_overrides(benchmark: dict, explain: bool = True) -> tuple[dict, list
     signals = benchmark.get("signals") or {}
 
     for key, (sig_name, bucket, direction) in KEY_MAP.items():
-        default = WEIGHTS.get(key)
+        default = DEFAULTS.get(key)
         if default is None:
             continue
         sig = signals.get(sig_name)
@@ -142,6 +142,33 @@ def compute_overrides(benchmark: dict, explain: bool = True) -> tuple[dict, list
     return overrides, notes
 
 
+def compute_regime_overrides(benchmark: dict) -> tuple[dict, list[str]]:
+    """
+    For each VIX regime that has enough data, compute per-regime overrides.
+    Returns ({key@regime: value, ...}, notes[]).
+    """
+    out: dict[str, float] = {}
+    notes: list[str] = []
+    by_regime = benchmark.get("signals_by_regime") or {}
+    if not by_regime:
+        notes.append("  (no signals_by_regime — re-run historical_backtest to enable)")
+        return out, notes
+
+    for regime, regime_signals in by_regime.items():
+        fake_bench = {"signals": regime_signals}
+        regime_overrides, _ = compute_overrides(fake_bench, explain=False)
+        if not regime_overrides:
+            continue
+        notes.append(f"  regime='{regime}':")
+        for k, v in regime_overrides.items():
+            sig_name, bucket, _ = KEY_MAP[k]
+            sig = regime_signals.get(sig_name) or {}
+            ic = _best_ic(sig)
+            out[f"{k}@{regime}"] = v
+            notes.append(f"    {k + '@' + regime:<32}  ic={ic:.3f}  → {v:+6.2f}")
+    return out, notes
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Tune score weights from hist backtest.")
     ap.add_argument("--benchmark", default=None,
@@ -150,6 +177,8 @@ def main() -> int:
                     help="print proposed overrides but do not write the file")
     ap.add_argument("--out", default=None,
                     help="override path (default: <project>/weights_override.json)")
+    ap.add_argument("--no-regime", action="store_true",
+                    help="skip per-VIX-regime overrides (flat only)")
     args = ap.parse_args()
 
     bench_path = args.benchmark or _latest_benchmark()
@@ -170,18 +199,31 @@ def main() -> int:
     for n in notes:
         print(n)
 
-    if not overrides:
+    regime_overrides: dict[str, float] = {}
+    if not args.no_regime:
+        print()
+        print("REGIME-CONDITIONAL")
+        print(SUB)
+        regime_overrides, rnotes = compute_regime_overrides(benchmark)
+        for n in rnotes:
+            print(n)
+
+    all_overrides = {**overrides, **regime_overrides}
+
+    if not all_overrides:
         print("\nNo overrides computed — check benchmark contents.")
         return 1
 
     if args.dry_run:
         print()
-        print("(dry-run — no file written)")
+        print(f"(dry-run — would write {len(overrides)} flat + "
+              f"{len(regime_overrides)} per-regime overrides)")
         return 0
 
-    path = write_overrides(overrides, path=args.out)
+    path = write_overrides(all_overrides, path=args.out)
     print()
-    print(f"  Wrote {len(overrides)} overrides → {path}")
+    print(f"  Wrote {len(overrides)} flat + {len(regime_overrides)} regime "
+          f"overrides → {path}")
     print(SEP)
     return 0
 

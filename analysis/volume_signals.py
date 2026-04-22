@@ -44,7 +44,7 @@ try:
 except Exception:  # pragma: no cover - yfinance is a hard dep elsewhere
     yf = None  # type: ignore
 
-from analysis.weights import w
+from analysis.weights import w, w_regime
 
 
 # ── 1. Relative volume ───────────────────────────────────────────────────────
@@ -108,20 +108,24 @@ def fetch_rvol(symbol: str, lookback: int = 20) -> RVOLResult | None:
         return None
 
 
-def rvol_score_delta(rv: RVOLResult | None, vol_signal: str) -> float:
+def rvol_score_delta(rv: RVOLResult | None, vol_signal: str,
+                     vix_regime: str | None = None) -> float:
     """
     Map RVOL to a small score delta. We only reward directional signals
     (BUY VOL / FLOW BUY) — a noisy-but-neutral stock is just noise. Penalise
     QUIET days mildly: low RVOL usually means nobody's confirming the signal.
+
+    If `vix_regime` is provided, regime-specific overrides in weights_override
+    take precedence (e.g. `rvol.hot@fear`).
     """
     if rv is None or vol_signal not in ("BUY VOL", "FLOW BUY"):
         return 0.0
     if rv.label == "HOT":
-        return w("rvol.hot", 6.0)
+        return w_regime("rvol.hot", vix_regime, 6.0)
     if rv.label == "ELEVATED":
-        return w("rvol.elevated", 3.0)
+        return w_regime("rvol.elevated", vix_regime, 3.0)
     if rv.label == "QUIET":
-        return w("rvol.quiet", -3.0)
+        return w_regime("rvol.quiet", vix_regime, -3.0)
     return 0.0
 
 
@@ -289,7 +293,24 @@ def vwap_alignment_delta(vw: VWAPResult | None, opt_type: str,
         return 0.0
     aligned = (is_call and pct > 0) or (not is_call and pct < 0)
     magnitude = min(abs(pct) / 0.01, 1.5)  # scales up to ±1.5×
+    # NOTE: regime-aware via compute_volume_deltas → vix_regime kwarg
     bonus = w("vwap.aligned", 4.0) if aligned else w("vwap.fighting", -3.0)
+    return round(bonus * magnitude, 2)
+
+
+def vwap_alignment_delta_r(vw: VWAPResult | None, opt_type: str,
+                           vol_signal: str, vix_regime: str | None) -> float:
+    """Regime-aware VWAP delta (thin wrapper)."""
+    if vw is None or vol_signal not in ("BUY VOL", "FLOW BUY"):
+        return 0.0
+    is_call = opt_type.lower().startswith("c")
+    pct = vw.pct_from_vwap
+    if abs(pct) < 0.003:
+        return 0.0
+    aligned = (is_call and pct > 0) or (not is_call and pct < 0)
+    magnitude = min(abs(pct) / 0.01, 1.5)
+    bonus = (w_regime("vwap.aligned", vix_regime, 4.0) if aligned
+             else w_regime("vwap.fighting", vix_regime, -3.0))
     return round(bonus * magnitude, 2)
 
 
@@ -302,6 +323,7 @@ def compute_volume_deltas(
     rvol: RVOLResult | None = None,
     bias: DirectionalBias | None = None,
     vwap: VWAPResult | None = None,
+    vix_regime: str | None = None,
     cap: float | None = None,
 ) -> dict:
     if cap is None:
@@ -310,10 +332,10 @@ def compute_volume_deltas(
     One-call helper for scorer.py. Returns a dict with each individual
     delta (for debugging / display) plus the capped total.
     """
-    d_rvol = rvol_score_delta(rvol, vol_signal)
+    d_rvol = rvol_score_delta(rvol, vol_signal, vix_regime=vix_regime)
     d_agg  = aggressive_flow_delta(bid, ask, last, opt_type, vol_oi_ratio)
     d_bias = directional_bias_delta(bias, vol_signal, opt_type)
-    d_vwap = vwap_alignment_delta(vwap, opt_type, vol_signal)
+    d_vwap = vwap_alignment_delta_r(vwap, opt_type, vol_signal, vix_regime)
     total = d_rvol + d_agg + d_bias + d_vwap
     # Symmetric cap so one noisy lens can't dominate.
     total = max(-cap, min(cap, total))

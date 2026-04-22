@@ -457,6 +457,7 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
                 rvol=rvol_info,
                 bias=chain_bias,
                 vwap=vwap_info,
+                vix_regime=(macro or {}).get("regime"),
             )
         except Exception:
             vol_deltas = {
@@ -464,7 +465,8 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
                 "dir_bias_delta": 0.0, "vwap_delta": 0.0,
                 "volume_delta_total": 0.0,
             }
-        try:    trend_delta = trend_score_delta(trend_info, opt_type, vol_signal)
+        try:    trend_delta = trend_score_delta(trend_info, opt_type, vol_signal,
+                                                 vix_regime=(macro or {}).get("regime"))
         except Exception: trend_delta = 0.0
 
         # ── Delta-aware edge (penalise lottery tickets, reward sweet spot) ──

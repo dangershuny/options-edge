@@ -103,6 +103,12 @@ WEIGHTS: dict[str, float] = {
 }
 
 
+# Snapshot pristine defaults BEFORE any override is applied, so the
+# optimizer can re-compute scaling from the true baseline rather than
+# compounding atop the previous run's overrides.
+DEFAULTS: dict[str, float] = dict(WEIGHTS)
+
+
 # ── Override loader ──────────────────────────────────────────────────────────
 def _load_overrides() -> dict[str, Any]:
     """Load weights_override.json into WEIGHTS (if it exists). Silent on miss."""
@@ -125,6 +131,29 @@ _loaded_overrides = _load_overrides()
 
 def w(key: str, default: float = 0.0) -> float:
     """Return weight for `key`, or `default` if missing."""
+    return float(WEIGHTS.get(key, default))
+
+
+# ── Regime-conditional lookup ────────────────────────────────────────────────
+# Overrides for a specific VIX regime live at `{key}@{regime}` where regime
+# is one of: low | normal | elevated | fear. If no regime-specific override
+# exists, falls back to the plain `key`.
+#
+# Example weights_override.json snippet:
+#   { "rvol.hot": 2.88,
+#     "rvol.hot@fear": 6.50,      # RVOL hot matters MORE in fear regimes
+#     "rvol.hot@low":  1.50 }
+_REGIMES = {"low", "normal", "elevated", "fear"}
+
+
+def w_regime(key: str, regime: str | None, default: float = 0.0) -> float:
+    """Return regime-specific weight if present, else plain weight, else default."""
+    if regime:
+        r = regime.lower()
+        if r in _REGIMES:
+            rkey = f"{key}@{r}"
+            if rkey in WEIGHTS:
+                return float(WEIGHTS[rkey])
     return float(WEIGHTS.get(key, default))
 
 

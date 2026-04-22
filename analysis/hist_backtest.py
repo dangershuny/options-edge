@@ -221,15 +221,18 @@ class HistBacktestResult:
     signals:        dict[str, dict] = field(default_factory=dict)
     # signals["rvol"] = {"ic": {"fwd_5d": 0.06, ...},
     #                    "by_bucket": {"hot": {"fwd_5d": {"n":..,"mean":..,"hit":..}}}}
+    signals_by_regime: dict[str, dict] = field(default_factory=dict)
+    # signals_by_regime["low"]["rvol"] = same shape as signals["rvol"]
 
     def to_dict(self) -> dict:
         return {
-            "period_days":   self.period_days,
-            "universe_size": len(self.universe),
-            "tickers_ok":    self.tickers_ok,
-            "tickers_fail":  self.tickers_fail,
-            "horizons":      self.horizons,
-            "signals":       self.signals,
+            "period_days":       self.period_days,
+            "universe_size":     len(self.universe),
+            "tickers_ok":        self.tickers_ok,
+            "tickers_fail":      self.tickers_fail,
+            "horizons":          self.horizons,
+            "signals":           self.signals,
+            "signals_by_regime": self.signals_by_regime,
         }
 
 
@@ -310,5 +313,21 @@ def run_hist_backtest(
 
     vix_vals = pd.concat(pooled_vix_signal, axis=0, ignore_index=True)
     result.signals["vix_regime"] = _bucket_stats(vix_vals, fwd_all)
+
+    # ── Regime-segmented stats ───────────────────────────────────────────
+    # For each VIX regime (low|normal|elevated|fear), subset the pooled rows
+    # and re-run _bucket_stats per signal. Enables the optimizer to write
+    # per-regime overrides like `rvol.hot@fear`.
+    regime_mask = vix_vals["bucket"]
+    for regime in ("low", "normal", "elevated", "fear"):
+        idx = regime_mask == regime
+        if idx.sum() < 200:  # too-thin regime: skip
+            continue
+        fwd_sub = fwd_all.loc[idx]
+        result.signals_by_regime[regime] = {}
+        for name, parts in pooled_signals.items():
+            vals = pd.concat(parts, axis=0, ignore_index=True)
+            vals_sub = vals.loc[idx]
+            result.signals_by_regime[regime][name] = _bucket_stats(vals_sub, fwd_sub)
 
     return result

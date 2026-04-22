@@ -74,7 +74,7 @@ def classify_trend(prices: pd.Series) -> TrendRegime | None:
 
 
 def trend_score_delta(tr: TrendRegime | None, opt_type: str,
-                      vol_signal: str) -> float:
+                      vol_signal: str, vix_regime: str | None = None) -> float:
     """Aligned: +4. Counter-trend: -3. Chop / insufficient: 0."""
     if tr is None or tr.regime in ("INSUFFICIENT", "CHOPPY"):
         return 0.0
@@ -84,12 +84,12 @@ def trend_score_delta(tr: TrendRegime | None, opt_type: str,
     aligned = (is_call and tr.regime == "UPTREND") or (
         not is_call and tr.regime == "DOWNTREND"
     )
-    from analysis.weights import w
+    from analysis.weights import w_regime
     if aligned:
         # Fading trend (slope turning over): discount the bonus.
         if is_call and tr.slope_20d < 0:
-            return w("trend.fading", 2.0)
+            return w_regime("trend.fading", vix_regime, 2.0)
         if not is_call and tr.slope_20d > 0:
-            return w("trend.fading", 2.0)
-        return w("trend.aligned", 4.0)
-    return w("trend.counter", -3.0)
+            return w_regime("trend.fading", vix_regime, 2.0)
+        return w_regime("trend.aligned", vix_regime, 4.0)
+    return w_regime("trend.counter", vix_regime, -3.0)
