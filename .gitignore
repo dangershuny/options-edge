@@ -7,3 +7,6 @@ venv/
 .venv/
 *.egg-info/
 .DS_Store
+engine_state.db
+*.db-journal
+benchmarks/

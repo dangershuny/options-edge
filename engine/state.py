@@ -89,6 +89,25 @@ CREATE TABLE IF NOT EXISTS news_seen (
     PRIMARY KEY (underlying, link)
 );
 CREATE INDEX IF NOT EXISTS ix_news_seen_underlying ON news_seen(underlying, seen_at);
+
+CREATE TABLE IF NOT EXISTS chain_surface (
+    symbol         TEXT    NOT NULL,
+    snapshot_date  TEXT    NOT NULL,       -- YYYY-MM-DD
+    expiry         TEXT    NOT NULL,       -- YYYY-MM-DD
+    strike         REAL    NOT NULL,
+    option_type    TEXT    NOT NULL,       -- 'call' | 'put'
+    dte            INTEGER,
+    bid            REAL,
+    ask            REAL,
+    last_price     REAL,
+    volume         INTEGER,
+    open_interest  INTEGER,
+    iv             REAL,
+    spot           REAL,                   -- underlying close that day
+    PRIMARY KEY (symbol, snapshot_date, expiry, strike, option_type)
+);
+CREATE INDEX IF NOT EXISTS ix_surface_sym_date ON chain_surface(symbol, snapshot_date);
+CREATE INDEX IF NOT EXISTS ix_surface_date ON chain_surface(snapshot_date);
 """
 
 
