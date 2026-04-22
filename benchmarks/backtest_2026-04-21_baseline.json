@@ -1,0 +1,399 @@
+{
+  "n_snapshots_parsed": 1,
+  "n_closed_trades": 20,
+  "warnings": [],
+  "overall": {
+    "n": 20,
+    "wins": 7,
+    "losses": 13,
+    "hit_rate": 35.0,
+    "total_pnl": -777.0,
+    "total_cost": 13817.0,
+    "roi_pct": -5.62,
+    "avg_win": 49.29,
+    "avg_loss": -86.31
+  },
+  "by_vol_signal": {
+    "BUY VOL": {
+      "n": 20,
+      "wins": 7,
+      "losses": 13,
+      "hit_rate": 35.0,
+      "total_pnl": -777.0,
+      "total_cost": 13817.0,
+      "roi_pct": -5.62,
+      "avg_win": 49.29,
+      "avg_loss": -86.31
+    }
+  },
+  "by_score_bucket": {
+    "0-40": {
+      "n": 4,
+      "wins": 3,
+      "losses": 1,
+      "hit_rate": 75.0,
+      "total_pnl": 157.0,
+      "total_cost": 2998.0,
+      "roi_pct": 5.24,
+      "avg_win": 67.33,
+      "avg_loss": -45.0
+    },
+    "40-60": {
+      "n": 14,
+      "wins": 4,
+      "losses": 10,
+      "hit_rate": 28.6,
+      "total_pnl": -895.0,
+      "total_cost": 10375.0,
+      "roi_pct": -8.63,
+      "avg_win": 35.75,
+      "avg_loss": -103.8
+    },
+    "60-80": {
+      "n": 2,
+      "wins": 0,
+      "losses": 2,
+      "hit_rate": 0.0,
+      "total_pnl": -39.0,
+      "total_cost": 444.0,
+      "roi_pct": -8.78,
+      "avg_win": null,
+      "avg_loss": -19.5
+    }
+  },
+  "by_option_type": {
+    "CALL": {
+      "n": 12,
+      "wins": 7,
+      "losses": 5,
+      "hit_rate": 58.3,
+      "total_pnl": 44.0,
+      "total_cost": 9296.0,
+      "roi_pct": 0.47,
+      "avg_win": 49.29,
+      "avg_loss": -60.2
+    },
+    "PUT": {
+      "n": 8,
+      "wins": 0,
+      "losses": 8,
+      "hit_rate": 0.0,
+      "total_pnl": -821.0,
+      "total_cost": 4521.0,
+      "roi_pct": -18.16,
+      "avg_win": null,
+      "avg_loss": -102.62
+    }
+  },
+  "by_dte_bucket": {
+    "14-30": {
+      "n": 1,
+      "wins": 0,
+      "losses": 1,
+      "hit_rate": 0.0,
+      "total_pnl": -525.0,
+      "total_cost": 2470.0,
+      "roi_pct": -21.26,
+      "avg_win": null,
+      "avg_loss": -525.0
+    },
+    "30-60": {
+      "n": 18,
+      "wins": 7,
+      "losses": 11,
+      "hit_rate": 38.9,
+      "total_pnl": -159.0,
+      "total_cost": 11149.0,
+      "roi_pct": -1.43,
+      "avg_win": 49.29,
+      "avg_loss": -45.82
+    },
+    "<14": {
+      "n": 1,
+      "wins": 0,
+      "losses": 1,
+      "hit_rate": 0.0,
+      "total_pnl": -93.0,
+      "total_cost": 198.0,
+      "roi_pct": -46.97,
+      "avg_win": null,
+      "avg_loss": -93.0
+    }
+  },
+  "by_iv_rank_label": {
+    "ABOVE AVG": {
+      "n": 6,
+      "wins": 3,
+      "losses": 3,
+      "hit_rate": 50.0,
+      "total_pnl": 98.0,
+      "total_cost": 4532.0,
+      "roi_pct": 2.16,
+      "avg_win": 38.67,
+      "avg_loss": -6.0
+    },
+    "BELOW AVG": {
+      "n": 2,
+      "wins": 0,
+      "losses": 2,
+      "hit_rate": 0.0,
+      "total_pnl": -283.0,
+      "total_cost": 2510.0,
+      "roi_pct": -11.27,
+      "avg_win": null,
+      "avg_loss": -141.5
+    },
+    "HIGH": {
+      "n": 10,
+      "wins": 4,
+      "losses": 6,
+      "hit_rate": 40.0,
+      "total_pnl": 26.0,
+      "total_cost": 4107.0,
+      "roi_pct": 0.63,
+      "avg_win": 57.25,
+      "avg_loss": -33.83
+    },
+    "LOW": {
+      "n": 2,
+      "wins": 0,
+      "losses": 2,
+      "hit_rate": 0.0,
+      "total_pnl": -618.0,
+      "total_cost": 2668.0,
+      "roi_pct": -23.16,
+      "avg_win": null,
+      "avg_loss": -309.0
+    }
+  },
+  "by_gex_signal": {
+    "EXPLOSIVE": {
+      "n": 5,
+      "wins": 3,
+      "losses": 2,
+      "hit_rate": 60.0,
+      "total_pnl": 42.0,
+      "total_cost": 3443.0,
+      "roi_pct": 1.22,
+      "avg_win": 67.33,
+      "avg_loss": -80.0
+    },
+    "PINNED": {
+      "n": 1,
+      "wins": 0,
+      "losses": 1,
+      "hit_rate": 0.0,
+      "total_pnl": -253.0,
+      "total_cost": 2180.0,
+      "roi_pct": -11.61,
+      "avg_win": null,
+      "avg_loss": -253.0
+    },
+    "SUPPORTIVE": {
+      "n": 14,
+      "wins": 4,
+      "losses": 10,
+      "hit_rate": 28.6,
+      "total_pnl": -566.0,
+      "total_cost": 8194.0,
+      "roi_pct": -6.91,
+      "avg_win": 35.75,
+      "avg_loss": -70.9
+    }
+  },
+  "by_skew_signal": {
+    "NEUTRAL": {
+      "n": 20,
+      "wins": 7,
+      "losses": 13,
+      "hit_rate": 35.0,
+      "total_pnl": -777.0,
+      "total_cost": 13817.0,
+      "roi_pct": -5.62,
+      "avg_win": 49.29,
+      "avg_loss": -86.31
+    }
+  },
+  "by_sector": {
+    "Auto": {
+      "n": 3,
+      "wins": 0,
+      "losses": 3,
+      "hit_rate": 0.0,
+      "total_pnl": -41.0,
+      "total_cost": 523.0,
+      "roi_pct": -7.84,
+      "avg_win": null,
+      "avg_loss": -13.67
+    },
+    "Crypto": {
+      "n": 4,
+      "wins": 3,
+      "losses": 1,
+      "hit_rate": 75.0,
+      "total_pnl": 109.0,
+      "total_cost": 4339.0,
+      "roi_pct": 2.51,
+      "avg_win": 38.67,
+      "avg_loss": -7.0
+    },
+    "Energy": {
+      "n": 5,
+      "wins": 1,
+      "losses": 4,
+      "hit_rate": 20.0,
+      "total_pnl": -16.0,
+      "total_cost": 664.0,
+      "roi_pct": -2.41,
+      "avg_win": 27.0,
+      "avg_loss": -10.75
+    },
+    "Finance": {
+      "n": 2,
+      "wins": 0,
+      "losses": 2,
+      "hit_rate": 0.0,
+      "total_pnl": -618.0,
+      "total_cost": 2668.0,
+      "roi_pct": -23.16,
+      "avg_win": null,
+      "avg_loss": -309.0
+    },
+    "Healthcare": {
+      "n": 5,
+      "wins": 3,
+      "losses": 2,
+      "hit_rate": 60.0,
+      "total_pnl": 42.0,
+      "total_cost": 3443.0,
+      "roi_pct": 1.22,
+      "avg_win": 67.33,
+      "avg_loss": -80.0
+    },
+    "Tech": {
+      "n": 1,
+      "wins": 0,
+      "losses": 1,
+      "hit_rate": 0.0,
+      "total_pnl": -253.0,
+      "total_cost": 2180.0,
+      "roi_pct": -11.61,
+      "avg_win": null,
+      "avg_loss": -253.0
+    }
+  },
+  "top_wins": [
+    {
+      "date": "2026-04-20",
+      "symbol": "BNTX",
+      "type": "call",
+      "strike": 97.5,
+      "expiry": "2026-06-18",
+      "score": 22.7,
+      "entry": 11.55,
+      "close": 12.3,
+      "pnl": 75.0
+    },
+    {
+      "date": "2026-04-20",
+      "symbol": "BNTX",
+      "type": "call",
+      "strike": 115.0,
+      "expiry": "2026-06-18",
+      "score": 25.9,
+      "entry": 3.33,
+      "close": 4.0,
+      "pnl": 67.0
+    },
+    {
+      "date": "2026-04-20",
+      "symbol": "BNTX",
+      "type": "call",
+      "strike": 110.0,
+      "expiry": "2026-06-18",
+      "score": 24.8,
+      "entry": 4.85,
+      "close": 5.45,
+      "pnl": 60.0
+    },
+    {
+      "date": "2026-04-20",
+      "symbol": "HOOD",
+      "type": "call",
+      "strike": 78.0,
+      "expiry": "2026-05-22",
+      "score": 45.0,
+      "entry": 15.52,
+      "close": 15.95,
+      "pnl": 43.0
+    },
+    {
+      "date": "2026-04-20",
+      "symbol": "HOOD",
+      "type": "call",
+      "strike": 83.0,
+      "expiry": "2026-05-22",
+      "score": 45.0,
+      "entry": 12.2,
+      "close": 12.6,
+      "pnl": 40.0
+    }
+  ],
+  "top_losses": [
+    {
+      "date": "2026-04-20",
+      "symbol": "JPM",
+      "type": "put",
+      "strike": 335.0,
+      "expiry": "2026-05-15",
+      "score": 53.0,
+      "entry": 24.7,
+      "close": 19.45,
+      "pnl": -525.0
+    },
+    {
+      "date": "2026-04-20",
+      "symbol": "AMD",
+      "type": "call",
+      "strike": 275.0,
+      "expiry": "2026-05-22",
+      "score": 56.9,
+      "entry": 21.8,
+      "close": 19.27,
+      "pnl": -253.0
+    },
+    {
+      "date": "2026-04-20",
+      "symbol": "BNTX",
+      "type": "put",
+      "strike": 97.5,
+      "expiry": "2026-06-18",
+      "score": 41.9,
+      "entry": 4.45,
+      "close": 3.3,
+      "pnl": -115.0
+    },
+    {
+      "date": "2026-04-20",
+      "symbol": "JPM",
+      "type": "put",
+      "strike": 300.0,
+      "expiry": "2026-05-01",
+      "score": 53.2,
+      "entry": 1.98,
+      "close": 1.05,
+      "pnl": -93.0
+    },
+    {
+      "date": "2026-04-20",
+      "symbol": "BNTX",
+      "type": "put",
+      "strike": 110.0,
+      "expiry": "2026-06-18",
+      "score": 28.7,
+      "entry": 10.25,
+      "close": 9.8,
+      "pnl": -45.0
+    }
+  ]
+}

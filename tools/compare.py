@@ -83,8 +83,14 @@ def run_comparison(snap_date: str | None = None) -> None:
         opt_type = trade["option_type"]
         sig      = trade["vol_signal"]
 
-        # Only BUY VOL trades are tracked
         entry_px = trade.get("entry_price_mid") or trade.get("ask") or 0
+
+        # Skip trades with no entry price — we can't compute meaningful P&L
+        if entry_px == 0:
+            no_data += 1
+            trade["outcome"] = "NO ENTRY"
+            rows.append({**trade, "_close": None, "_pnl": None})
+            continue
 
         print(f"  Fetching {symbol} ${strike:.0f} {opt_type.upper()} {expiry}…", end=" ", flush=True)
         close_px = _get_option_close(symbol, expiry, strike, opt_type)
@@ -139,7 +145,7 @@ def run_comparison(snap_date: str | None = None) -> None:
         pnl   = r.get("_pnl")
         sig   = r["vol_signal"][:7]
         outcome = r.get("outcome", "—")
-        outcome_icon = "✅" if outcome == "WIN" else ("❌" if outcome == "LOSS" else "—")
+        outcome_icon = "✅" if outcome == "WIN" else ("❌" if outcome == "LOSS" else ("⚠" if outcome == "NO ENTRY" else "—"))
         close_str  = f"${close:.2f}" if close is not None else "N/A"
         entry_str  = f"${entry:.2f}" if entry else "—"
         pnl_str    = f"${pnl:+.0f}" if pnl is not None else "—"
@@ -150,8 +156,9 @@ def run_comparison(snap_date: str | None = None) -> None:
               f"{r['score']:>6.1f} {outcome_icon} {outcome}")
 
     print(f"\n  {'─'*68}")
-    total_trades = winners + losers + no_data
-    print(f"  Total trades : {total_trades}  |  Wins: {winners}  |  Losses: {losers}  |  No data: {no_data}")
+    tradeable = winners + losers
+    total_trades = tradeable + no_data
+    print(f"  Total tracked: {total_trades}  |  Wins: {winners}  |  Losses: {losers}  |  Skipped (no price): {no_data}")
     if total_cost > 0:
         roi = total_pnl / total_cost * 100
         print(f"  Total P&L    : ${total_pnl:+.2f}  |  Total cost: ${total_cost:.0f}  |  ROI: {roi:+.1f}%")

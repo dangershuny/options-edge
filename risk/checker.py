@@ -11,7 +11,102 @@ That engine doesn't exist yet; this module is ready to plug into it.
 """
 
 from __future__ import annotations
+from datetime import date, datetime
 from risk.config import RISK, RiskLimitExceeded
+
+
+# ── Pre-catalyst refusal rule ─────────────────────────────────────────────────
+#
+# A major catalyst (earnings / FOMC / PDUFA / guidance / product launch)
+# landing inside the expiry window is nearly always priced in by the options
+# market. With <10 DTE there's insufficient time for a directional single-leg
+# thesis to play out around the event — you're mostly buying the IV premium
+# that gets crushed when the event resolves.
+#
+# Rule: refuse any long single-leg trade where a major catalyst occurs
+# between now and expiry AND DTE < PRE_CATALYST_MIN_DTE.
+#
+# Legitimate overrides (operator must pass explicit override reason):
+#   "volatility_play"  — long straddle/strangle; thesis IS the move size
+#   "post_event"       — catalyst already passed; this is a drift/continuation entry
+#   "iv_underpriced"   — IV rank <20 going into a typically >5% mover
+#   "defined_risk"     — multi-leg debit spread with capped max loss
+#   "strong_informed"  — blocks_signal STRONG + insider_signal STRONG aligned
+#
+# Without one of those, the rule blocks. User confirmed: "catalyst is always
+# priced in that close to expiry — not always but a vast majority of the time."
+# Default-deny is the correct posture.
+
+PRE_CATALYST_MIN_DTE = 10
+VALID_CATALYST_OVERRIDES = {
+    "volatility_play", "post_event", "iv_underpriced",
+    "defined_risk", "strong_informed",
+}
+
+
+def _parse_catalyst_date(catalyst_summary) -> date | None:
+    """Extract a date from catalyst_summary, which can be a dict or string."""
+    if not catalyst_summary:
+        return None
+    if isinstance(catalyst_summary, dict):
+        raw = catalyst_summary.get("date") or catalyst_summary.get("next_date")
+    elif isinstance(catalyst_summary, str):
+        # try ISO-ish prefix
+        raw = catalyst_summary[:10] if len(catalyst_summary) >= 10 else None
+    else:
+        return None
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def check_pre_catalyst(
+    dte: int,
+    catalyst_summary=None,
+    catalyst_override: str | None = None,
+    today: date | None = None,
+) -> tuple[bool, str]:
+    """
+    Returns (allowed, reason).
+
+    Blocks if a catalyst lands between today and expiry AND DTE is short,
+    unless the operator passes a recognized override reason.
+    """
+    today = today or date.today()
+    cat_date = _parse_catalyst_date(catalyst_summary)
+
+    # No catalyst detected → rule doesn't apply
+    if cat_date is None:
+        return True, "no catalyst in window"
+
+    # Catalyst is in the past → rule doesn't apply (post-event entries are fine)
+    if cat_date < today:
+        return True, f"catalyst {cat_date} is in the past"
+
+    # Catalyst is AFTER expiry → rule doesn't apply
+    expiry_date = today.fromordinal(today.toordinal() + dte)
+    if cat_date > expiry_date:
+        return True, f"catalyst {cat_date} is after expiry {expiry_date}"
+
+    # Catalyst lands inside window AND DTE is long enough to absorb it
+    if dte >= PRE_CATALYST_MIN_DTE:
+        return True, f"catalyst {cat_date} in window but {dte} DTE absorbs it"
+
+    # Here we are: short-DTE position into a pending catalyst.
+    if catalyst_override in VALID_CATALYST_OVERRIDES:
+        return True, (
+            f"catalyst {cat_date} pending with {dte} DTE — "
+            f"allowed via override='{catalyst_override}'"
+        )
+
+    return False, (
+        f"catalyst {cat_date} pending with only {dte} DTE "
+        f"(limit ≥{PRE_CATALYST_MIN_DTE}) — premium is priced in. "
+        f"Override with one of: {sorted(VALID_CATALYST_OVERRIDES)}"
+    )
 
 
 def check_trade(
@@ -27,6 +122,8 @@ def check_trade(
     ask: float,
     net_credit: float | None = None,
     spread_width: float | None = None,
+    catalyst_summary=None,
+    catalyst_override: str | None = None,
     # Portfolio state — injected by the trading engine
     open_positions: list[dict] | None = None,
     daily_pnl: float = 0.0,
@@ -76,6 +173,13 @@ def check_trade(
 
     if dte > RISK["max_dte"]:
         return _reject(f"DTE {dte} above maximum {RISK['max_dte']}", warnings)
+
+    # ── Pre-catalyst refusal (IV already priced in with too little time) ──────
+    allowed, why = check_pre_catalyst(dte, catalyst_summary, catalyst_override)
+    if not allowed:
+        return _reject(why, warnings)
+    if catalyst_override:
+        warnings.append(f"catalyst override active: {catalyst_override} — {why}")
 
     # ── OTM check ─────────────────────────────────────────────────────────────
 

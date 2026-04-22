@@ -7,7 +7,7 @@ from analysis.scorer import analyze_ticker
 from analysis.discover import run_discovery
 from data.news import news_tool_status
 from data.macro import get_vix_context, reset_cache as reset_vix_cache
-from sentinel_bridge import sentinel_status
+from sentinel_bridge import sentinel_status, ensure_sentinel_running, sentinel_last_error, scan_ticker as sentinel_scan_ticker
 from risk.config import RISK
 
 WATCHLIST_FILE = "watchlist.json"
@@ -128,11 +128,25 @@ with st.sidebar:
     st.caption("⚠️ Earnings-adjacent expiries excluded automatically")
     st.divider()
     st.caption(f"📡 News tool: **{news_tool_status()}**")
-    st.caption(f"📡 Sentiment: **{sentinel_status()}**")
+    # Sentiment status is silent on success; failure is surfaced by the top banner.
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 st.title("Options Edge Scanner")
+
+# Auto-start news sentinel. Cached so reruns don't re-launch.
+if "sentinel_checked" not in st.session_state:
+    st.session_state["sentinel_checked"] = True
+    st.session_state["sentinel_ok"] = ensure_sentinel_running()
+    st.session_state["sentinel_err"] = sentinel_last_error()
+
+# Only show a banner when sentiment is missing — silent on success.
+if not st.session_state.get("sentinel_ok", False):
+    st.warning(
+        f"⚠️ **News sentiment offline** — scoring without the sentiment signal "
+        f"(can move scores by ±15). Reason: "
+        f"_{st.session_state.get('sentinel_err') or 'server unreachable'}_"
+    )
 
 tab_watchlist, tab_discover = st.tabs(["📋 Watchlist", "🔭 Discover"])
 
@@ -166,9 +180,13 @@ with tab_discover:
                         styles[col_list.index(field)] = fn(row[field])
                 return styles
 
-            show_cols = ["symbol", "price", "iv_pct", "rv_pct", "iv_rv_spread", "vol_signal"]
+            show_cols = ["symbol", "price", "iv_pct", "rv_pct", "iv_rv_spread",
+                         "vol_signal", "atm_strike", "atm_entry", "atm_expiry"]
+            show_cols = [c for c in show_cols if c in disc_df.columns]
             labels = {"symbol": "Ticker", "price": "Price", "iv_pct": "IV %",
-                      "rv_pct": "RV %", "iv_rv_spread": "IV−RV", "vol_signal": "Signal"}
+                      "rv_pct": "RV %", "iv_rv_spread": "IV−RV", "vol_signal": "Signal",
+                      "atm_strike": "ATM Strike", "atm_entry": "Entry $",
+                      "atm_expiry": "Expiry"}
             st.dataframe(
                 disc_df[show_cols].rename(columns=labels).style.apply(color_disc, axis=1),
                 use_container_width=True, hide_index=True,
@@ -228,6 +246,11 @@ with tab_watchlist:
 
     for i, ticker in enumerate(tickers_to_scan):
         progress_bar.progress(i / len(tickers_to_scan), text=f"Scanning {ticker}…")
+        # Refresh sentiment ahead of analysis; failure is silent/non-fatal.
+        try:
+            sentinel_scan_ticker(ticker)
+        except Exception:
+            pass
         df, news, err, earn_edge = analyze_ticker(ticker)
         if err:
             errors.append(f"**{ticker}**: {err}")

@@ -106,6 +106,33 @@ RISK: dict = {
     # Automatically take profit at this multiple of debit paid.
     # 2.0 = exit when position doubles. None = no auto-TP.
     "auto_take_profit_multiplier": 2.0,
+
+
+    # ── Cash-account / settlement guards ──────────────────────────────────────
+
+    # When True, the trading engine must NOT close a position on the same
+    # trading day it was opened. Every trade holds overnight minimum.
+    #
+    # Rationale: this starts as a small cash account. Cash accounts settle
+    # options T+1; same-day exits produce unsettled proceeds. If those
+    # proceeds are then used to fund another buy that is also sold before
+    # settlement, it's a good-faith violation. Three GFVs in 12 months =
+    # 90-day cash-only lockout.
+    #
+    # Setting this to True means the engine will:
+    #   - Convert intraday SL hits into "exit at next-day open" orders
+    #   - Skip the trailing stop fire until the next session
+    #   - Force-close the theta guard only at EOD of day 2+
+    #
+    # Flip to False once the account has margin and PDT tracking is safe,
+    # or once cash balance is large enough that unsettled-proceeds timing
+    # never matters in practice.
+    "cash_account_no_same_day_exit": True,
+
+    # Minimum settled cash buffer (as fraction of portfolio) that must
+    # remain after each new buy. Prevents accidentally spending unsettled
+    # proceeds on the next entry.
+    "min_settled_cash_fraction": 0.20,
 }
 
 

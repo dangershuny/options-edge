@@ -22,8 +22,12 @@ from data.universe import UNIVERSE
 from analysis.vol import calculate_rv, iv_rv_signal
 
 
-def _atm_iv(symbol: str, current_price: float) -> float | None:
-    """Return the front-month ATM implied vol for a single ticker."""
+def _atm_iv(symbol: str, current_price: float) -> dict | None:
+    """
+    Return the front-month ATM call for a single ticker.
+    {iv, strike, entry_price, expiry} or None on failure.
+    entry_price = (bid+ask)/2 if both available, else lastPrice.
+    """
     try:
         ticker = yf.Ticker(symbol)
         expirations = ticker.options
@@ -35,8 +39,23 @@ def _atm_iv(symbol: str, current_price: float) -> float | None:
         if calls.empty:
             return None
         atm = calls.iloc[(calls["strike"] - current_price).abs().argsort()[:1]]
-        iv = float(atm["impliedVolatility"].iloc[0])
-        return iv if iv > 0.001 else None
+        row = atm.iloc[0]
+        iv = float(row.get("impliedVolatility") or 0)
+        if iv <= 0.001:
+            return None
+        bid = float(row.get("bid") or 0)
+        ask = float(row.get("ask") or 0)
+        last = float(row.get("lastPrice") or 0)
+        if bid > 0 and ask > 0:
+            entry = round((bid + ask) / 2, 2)
+        else:
+            entry = round(last, 2) if last > 0 else None
+        return {
+            "iv":          iv,
+            "strike":      float(row["strike"]),
+            "entry_price": entry,
+            "expiry":      exp,
+        }
     except Exception:
         return None
 
@@ -51,20 +70,24 @@ def _quick_scan_ticker(symbol: str, prices: pd.Series) -> dict | None:
         return None
 
     current_price = float(prices.iloc[-1])
-    iv = _atm_iv(symbol, current_price)
-    if iv is None:
+    atm = _atm_iv(symbol, current_price)
+    if atm is None:
         return None
 
+    iv = atm["iv"]
     signal, spread, strength = iv_rv_signal(iv, rv)
     return {
-        "symbol": symbol,
-        "price": round(current_price, 2),
-        "iv_pct": round(iv * 100, 1),
-        "rv_pct": round(rv * 100, 1),
+        "symbol":       symbol,
+        "price":        round(current_price, 2),
+        "iv_pct":       round(iv * 100, 1),
+        "rv_pct":       round(rv * 100, 1),
         "iv_rv_spread": round(spread * 100, 1),
-        "abs_spread": abs(spread),
-        "vol_signal": signal,
-        "strength": strength,
+        "abs_spread":   abs(spread),
+        "vol_signal":   signal,
+        "strength":     strength,
+        "atm_strike":   atm["strike"],
+        "atm_entry":    atm["entry_price"],
+        "atm_expiry":   atm["expiry"],
     }
 
 

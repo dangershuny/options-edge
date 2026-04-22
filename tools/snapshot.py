@@ -28,6 +28,8 @@ from analysis.vol import calculate_rv, iv_rv_signal
 from analysis.scorer import analyze_ticker
 from analysis.discover import run_discovery
 from risk.config import RISK
+from sentinel_bridge import ensure_sentinel_running, sentinel_last_error, scan_ticker as sentinel_scan_ticker
+from risk.exits import calibration_info
 
 SNAPSHOT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -50,7 +52,16 @@ def run_and_save(tickers: list[str] | None = None) -> None:
     print(f"  OPTIONS EDGE — Trade Recommendation Snapshot")
     print(f"  Date      : {snap_date}  (last market close: Fri Apr 18 2026)")
     print(f"  Generated : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    ci = calibration_info()
+    print(f"  Exits cal : {ci['source']}  (n={ci['n_contracts']}, "
+          f"last {ci['last_updated']})")
     print(f"{'═'*72}\n")
+
+    # Ensure news sentinel is running — auto-launch if needed. Silent on success.
+    if not ensure_sentinel_running():
+        err = sentinel_last_error() or "server unreachable"
+        print(f"  ⚠ News sentiment OFFLINE — scoring without it ({err})")
+        print(f"    Sentiment can move scores by ±15. Start manually to include it.\n")
 
     # ── Step 1: Discover candidates if no tickers given ────────────────────────
     if tickers is None:
@@ -70,6 +81,12 @@ def run_and_save(tickers: list[str] | None = None) -> None:
 
     for symbol in tickers:
         print(f"  Analysing {symbol}…", end=" ", flush=True)
+        # Refresh sentiment before analysis; failure is non-fatal (scorer
+        # simply gets no sentiment_delta for this ticker).
+        try:
+            sentinel_scan_ticker(symbol)
+        except Exception:
+            pass
         try:
             df, news, err, earnings_edge = analyze_ticker(symbol)
             if err:
@@ -113,7 +130,7 @@ def run_and_save(tickers: list[str] | None = None) -> None:
             "expiry":           row["expiry"],
             "dte":              row["dte"],
             "action":           row["action"],
-            "vol_signal":       "BUY VOL",
+            "vol_signal":       row["vol_signal"],
             "stock_price_at_snap": row["stock_price"],
             "bid":              row["bid"],
             "ask":              row["ask"],
@@ -128,6 +145,18 @@ def run_and_save(tickers: list[str] | None = None) -> None:
             "iv_rank_label":    row.get("iv_rank_label"),
             "max_loss_per_contract": row.get("max_loss_per_contract"),
             "suggested_contracts":   row.get("suggested_contracts"),
+            # New signal feeds wired into the scorer
+            "sentiment_delta":  row.get("sentiment_delta"),
+            "insider_delta":    row.get("insider_delta"),
+            "short_delta":      row.get("short_delta"),
+            "blocks_delta":     row.get("blocks_delta"),
+            "catalyst_delta":   row.get("catalyst_delta"),
+            "pin_delta":        row.get("pin_delta"),
+            "insider_signal":   row.get("insider_signal"),
+            "short_signal":     row.get("short_signal"),
+            "blocks_signal":    row.get("blocks_signal"),
+            "catalyst_summary": row.get("catalyst_summary"),
+            "pin_risk":         row.get("pin_risk"),
             # Filled in tomorrow
             "close_price_next_day": None,
             "pnl_per_contract":     None,
@@ -143,7 +172,52 @@ def run_and_save(tickers: list[str] | None = None) -> None:
         print(f"\n  Skipped tickers:")
         for e in errors:
             print(f"    • {e}")
+
+    # ── Step 5: Auto-recalibrate exit rules from rolling snapshot history ────
+    # Runs in a subprocess so a failure (yfinance hiccup, rate-limit) can't
+    # corrupt the snapshot that was just saved. Silent unless tiers changed.
+    try:
+        _auto_recalibrate()
+    except Exception as e:
+        print(f"  ⚠ Exit recalibration failed (non-fatal): {e}")
     print()
+
+
+def _auto_recalibrate() -> None:
+    """Trigger tools/recalibrate_exits.py in the background-safe way.
+
+    Uses --min-n 20 (the tool's own gate) so thin datasets no-op cleanly.
+    Output is captured and only printed if tiers changed or on error —
+    keeps the snapshot summary uncluttered on routine runs.
+    """
+    import subprocess
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "recalibrate_exits.py")
+    if not os.path.exists(script):
+        return
+    print(f"\n  Recalibrating exit rules from snapshot history…")
+    try:
+        result = subprocess.run(
+            [sys.executable, script],
+            capture_output=True, text=True, timeout=600,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        )
+    except subprocess.TimeoutExpired:
+        print("    (recalibration timed out after 10m — skipped)")
+        return
+    out = (result.stdout or "") + (result.stderr or "")
+    # Surface only the meaningful lines; swallow the yfinance warnings.
+    interesting = [
+        ln for ln in out.splitlines()
+        if any(k in ln for k in (
+            "Priced with intraday", "Below --min-n", "New calibration",
+            "Diff vs previous", "REVIEW", "Wrote ", "score ",
+        ))
+    ]
+    for ln in interesting:
+        print(f"    {ln}")
+    if any("REVIEW" in ln for ln in interesting):
+        print("    ⚠ Tier drift detected — review above before next live run")
 
 
 def _print_catalogue(df: pd.DataFrame, snap_date: str) -> None:

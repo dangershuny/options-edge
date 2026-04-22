@@ -25,12 +25,29 @@ from analysis.earnings_vol import analyze_earnings_edge
 from sentinel_bridge import get_divergence, divergence_score_adjustment
 from risk.sizer import size_trade
 
+# ── New signal feeds (all SAFE-DEFAULT on failure) ───────────────────────────
+from data.insider import get_insider_activity, insider_score_delta
+from data.short_interest import get_short_interest, short_interest_score_delta
+from data.blocks import get_unusual_volume, blocks_score_delta
+from data.catalysts import catalysts_in_window, catalyst_score_delta
+from analysis.pin_risk import assess_pin_risk, pin_risk_score_delta
+
 
 # ── Filters ────────────────────────────────────────────────────────────────────
 OTM_LIMIT  = 0.15   # 15% OTM (was 10%) — captures more directional plays
 MIN_VOLUME = 10     # (was 25) — lower bar; flow signals need fewer contracts
 MIN_DTE    = 7
 MAX_DTE    = 90
+
+# Premium ceiling — reject expensive contracts outright. On Apr 20 snapshot the
+# two worst losses were $24.70 and $21.80 entries (JPM PUT, AMD CALL).
+# The 7 winners were all $2.81–$15.52. Cap at $15 unless score > 80.
+MAX_PREMIUM_HARD     = 15.0   # per-contract cap for normal scores
+MAX_PREMIUM_HIGH_BAR = 25.0   # absolute ceiling even for high-conviction trades
+
+# Trend-exhaustion window (for contrarian check)
+TREND_WINDOW_DAYS     = 10
+TREND_STRETCHED_PCT   = 0.08   # 8% move in 10d = stretched
 
 # FLOW BUY composite signal: unusual activity even without IV<RV edge
 FLOW_BUY_MIN_VOL_OI  = 1.5   # vol/OI ≥ 1.5× = very strong unusual activity
@@ -56,6 +73,11 @@ def _buy_trade_detail(row: pd.Series) -> dict:
     bid   = float(row.get("bid") or 0)
     ask   = float(row.get("ask") or 0)
     entry = _midpoint(bid, ask)
+    # Fallback to lastPrice when markets are closed and bid/ask are both 0
+    if entry == 0:
+        last = float(row.get("lastPrice") or row.get("last_price") or 0)
+        if last > 0:
+            entry = round(last, 2)
     max_loss = round(entry * 100, 2)
     return {
         "leg1_strike": float(row["strike"]),
@@ -120,18 +142,13 @@ def score_contract(
     skew: dict | None = None,
     gex: dict | None = None,
     ivr: dict | None = None,
+    opt_type: str = "call",
+    entry_price: float = 0.0,
+    trend_pct: float | None = None,  # last-10d % return of underlying
 ) -> float:
     """
-    Composite score 0–100.
-
-    Base (unchanged):
-      vol mismatch × 50  |  flow up to 35  |  DTE bonus up to 10
-
-    Bonuses:
-      +8   IV rank confirms signal direction
-      +7   skew direction aligns with vol signal
-      +5   GEX EXPLOSIVE (moves amplify → options pay)
-      -5   GEX PINNED (gamma wall suppresses movement)
+    Composite score 0–100.  See module docstring for loss-pattern notes that
+    motivated the contrarian/premium/trend penalties below.
     """
     vol_sig, _, vol_strength = iv_rv_signal(iv, rv)
     flow_sig = classify_flow(vol_oi_ratio)
@@ -151,9 +168,8 @@ def score_contract(
     elif 14 <= dte <= 60:
         score += 5
 
-    # FLOW BUY gets its own base contribution
     if vol_signal == "FLOW BUY":
-        score = max(score, 30.0)  # floor at 30 — it's a signal, not just noise
+        score = max(score, 30.0)
 
     # ── Enhancement bonuses ───────────────────────────────────────────────────
     if ivr and ivr.get("iv_rank") is not None:
@@ -171,7 +187,7 @@ def score_contract(
             score += 7
         elif vol_signal == "FLOW BUY":
             if skew_sig in ("BULLISH", "BEARISH"):
-                score += 5   # flow aligns with any strong skew
+                score += 5
 
     if gex:
         g_sig = gex.get("gex_signal", "NEUTRAL")
@@ -180,7 +196,33 @@ def score_contract(
         elif g_sig == "PINNED":
             score -= 5
 
-    return round(min(score, 100), 1)
+    # ── Contrarian dampeners (lessons from Apr 20 snapshot losses) ────────────
+    # 1. Peak fear / peak greed: extreme IV rank + aligned directional signal
+    #    often marks capitulation (bounce imminent). The Apr 20 JPM PUT at
+    #    score 53 lost $525 — classic high-IV-rank BUY PUT at bottom.
+    if ivr and ivr.get("iv_rank") is not None:
+        rank = ivr["iv_rank"]
+        if vol_signal == "BUY VOL" and rank > 0.80 and opt_type == "put":
+            score -= 15  # peak fear — puts likely to collapse on bounce
+        elif vol_signal == "BUY VOL" and rank < 0.15 and opt_type == "call":
+            score -= 10  # peak complacency — calls likely to fade
+
+    # 2. Trend exhaustion: buying puts on a stock already down sharply (or
+    #    calls on one already up sharply) is chasing a move that's priced in.
+    if trend_pct is not None and vol_signal in ("BUY VOL", "FLOW BUY"):
+        if opt_type == "put" and trend_pct < -TREND_STRETCHED_PCT:
+            score -= 12  # stock already down >8% in 10d — late on puts
+        elif opt_type == "call" and trend_pct > TREND_STRETCHED_PCT:
+            score -= 12  # stock already up >8% in 10d — late on calls
+
+    # 3. Premium efficiency: expensive contracts have identical "max loss =
+    #    premium" framing but much larger absolute-dollar risk. Winning
+    #    contracts on Apr 20 averaged $8 entry; the two worst losses were
+    #    $24.70 and $21.80. Penalize every $5 over $5 threshold.
+    if entry_price > 5.0:
+        score -= min((entry_price - 5.0) / 5.0 * 4, 15)
+
+    return round(max(min(score, 100), 0), 1)
 
 
 def _is_flow_buy(vol_oi_ratio: float, gex: dict | None) -> bool:
@@ -223,6 +265,11 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
     # IV rank proxy
     ivr = iv_rank(rv30, prices)
 
+    # 10-day trend — used for trend-exhaustion contrarian check
+    trend_pct = None
+    if len(prices) >= TREND_WINDOW_DAYS + 1:
+        trend_pct = float(prices.iloc[-1] / prices.iloc[-(TREND_WINDOW_DAYS + 1)] - 1)
+
     chain_filtered, earnings_date, err = get_options_chain(symbol)
     if err:
         return None, [], err, None
@@ -234,6 +281,16 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
 
     skew = calculate_skew(chain_full, price)
     gex  = calculate_gex(chain_full, price)
+
+    # ── Ticker-level enrichments (one yfinance / EDGAR call per ticker) ──────
+    # Every helper returns a SAFE-DEFAULT dict on failure, so None-guards below
+    # aren't strictly required — but we're defensive anyway.
+    try:    insider_info = get_insider_activity(symbol)
+    except Exception: insider_info = None
+    try:    short_info   = get_short_interest(symbol)
+    except Exception: short_info = None
+    try:    blocks_info  = get_unusual_volume(symbol)
+    except Exception: blocks_info = None
 
     earnings_edge = analyze_earnings_edge(symbol, chain_full, price, earnings_date)
 
@@ -310,10 +367,50 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             trade["trade_detail"] = "—"
             action = "WATCH"
 
+        entry_px_for_score = float(trade.get("entry_price") or 0)
+        # Hard premium ceiling: drop absurdly expensive contracts outright.
+        # Max-loss = premium, so a $25 contract risks $2,500 per lot.
+        if vol_signal in ("BUY VOL", "FLOW BUY") and entry_px_for_score > MAX_PREMIUM_HIGH_BAR:
+            continue
+
         base_score     = score_contract(iv, rv_dte, vol_oi, dte,
-                                        vol_signal=vol_signal, skew=skew, gex=gex, ivr=ivr)
+                                        vol_signal=vol_signal, skew=skew, gex=gex, ivr=ivr,
+                                        opt_type=opt_type, entry_price=entry_px_for_score,
+                                        trend_pct=trend_pct)
         sentiment_delta = divergence_score_adjustment(divergence, vol_signal)
-        final_score    = round(min(max(base_score + sentiment_delta, 0), 100), 1)
+
+        # ── Per-contract enrichments ─────────────────────────────────────────
+        try:
+            catalyst_info = catalysts_in_window(symbol, dte)
+        except Exception:
+            catalyst_info = None
+        try:
+            pin_info = assess_pin_risk(chain_full, price, float(row["strike"]), dte, gex)
+        except Exception:
+            pin_info = None
+
+        # Score deltas — each returns 0.0 on unknown / neutral
+        try:    insider_delta = insider_score_delta(insider_info, opt_type)
+        except Exception: insider_delta = 0.0
+        try:    short_delta   = short_interest_score_delta(short_info, opt_type)
+        except Exception: short_delta = 0.0
+        try:    blocks_delta  = blocks_score_delta(blocks_info, opt_type, vol_signal)
+        except Exception: blocks_delta = 0.0
+        try:    catalyst_delta = catalyst_score_delta(catalyst_info, vol_signal)
+        except Exception: catalyst_delta = 0.0
+        try:    pin_delta     = pin_risk_score_delta(pin_info)
+        except Exception: pin_delta = 0.0
+
+        extras_delta = (insider_delta + short_delta + blocks_delta
+                        + catalyst_delta + pin_delta)
+        final_score = round(min(max(
+            base_score + sentiment_delta + extras_delta, 0), 100), 1)
+
+        # Secondary soft filter: keep >$15 contracts only if score is strong
+        if (vol_signal in ("BUY VOL", "FLOW BUY")
+                and entry_px_for_score > MAX_PREMIUM_HARD
+                and final_score < 80):
+            continue
 
         divergence_flag = "—"
         if divergence and divergence.get("direction"):
@@ -346,6 +443,16 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             "flow_signal":   row["flow_signal"],
             "score":         final_score,
             "sentiment_delta": sentiment_delta,
+            "insider_delta": insider_delta,
+            "short_delta":   short_delta,
+            "blocks_delta":  blocks_delta,
+            "catalyst_delta": catalyst_delta,
+            "pin_delta":     pin_delta,
+            "insider_signal":  (insider_info or {}).get("signal"),
+            "short_signal":    (short_info or {}).get("signal"),
+            "blocks_signal":   (blocks_info or {}).get("signal"),
+            "catalyst_summary": (catalyst_info or {}).get("summary"),
+            "pin_risk":        (pin_info or {}).get("pin_risk"),
             "divergence_flag": divergence_flag,
             "earnings":      earnings_date.strftime("%Y-%m-%d") if earnings_date else "—",
             "iv_rank_label": ivr.get("iv_rank_label", "N/A"),

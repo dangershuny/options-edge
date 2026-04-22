@@ -1,0 +1,74 @@
+==============================================================================
+  BACKTEST REPORT  —  C:\Users\dange\Personal_Projects\options-edge-new\snapshots
+==============================================================================
+  Snapshots parsed:   1
+  Closed trades:      20
+
+OVERALL
+------------------------------------------------------------------------------
+  all trades             n= 20  wins=  7  losses= 13  hit=  35.0%  ROI=  -5.6%  avgW=$   49.29  avgL=$  -86.31
+
+BY VOL SIGNAL
+------------------------------------------------------------------------------
+  BUY VOL                n= 20  wins=  7  losses= 13  hit=  35.0%  ROI=  -5.6%  avgW=$   49.29  avgL=$  -86.31
+
+BY SCORE BUCKET
+------------------------------------------------------------------------------
+  0-40                   n=  4  wins=  3  losses=  1  hit=  75.0%  ROI=   5.2%  avgW=$   67.33  avgL=$  -45.00
+  40-60                  n= 14  wins=  4  losses= 10  hit=  28.6%  ROI=  -8.6%  avgW=$   35.75  avgL=$ -103.80
+  60-80                  n=  2  wins=  0  losses=  2  hit=   0.0%  ROI=  -8.8%  avgW=    n/a  avgL=$  -19.50
+
+BY OPTION TYPE
+------------------------------------------------------------------------------
+  CALL                   n= 12  wins=  7  losses=  5  hit=  58.3%  ROI=   0.5%  avgW=$   49.29  avgL=$  -60.20
+  PUT                    n=  8  wins=  0  losses=  8  hit=   0.0%  ROI= -18.2%  avgW=    n/a  avgL=$ -102.62
+
+BY DTE BUCKET
+------------------------------------------------------------------------------
+  14-30                  n=  1  wins=  0  losses=  1  hit=   0.0%  ROI= -21.3%  avgW=    n/a  avgL=$ -525.00
+  30-60                  n= 18  wins=  7  losses= 11  hit=  38.9%  ROI=  -1.4%  avgW=$   49.29  avgL=$  -45.82
+  <14                    n=  1  wins=  0  losses=  1  hit=   0.0%  ROI= -47.0%  avgW=    n/a  avgL=$  -93.00
+
+BY IV RANK LABEL
+------------------------------------------------------------------------------
+  ABOVE AVG              n=  6  wins=  3  losses=  3  hit=  50.0%  ROI=   2.2%  avgW=$   38.67  avgL=$   -6.00
+  BELOW AVG              n=  2  wins=  0  losses=  2  hit=   0.0%  ROI= -11.3%  avgW=    n/a  avgL=$ -141.50
+  HIGH                   n= 10  wins=  4  losses=  6  hit=  40.0%  ROI=   0.6%  avgW=$   57.25  avgL=$  -33.83
+  LOW                    n=  2  wins=  0  losses=  2  hit=   0.0%  ROI= -23.2%  avgW=    n/a  avgL=$ -309.00
+
+BY GEX SIGNAL
+------------------------------------------------------------------------------
+  EXPLOSIVE              n=  5  wins=  3  losses=  2  hit=  60.0%  ROI=   1.2%  avgW=$   67.33  avgL=$  -80.00
+  PINNED                 n=  1  wins=  0  losses=  1  hit=   0.0%  ROI= -11.6%  avgW=    n/a  avgL=$ -253.00
+  SUPPORTIVE             n= 14  wins=  4  losses= 10  hit=  28.6%  ROI=  -6.9%  avgW=$   35.75  avgL=$  -70.90
+
+BY SKEW SIGNAL
+------------------------------------------------------------------------------
+  NEUTRAL                n= 20  wins=  7  losses= 13  hit=  35.0%  ROI=  -5.6%  avgW=$   49.29  avgL=$  -86.31
+
+BY SECTOR
+------------------------------------------------------------------------------
+  Auto                   n=  3  wins=  0  losses=  3  hit=   0.0%  ROI=  -7.8%  avgW=    n/a  avgL=$  -13.67
+  Crypto                 n=  4  wins=  3  losses=  1  hit=  75.0%  ROI=   2.5%  avgW=$   38.67  avgL=$   -7.00
+  Energy                 n=  5  wins=  1  losses=  4  hit=  20.0%  ROI=  -2.4%  avgW=$   27.00  avgL=$  -10.75
+  Finance                n=  2  wins=  0  losses=  2  hit=   0.0%  ROI= -23.2%  avgW=    n/a  avgL=$ -309.00
+  Healthcare             n=  5  wins=  3  losses=  2  hit=  60.0%  ROI=   1.2%  avgW=$   67.33  avgL=$  -80.00
+  Tech                   n=  1  wins=  0  losses=  1  hit=   0.0%  ROI= -11.6%  avgW=    n/a  avgL=$ -253.00
+
+TOP WINS
+------------------------------------------------------------------------------
+  2026-04-20   BNTX   call  $  97.50  exp 2026-06-18  score  22.7  entry $ 11.55  close $ 12.30  pnl $  +75.00
+  2026-04-20   BNTX   call  $ 115.00  exp 2026-06-18  score  25.9  entry $  3.33  close $  4.00  pnl $  +67.00
+  2026-04-20   BNTX   call  $ 110.00  exp 2026-06-18  score  24.8  entry $  4.85  close $  5.45  pnl $  +60.00
+  2026-04-20   HOOD   call  $  78.00  exp 2026-05-22  score  45.0  entry $ 15.52  close $ 15.95  pnl $  +43.00
+  2026-04-20   HOOD   call  $  83.00  exp 2026-05-22  score  45.0  entry $ 12.20  close $ 12.60  pnl $  +40.00
+
+TOP LOSSES
+------------------------------------------------------------------------------
+  2026-04-20   JPM    put   $ 335.00  exp 2026-05-15  score  53.0  entry $ 24.70  close $ 19.45  pnl $ -525.00
+  2026-04-20   AMD    call  $ 275.00  exp 2026-05-22  score  56.9  entry $ 21.80  close $ 19.27  pnl $ -253.00
+  2026-04-20   BNTX   put   $  97.50  exp 2026-06-18  score  41.9  entry $  4.45  close $  3.30  pnl $ -115.00
+  2026-04-20   JPM    put   $ 300.00  exp 2026-05-01  score  53.2  entry $  1.98  close $  1.05  pnl $  -93.00
+  2026-04-20   BNTX   put   $ 110.00  exp 2026-06-18  score  28.7  entry $ 10.25  close $  9.80  pnl $  -45.00
+
+==============================================================================

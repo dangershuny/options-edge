@@ -1,45 +1,137 @@
 """
 HTTP client bridge between options-edge and the news_sentinel server (localhost:8502).
 
-The sentinel server must be running: `python news_sentinel/server.py`
-If offline, all calls return safe empty defaults — options-edge degrades gracefully.
+`ensure_sentinel_running()` auto-launches the server if it's not already up.
+If it cannot be launched or stays unreachable, calls return None — scoring
+proceeds without sentiment and a warning is surfaced to the user.
 """
 
 import json
+import os
+import subprocess
+import sys
+import time
 from urllib.request import urlopen
-from urllib.error import URLError
 
-SENTINEL_URL = "http://localhost:8502"
-TIMEOUT = 1.5  # fail fast; don't block a scan
+SENTINEL_URL  = "http://localhost:8502"
+TIMEOUT       = 1.5           # per-request timeout for cheap GETs (health, /divergence)
+SCAN_TIMEOUT  = 45.0          # /scan does full news+social fetch; allow longer
+STARTUP_WAIT  = 10.0          # seconds to wait for a freshly-launched server
+POLL_INTERVAL = 0.5
+
+# Resolve news_sentinel/server.py next to this repo (sibling under Claude Projects).
+SENTINEL_DIR = os.path.abspath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "..", "OneDrive", "Documents", "Claude Projects", "news_sentinel",
+))
+SENTINEL_SERVER_SCRIPT = os.path.join(SENTINEL_DIR, "server.py")
 
 _server_up: bool | None = None
+_launch_attempted = False
+_last_error: str | None = None
+
+
+def _ping(timeout: float = TIMEOUT) -> bool:
+    try:
+        urlopen(f"{SENTINEL_URL}/health", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def _launch_server() -> bool:
+    """Start news_sentinel server in background. Returns True if it came up."""
+    global _last_error
+    if not os.path.exists(SENTINEL_SERVER_SCRIPT):
+        _last_error = f"server.py not found at {SENTINEL_SERVER_SCRIPT}"
+        return False
+    try:
+        creationflags = 0
+        if sys.platform == "win32":
+            # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — survive parent exit, no console window
+            creationflags = 0x00000008 | 0x00000200
+        subprocess.Popen(
+            [sys.executable, SENTINEL_SERVER_SCRIPT],
+            cwd=SENTINEL_DIR,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+            close_fds=True,
+        )
+    except Exception as e:
+        _last_error = f"failed to launch server: {e}"
+        return False
+
+    # Poll until healthy or timeout
+    deadline = time.time() + STARTUP_WAIT
+    while time.time() < deadline:
+        if _ping(timeout=0.5):
+            return True
+        time.sleep(POLL_INTERVAL)
+    _last_error = f"server launched but did not respond within {STARTUP_WAIT}s"
+    return False
+
+
+def ensure_sentinel_running() -> bool:
+    """
+    Ensure the sentinel server is reachable. Call this once at scan start.
+    If already up → no-op. If down → attempt launch, wait for health.
+    Subsequent calls are cached (cheap).
+    """
+    global _server_up, _launch_attempted, _last_error
+
+    if _server_up is True:
+        return True
+
+    if _ping():
+        _server_up = True
+        return True
+
+    if _launch_attempted:
+        # Already tried this session; don't keep retrying.
+        _server_up = False
+        return False
+
+    _launch_attempted = True
+    if _launch_server():
+        _server_up = True
+        return True
+    _server_up = False
+    return False
 
 
 def _probe() -> bool:
-    global _server_up
-    if _server_up is not None:
-        return _server_up
-    try:
-        urlopen(f"{SENTINEL_URL}/health", timeout=TIMEOUT)
-        _server_up = True
-    except Exception:
-        _server_up = False
-    return _server_up
+    """Legacy probe — now defers to ensure_sentinel_running()."""
+    return ensure_sentinel_running()
 
 
-def _get(path: str) -> dict | None:
+def _get(path: str, timeout: float = TIMEOUT) -> dict | None:
     if not _probe():
         return None
     try:
-        with urlopen(f"{SENTINEL_URL}{path}", timeout=TIMEOUT) as r:
+        with urlopen(f"{SENTINEL_URL}{path}", timeout=timeout) as r:
             return json.loads(r.read())
     except Exception:
         return None
 
 
-def get_divergence(ticker: str) -> dict | None:
-    """Returns the latest divergence event for ticker, or None."""
-    return _get(f"/divergence?ticker={ticker.upper()}")
+def get_divergence(ticker: str, max_age_hours: int = 24) -> dict | None:
+    """
+    Returns the latest FRESH divergence event for ticker, or None.
+
+    Server filters by flagged_at >= now - max_age_hours so a stale divergence
+    flagged days ago can't keep scoring today's trades. Default 24h.
+    """
+    return _get(f"/divergence?ticker={ticker.upper()}&max_age_hours={max_age_hours}")
+
+
+def scan_ticker(ticker: str) -> dict | None:
+    """
+    Trigger a fresh news_sentinel scan for `ticker`. Blocks until complete.
+    Uses a longer timeout since /scan does full news+social+Claude analysis.
+    """
+    return _get(f"/scan?ticker={ticker.upper()}", timeout=SCAN_TIMEOUT)
 
 
 def divergence_score_adjustment(divergence: dict | None, vol_signal: str) -> float:
@@ -76,3 +168,8 @@ def sentinel_status() -> str:
     if _server_up is None:
         return "not checked"
     return "connected" if _server_up else "offline"
+
+
+def sentinel_last_error() -> str | None:
+    """Reason the last launch/probe failed, if any."""
+    return _last_error
