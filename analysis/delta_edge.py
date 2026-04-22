@@ -52,13 +52,14 @@ def delta_score_delta(delta: float | None, vol_signal: str) -> float:
     """
     if delta is None or vol_signal not in ("BUY VOL", "FLOW BUY"):
         return 0.0
+    from analysis.weights import w
     ad = abs(delta)
     if ad < 0.10:
-        return -8.0
+        return w("delta.lottery_hard", -8.0)
     if ad < 0.15:
-        return -4.0
+        return w("delta.lottery_soft", -4.0)
     if 0.25 <= ad <= 0.45:
-        return +4.0
+        return w("delta.sweet_spot", 4.0)
     if ad > 0.65:
-        return -2.0
+        return w("delta.deep_itm", -2.0)
     return 0.0

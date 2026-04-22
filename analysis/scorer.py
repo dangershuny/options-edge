@@ -39,6 +39,7 @@ from analysis.trend_filter import classify_trend, trend_score_delta
 from analysis.confluence import evaluate_confluence
 from analysis.delta_edge import contract_delta, delta_score_delta
 from data.macro import get_vix_context, macro_score_delta
+from analysis.weights import w as _w
 
 
 # ── Filters ────────────────────────────────────────────────────────────────────
@@ -218,10 +219,11 @@ def score_contract(
     # 2. Trend exhaustion: buying puts on a stock already down sharply (or
     #    calls on one already up sharply) is chasing a move that's priced in.
     if trend_pct is not None and vol_signal in ("BUY VOL", "FLOW BUY"):
+        _te = _w("contra.trend_exhaust", -12.0)
         if opt_type == "put" and trend_pct < -TREND_STRETCHED_PCT:
-            score -= 12  # stock already down >8% in 10d — late on puts
+            score += _te  # stock already down >8% in 10d — late on puts
         elif opt_type == "call" and trend_pct > TREND_STRETCHED_PCT:
-            score -= 12  # stock already up >8% in 10d — late on calls
+            score += _te  # stock already up >8% in 10d — late on calls
 
     # 3. Premium efficiency: expensive contracts have identical "max loss =
     #    premium" framing but much larger absolute-dollar risk. Winning

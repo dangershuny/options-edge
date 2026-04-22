@@ -84,11 +84,12 @@ def trend_score_delta(tr: TrendRegime | None, opt_type: str,
     aligned = (is_call and tr.regime == "UPTREND") or (
         not is_call and tr.regime == "DOWNTREND"
     )
+    from analysis.weights import w
     if aligned:
         # Fading trend (slope turning over): discount the bonus.
         if is_call and tr.slope_20d < 0:
-            return +2.0
+            return w("trend.fading", 2.0)
         if not is_call and tr.slope_20d > 0:
-            return +2.0
-        return +4.0
-    return -3.0
+            return w("trend.fading", 2.0)
+        return w("trend.aligned", 4.0)
+    return w("trend.counter", -3.0)

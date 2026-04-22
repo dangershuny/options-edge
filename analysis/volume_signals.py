@@ -44,6 +44,8 @@ try:
 except Exception:  # pragma: no cover - yfinance is a hard dep elsewhere
     yf = None  # type: ignore
 
+from analysis.weights import w
+
 
 # ── 1. Relative volume ───────────────────────────────────────────────────────
 
@@ -115,11 +117,11 @@ def rvol_score_delta(rv: RVOLResult | None, vol_signal: str) -> float:
     if rv is None or vol_signal not in ("BUY VOL", "FLOW BUY"):
         return 0.0
     if rv.label == "HOT":
-        return +6.0
+        return w("rvol.hot", 6.0)
     if rv.label == "ELEVATED":
-        return +3.0
+        return w("rvol.elevated", 3.0)
     if rv.label == "QUIET":
-        return -3.0
+        return w("rvol.quiet", -3.0)
     return 0.0
 
 
@@ -165,7 +167,7 @@ def aggressive_flow_delta(bid: float, ask: float, last: float,
     # side, same direction. So we read ratio the same way: ratio > 0 on a
     # put print means puts are being lifted at the ask = put demand =
     # aligned with a BUY PUT thesis.
-    return round(ratio * 5.0, 2)
+    return round(ratio * w("agg_flow.max", 5.0), 2)
 
 
 # ── 3. Chain directional bias (call vol vs put vol) ──────────────────────────
@@ -214,10 +216,11 @@ def directional_bias_delta(bias: DirectionalBias | None,
         return 0.0
     if vol_signal not in ("BUY VOL", "FLOW BUY"):
         return 0.0
+    db = w("dir_bias.max", 3.0)
     if opt_type.startswith("c"):
-        return +3.0 if bias.label == "CALL_HEAVY" else -3.0
+        return +db if bias.label == "CALL_HEAVY" else -db
     else:
-        return +3.0 if bias.label == "PUT_HEAVY" else -3.0
+        return +db if bias.label == "PUT_HEAVY" else -db
 
 
 # ── 4. VWAP alignment ────────────────────────────────────────────────────────
@@ -286,7 +289,8 @@ def vwap_alignment_delta(vw: VWAPResult | None, opt_type: str,
         return 0.0
     aligned = (is_call and pct > 0) or (not is_call and pct < 0)
     magnitude = min(abs(pct) / 0.01, 1.5)  # scales up to ±1.5×
-    return round((+4.0 if aligned else -3.0) * magnitude, 2)
+    bonus = w("vwap.aligned", 4.0) if aligned else w("vwap.fighting", -3.0)
+    return round(bonus * magnitude, 2)
 
 
 # ── Combined helper: bundle all four deltas for the scorer ───────────────────
@@ -298,8 +302,10 @@ def compute_volume_deltas(
     rvol: RVOLResult | None = None,
     bias: DirectionalBias | None = None,
     vwap: VWAPResult | None = None,
-    cap: float = 15.0,
+    cap: float | None = None,
 ) -> dict:
+    if cap is None:
+        cap = w("vol_bundle.cap", 15.0)
     """
     One-call helper for scorer.py. Returns a dict with each individual
     delta (for debugging / display) plus the capped total.

@@ -106,21 +106,22 @@ def macro_score_delta(macro: dict | None, vol_signal: str) -> float:
     Backwardation term-slope overlay:
       slope < −3 (deep backwardation)    → additional −3 on long vol
     """
+    from analysis.weights import w
     if not macro or vol_signal not in ("BUY VOL", "FLOW BUY"):
         return 0.0
     regime = macro.get("regime")
     delta = 0.0
     if regime == "LOW":
-        delta = +4.0
+        delta = w("macro.vix_low", 4.0)
     elif regime == "NORMAL":
         delta = 0.0
     elif regime == "ELEVATED":
-        delta = -3.0
+        delta = w("macro.vix_elevated", -3.0)
     elif regime == "FEAR":
-        delta = -8.0
+        delta = w("macro.vix_fear", -8.0)
     slope = macro.get("term_slope")
     if isinstance(slope, (int, float)) and slope is not None and slope < -3:
-        delta -= 3.0
+        delta += w("macro.backwardation", -3.0)
     return round(delta, 2)
 
 

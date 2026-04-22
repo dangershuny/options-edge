@@ -1,0 +1,13 @@
+{
+  "contra.trend_exhaust": -2.85,
+  "macro.vix_elevated": -1.32,
+  "macro.vix_fear": -3.53,
+  "macro.vix_low": 5.89,
+  "rvol.elevated": 1.44,
+  "rvol.hot": 2.88,
+  "rvol.quiet": -0.5,
+  "trend.aligned": 1.39,
+  "trend.counter": -0.5,
+  "vwap.aligned": 2.32,
+  "vwap.fighting": -0.52
+}

@@ -1,0 +1,11 @@
+{
+  "snapshot_date": "2026-04-21",
+  "generated_at": "2026-04-21T23:07:06.133168",
+  "last_close_date": "2026-04-18",
+  "risk_settings": {
+    "portfolio_size": 500,
+    "max_cost_per_trade": 75,
+    "min_score_to_trade": 75
+  },
+  "trades": []
+}
