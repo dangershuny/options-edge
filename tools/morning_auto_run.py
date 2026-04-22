@@ -322,10 +322,19 @@ def main() -> int:
     summary_path = LOG_DIR / f"morning_auto_run_{today}.json"
     summary_path.write_text(json.dumps(summary, indent=2, default=str))
 
+    # Regenerate dashboard.html so user can open it fresh
+    try:
+        from tools.build_dashboard import build as _build_dash
+        dash_path = _build_dash()
+        print(f"\n[OK] Dashboard refreshed: {dash_path}")
+    except Exception as e:
+        print(f"\n[WARN] Dashboard regen failed: {e}")
+
     print(f"\n{'=' * 60}")
     print(f"  DONE in {summary['elapsed_sec']:.1f}s")
-    print(f"  Summary: {summary_path}")
-    print(f"  Log:     {log_path}")
+    print(f"  Summary:   {summary_path}")
+    print(f"  Log:       {log_path}")
+    print(f"  Dashboard: {REPO_ROOT / 'dashboard.html'}")
     print(f"{'=' * 60}")
 
     # Email alert — always, so user knows what happened
