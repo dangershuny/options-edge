@@ -35,6 +35,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# Load .env before anything imports broker code
+import config_loader  # noqa: F401  (side-effect: loads Alpaca keys)
+
 OUTPUT_PATH = REPO_ROOT / "logs" / "paper_trades.jsonl"
 OUTPUT_PATH.parent.mkdir(exist_ok=True)
 
