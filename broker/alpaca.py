@@ -114,6 +114,7 @@ class AccountSnapshot:
     day_trade_count: int   # 0 for cash accounts
     account_blocked: bool
     is_paper: bool
+    account_number: str = ""  # Alpaca account ID (e.g. PA3NZ2BBJVOY)
 
 
 def get_account() -> AccountSnapshot:
@@ -135,6 +136,7 @@ def get_account() -> AccountSnapshot:
         day_trade_count=int(getattr(a, "daytrade_count", 0) or 0),
         account_blocked=bool(getattr(a, "account_blocked", False)),
         is_paper=_env_bool("ALPACA_PAPER", True),
+        account_number=str(getattr(a, "account_number", "") or ""),
     )
 
 
