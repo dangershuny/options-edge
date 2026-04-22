@@ -32,6 +32,13 @@ from data.short_interest import get_short_interest, short_interest_score_delta
 from data.blocks import get_unusual_volume, blocks_score_delta
 from data.catalysts import catalysts_in_window, catalyst_score_delta
 from analysis.pin_risk import assess_pin_risk, pin_risk_score_delta
+from analysis.volume_signals import (
+    fetch_rvol, fetch_vwap, chain_directional_bias, compute_volume_deltas,
+)
+from analysis.trend_filter import classify_trend, trend_score_delta
+from analysis.confluence import evaluate_confluence
+from analysis.delta_edge import contract_delta, delta_score_delta
+from data.macro import get_vix_context, macro_score_delta
 
 
 # ── Filters ────────────────────────────────────────────────────────────────────
@@ -303,6 +310,20 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
     try:    blocks_info  = get_unusual_volume(symbol)
     except Exception: blocks_info = None
 
+    # ── Volume edge (RVOL + VWAP + chain bias) + trend regime ────────────────
+    try:    rvol_info = fetch_rvol(symbol)
+    except Exception: rvol_info = None
+    try:    vwap_info = fetch_vwap(symbol)
+    except Exception: vwap_info = None
+    try:    trend_info = classify_trend(prices)
+    except Exception: trend_info = None
+    try:    chain_bias = chain_directional_bias(chain_full)
+    except Exception: chain_bias = None
+
+    # Macro regime — cached across the entire scan (one fetch per run)
+    try:    macro = get_vix_context()
+    except Exception: macro = None
+
     earnings_edge = analyze_earnings_edge(symbol, chain_full, price, earnings_date)
 
     # ── Filter to tradeable contracts ─────────────────────────────────────────
@@ -421,8 +442,58 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
         try:    pin_delta     = pin_risk_score_delta(pin_info)
         except Exception: pin_delta = 0.0
 
+        # ── Volume-family deltas + trend confirmation ────────────────────
+        try:
+            last_px = float(row.get("lastPrice") or row.get("last_price") or 0)
+            vol_deltas = compute_volume_deltas(
+                bid=float(row.get("bid") or 0),
+                ask=float(row.get("ask") or 0),
+                last=last_px,
+                opt_type=opt_type,
+                vol_signal=vol_signal,
+                vol_oi_ratio=vol_oi,
+                rvol=rvol_info,
+                bias=chain_bias,
+                vwap=vwap_info,
+            )
+        except Exception:
+            vol_deltas = {
+                "rvol_delta": 0.0, "agg_delta": 0.0,
+                "dir_bias_delta": 0.0, "vwap_delta": 0.0,
+                "volume_delta_total": 0.0,
+            }
+        try:    trend_delta = trend_score_delta(trend_info, opt_type, vol_signal)
+        except Exception: trend_delta = 0.0
+
+        # ── Delta-aware edge (penalise lottery tickets, reward sweet spot) ──
+        try:
+            delta_val = contract_delta(price, float(row["strike"]), dte, iv, opt_type)
+        except Exception:
+            delta_val = None
+        try:    delta_delta = delta_score_delta(delta_val, vol_signal)
+        except Exception: delta_delta = 0.0
+
+        # ── Macro / VIX regime scaling ──────────────────────────────────────
+        try:    macro_delta = macro_score_delta(macro, vol_signal)
+        except Exception: macro_delta = 0.0
+
+        # ── Signal confluence (non-linear in agreement count) ───────────────
+        try:
+            conf = evaluate_confluence(
+                vol_signal=vol_signal, flow_signal=row["flow_signal"],
+                opt_type=opt_type, skew=skew, gex=gex,
+                insider_info=insider_info, blocks_info=blocks_info,
+                chain_bias=chain_bias, trend=trend_info,
+            )
+            conf_delta = conf.score_delta
+        except Exception:
+            conf = None
+            conf_delta = 0.0
+
         extras_delta = (insider_delta + short_delta + blocks_delta
-                        + catalyst_delta + pin_delta)
+                        + catalyst_delta + pin_delta
+                        + vol_deltas["volume_delta_total"] + trend_delta
+                        + delta_delta + macro_delta + conf_delta)
         final_score = round(min(max(
             base_score + sentiment_delta + extras_delta, 0), 100), 1)
 
@@ -468,6 +539,26 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             "blocks_delta":  blocks_delta,
             "catalyst_delta": catalyst_delta,
             "pin_delta":     pin_delta,
+            "rvol_delta":    vol_deltas["rvol_delta"],
+            "agg_delta":     vol_deltas["agg_delta"],
+            "dir_bias_delta": vol_deltas["dir_bias_delta"],
+            "vwap_delta":    vol_deltas["vwap_delta"],
+            "trend_delta":   trend_delta,
+            "delta_delta":   delta_delta,
+            "macro_delta":   macro_delta,
+            "confluence_delta": conf_delta,
+            "delta":         delta_val,
+            "confluence_label": (conf.label if conf else None),
+            "confluence_agree":  (conf.agree if conf else None),
+            "confluence_disagree": (conf.disagree if conf else None),
+            "vix_regime":    (macro.get("regime") if macro else None),
+            "vix":           (macro.get("vix") if macro else None),
+            "rvol":          (rvol_info.rvol if rvol_info else None),
+            "rvol_label":    (rvol_info.label if rvol_info else None),
+            "vwap":          (vwap_info.vwap if vwap_info else None),
+            "vwap_side":     (vwap_info.side if vwap_info else None),
+            "trend_regime":  (trend_info.regime if trend_info else None),
+            "chain_bias":    (chain_bias.label if chain_bias else None),
             "insider_signal":  (insider_info or {}).get("signal"),
             "short_signal":    (short_info or {}).get("signal"),
             "blocks_signal":   (blocks_info or {}).get("signal"),

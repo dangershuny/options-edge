@@ -27,7 +27,7 @@ from data.market import get_current_price, get_options_chain, check_market_cap
 from analysis.vol import calculate_rv, iv_rv_signal
 from analysis.scorer import analyze_ticker
 from analysis.discover import run_discovery
-from risk.config import RISK, auto_select_mode, apply_mode
+from risk.config import RISK, auto_select_mode, apply_mode, MICRO_MODE, STANDARD_MODE, FULL_MODE
 from sentinel_bridge import ensure_sentinel_running, sentinel_last_error, scan_ticker as sentinel_scan_ticker
 from risk.exits import calibration_info
 
@@ -43,22 +43,29 @@ def _fmt_date() -> str:
     return date.today().isoformat()
 
 
-def run_and_save(tickers: list[str] | None = None) -> None:
+def run_and_save(tickers: list[str] | None = None,
+                 mode_override: str | None = None,
+                 suffix: str | None = None) -> None:
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
     snap_date = _fmt_date()
-    snap_path = os.path.join(SNAPSHOT_DIR, f"{snap_date}.json")
+    fname = f"{snap_date}{('_' + suffix) if suffix else ''}.json"
+    snap_path = os.path.join(SNAPSHOT_DIR, fname)
 
     print(f"\n{'═'*72}")
     print(f"  OPTIONS EDGE — Trade Recommendation Snapshot")
     print(f"  Date      : {snap_date}  (last market close: Fri Apr 18 2026)")
     print(f"  Generated : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Auto-select account-size mode from current portfolio. MICRO <$1K,
-    # STANDARD <$5K, FULL otherwise. Filters applied to this scan.
-    mode = auto_select_mode(RISK["portfolio_size"])
+    # Mode: explicit override (for A/B comparisons) OR auto-select from portfolio.
+    if mode_override:
+        mode_map = {"MICRO": MICRO_MODE, "STANDARD": STANDARD_MODE, "FULL": FULL_MODE}
+        mode = mode_map[mode_override.upper()]
+        mode_name = mode_override.upper()
+    else:
+        mode = auto_select_mode(RISK["portfolio_size"])
+        mode_name = ("MICRO" if RISK["portfolio_size"] < 1_000 else
+                     "STANDARD" if RISK["portfolio_size"] < 5_000 else "FULL")
     apply_mode(mode)
-    mode_name = ("MICRO" if RISK["portfolio_size"] < 1_000 else
-                 "STANDARD" if RISK["portfolio_size"] < 5_000 else "FULL")
     print(f"  Mode      : {mode_name}  "
           f"(portfolio ${RISK['portfolio_size']:,}, "
           f"max/trade ${RISK['max_cost_per_trade']}, "
@@ -286,5 +293,11 @@ def _print_catalogue(df: pd.DataFrame, snap_date: str) -> None:
 
 
 if __name__ == "__main__":
-    tickers_arg = sys.argv[1:] if len(sys.argv) > 1 else None
-    run_and_save(tickers_arg)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("tickers", nargs="*", help="explicit tickers (else discovery)")
+    ap.add_argument("--mode", choices=["MICRO", "STANDARD", "FULL"],
+                    help="override auto mode selection")
+    ap.add_argument("--suffix", help="append to output filename, e.g. 'micro'")
+    args = ap.parse_args()
+    run_and_save(args.tickers or None, mode_override=args.mode, suffix=args.suffix)

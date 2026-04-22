@@ -206,6 +206,30 @@ RISK: dict = {
     # proceeds on the next entry.
     "min_settled_cash_fraction": 0.20,
 
+    # ── Live news-monitor exit (intraday) ─────────────────────────────────────
+    # Every N seconds during the session, pull fresh headlines for every open
+    # underlying. If a material article's sentiment runs *against* the
+    # position (bearish for a long call, bullish for a long put), fire an
+    # exit trigger. Falls through the same same_day_exit_allowed gate as
+    # SL/trailing/theta so cash accounts queue for next session.
+    "news_exit_enabled":               True,
+    "news_check_interval_seconds":     600,     # 10 minutes
+    "news_sentiment_adverse_cutoff":   -0.45,   # for a long call, treat
+                                                # sentiment ≤ −0.45 as adverse;
+                                                # for a long put, ≥ +0.45.
+    "news_require_min_articles":       1,       # count of fresh adverse
+                                                # articles needed to fire
+    "news_ignore_social_only":         True,    # StockTwits/IHub alone
+                                                # never triggers exits
+    "news_entry_lookback_minutes":     60,      # refuse entry if adverse
+                                                # news hit in last N minutes
+
+    # ── Liquidity floors (entry-time) ─────────────────────────────────────────
+    # Open-interest minimum for any new entry. Contracts with OI < 100 often
+    # have stale prints & wide effective spreads even when the displayed
+    # NBBO looks tight. Setting this to 0 disables the check.
+    "min_open_interest":               100,
+
     # ── Account-size filters (set by apply_mode) ──────────────────────────────
     # Defaults below match FULL_MODE so behavior is identical to pre-mode code
     # when apply_mode() is never called.

@@ -184,6 +184,32 @@ def get_news(ticker: str, max_age_days: int = 5, limit: int = 6) -> list[dict]:
     return _call_rss_multi(ticker, max_age_days, limit)
 
 
+def get_news_since(ticker: str, since: datetime, limit: int = 20) -> list[dict]:
+    """
+    Return articles published strictly after `since`. Used by the live
+    intraday news monitor — we don't want to re-act to news we already
+    saw at the last tick.
+
+    `since` should be timezone-aware UTC; naive datetimes are treated as UTC.
+    """
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    articles = get_news(ticker, max_age_days=2, limit=limit)
+    fresh: list[dict] = []
+    for a in articles:
+        pub = a.get("published")
+        if pub is None:
+            # No timestamp — conservative: include it so we don't miss a
+            # breaking headline just because the feed didn't date-stamp it.
+            fresh.append(a)
+            continue
+        if pub.tzinfo is None:
+            pub = pub.replace(tzinfo=timezone.utc)
+        if pub > since:
+            fresh.append(a)
+    return fresh
+
+
 def news_tool_status() -> str:
     if _news_tool_up is None:
         return "not checked"

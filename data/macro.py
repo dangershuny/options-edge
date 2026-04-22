@@ -95,6 +95,55 @@ def _fetch_close(symbol: str) -> float | None:
         return None
 
 
+def macro_score_delta(macro: dict | None, vol_signal: str) -> float:
+    """
+    Macro regime adjustment for a proposed long-premium trade.
+
+    LOW VIX  + BUY VOL  → +4  (buying cheap options; favourable)
+    NORMAL                → 0
+    ELEVATED + BUY VOL  → −3  (paying elevated premium; unfavourable for long)
+    FEAR     + BUY VOL  → −8  (very expensive premium + IV-crush risk)
+    Backwardation term-slope overlay:
+      slope < −3 (deep backwardation)    → additional −3 on long vol
+    """
+    if not macro or vol_signal not in ("BUY VOL", "FLOW BUY"):
+        return 0.0
+    regime = macro.get("regime")
+    delta = 0.0
+    if regime == "LOW":
+        delta = +4.0
+    elif regime == "NORMAL":
+        delta = 0.0
+    elif regime == "ELEVATED":
+        delta = -3.0
+    elif regime == "FEAR":
+        delta = -8.0
+    slope = macro.get("term_slope")
+    if isinstance(slope, (int, float)) and slope is not None and slope < -3:
+        delta -= 3.0
+    return round(delta, 2)
+
+
+def macro_size_multiplier(macro: dict | None) -> float:
+    """
+    Sizing multiplier that shrinks position size in hostile regimes. Applied
+    inside sizer.size_trade() so every trade scales with regime quality.
+
+      LOW      → 1.10  (tiny upsize; cheap premium)
+      NORMAL   → 1.00
+      ELEVATED → 0.75
+      FEAR     → 0.50  (half size when VIX > 30)
+      UNKNOWN  → 0.90
+    """
+    if not macro:
+        return 0.90
+    regime = macro.get("regime", "UNKNOWN")
+    return {
+        "LOW": 1.10, "NORMAL": 1.00, "ELEVATED": 0.75,
+        "FEAR": 0.50, "UNKNOWN": 0.90,
+    }.get(regime, 1.0)
+
+
 def _unknown() -> dict:
     return {
         "vix":        None,

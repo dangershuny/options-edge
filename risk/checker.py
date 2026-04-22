@@ -38,6 +38,13 @@ from risk.config import RISK, RiskLimitExceeded
 # Default-deny is the correct posture.
 
 PRE_CATALYST_MIN_DTE = 10
+
+# Hard block catalyst day itself (and the day before) regardless of overrides.
+# On the day of earnings / FOMC / PDUFA, IV is maximally priced in and IV
+# crush immediately after the print is the single highest-expectancy way to
+# LOSE money on a long-premium trade. No override should let you buy calls
+# or puts on the day of an announcement.
+CATALYST_DAY_HARD_BLOCK_DAYS = 1  # catalyst within ≤1 day = blocked, always
 VALID_CATALYST_OVERRIDES = {
     "volatility_play", "post_event", "iv_underpriced",
     "defined_risk", "strong_informed",
@@ -91,6 +98,18 @@ def check_pre_catalyst(
     if cat_date > expiry_date:
         return True, f"catalyst {cat_date} is after expiry {expiry_date}"
 
+    # Hard block: catalyst is today or tomorrow. No override allowed and the
+    # long-DTE "absorbs it" escape hatch also doesn't apply — IV crush on
+    # the print happens in seconds and dwarfs any directional edge we could
+    # capture by holding through. Checked BEFORE any allow-path.
+    days_to_catalyst = (cat_date - today).days
+    if days_to_catalyst <= CATALYST_DAY_HARD_BLOCK_DAYS:
+        return False, (
+            f"catalyst {cat_date} is {days_to_catalyst} day(s) away — "
+            f"IV-crush hard block (no override permitted within "
+            f"{CATALYST_DAY_HARD_BLOCK_DAYS} day(s))"
+        )
+
     # Catalyst lands inside window AND DTE is long enough to absorb it
     if dte >= PRE_CATALYST_MIN_DTE:
         return True, f"catalyst {cat_date} in window but {dte} DTE absorbs it"
@@ -107,6 +126,45 @@ def check_pre_catalyst(
         f"(limit ≥{PRE_CATALYST_MIN_DTE}) — premium is priced in. "
         f"Override with one of: {sorted(VALID_CATALYST_OVERRIDES)}"
     )
+
+
+def check_adverse_news(symbol: str, opt_type: str,
+                       lookback_minutes: int | None = None) -> tuple[bool, str]:
+    """
+    Entry-time adverse-news gate. Pulls fresh headlines for the underlying
+    and refuses entry if material news in the opposite direction of the
+    trade has printed in the lookback window.
+
+    Returns (allowed, reason). Safe-default allow on any fetch failure —
+    we don't want a flaky news service to silently halt trading.
+    """
+    try:
+        from datetime import datetime, timedelta, timezone
+        from data.news import get_news_since
+        from engine.news_monitor import classify_for_position
+        from risk.config import RISK
+    except Exception:
+        return True, "news module unavailable (allowed)"
+
+    minutes = int(lookback_minutes
+                  or RISK.get("news_entry_lookback_minutes", 60))
+    since = datetime.now(tz=timezone.utc) - timedelta(minutes=minutes)
+    try:
+        arts = get_news_since(symbol, since, limit=20)
+    except Exception:
+        return True, "news fetch failed (allowed)"
+    if not arts:
+        return True, "no fresh news"
+
+    sig = classify_for_position(arts, opt_type)
+    if sig.is_adverse:
+        top = (sig.adverse_articles[0].get("title") or "")[:80]
+        return False, (
+            f"adverse news in last {minutes}m "
+            f"({len(sig.adverse_articles)}/{len(arts)} articles, "
+            f"agg={sig.sentiment_score:+.2f}): \"{top}\""
+        )
+    return True, f"{len(arts)} fresh articles, none adverse"
 
 
 def check_trade(
@@ -127,6 +185,10 @@ def check_trade(
     # Portfolio state — injected by the trading engine
     open_positions: list[dict] | None = None,
     daily_pnl: float = 0.0,
+    # New optional signals
+    open_interest: int | None = None,
+    opt_type: str | None = None,
+    check_news: bool = False,
 ) -> dict:
     """
     Validate a proposed trade against all risk limits.
@@ -199,6 +261,23 @@ def check_trade(
                 f"(limit {RISK['max_bid_ask_spread_ratio']*100:.0f}%)",
                 warnings,
             )
+
+    # Open-interest floor — a contract with OI < 100 is often a one-off
+    # institutional print that won't have reliable pricing to exit into.
+    min_oi = RISK.get("min_open_interest", 0)
+    if min_oi and open_interest is not None and open_interest < min_oi:
+        return _reject(
+            f"Open interest {open_interest} below minimum {min_oi} "
+            f"— too illiquid to exit reliably",
+            warnings,
+        )
+
+    # Adverse-news entry gate (opt-in: engine passes check_news=True)
+    if check_news and opt_type:
+        ok, reason = check_adverse_news(symbol, opt_type)
+        if not ok:
+            return _reject(reason, warnings)
+        warnings.append(f"news check: {reason}")
 
     # ── Credit spread quality ─────────────────────────────────────────────────
 

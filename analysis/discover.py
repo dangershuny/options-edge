@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from data.universe import UNIVERSE
 from analysis.vol import calculate_rv, iv_rv_signal
+from analysis.volume_signals import relative_volume
 
 
 def _atm_iv(symbol: str, current_price: float) -> dict | None:
@@ -60,10 +61,15 @@ def _atm_iv(symbol: str, current_price: float) -> dict | None:
         return None
 
 
-def _quick_scan_ticker(symbol: str, prices: pd.Series) -> dict | None:
+def _quick_scan_ticker(symbol: str, prices: pd.Series,
+                       volumes: pd.Series | None = None) -> dict | None:
     """
     Given pre-fetched price history, compute RV and fetch ATM IV.
     Returns a lightweight dict or None if data is insufficient.
+
+    Also computes RVOL if a volume series is passed. RVOL is used to
+    boost ranking of tickers that have unusual activity today — volume
+    is where institutions leave fingerprints the scorer can detect.
     """
     rv = calculate_rv(prices, window=30)
     if rv is None or rv <= 0:
@@ -76,6 +82,14 @@ def _quick_scan_ticker(symbol: str, prices: pd.Series) -> dict | None:
 
     iv = atm["iv"]
     signal, spread, strength = iv_rv_signal(iv, rv)
+
+    rvol_info = None
+    if volumes is not None:
+        try:
+            rvol_info = relative_volume(volumes, lookback=20)
+        except Exception:
+            rvol_info = None
+
     return {
         "symbol":       symbol,
         "price":        round(current_price, 2),
@@ -88,6 +102,8 @@ def _quick_scan_ticker(symbol: str, prices: pd.Series) -> dict | None:
         "atm_strike":   atm["strike"],
         "atm_entry":    atm["entry_price"],
         "atm_expiry":   atm["expiry"],
+        "rvol":         (rvol_info.rvol if rvol_info else None),
+        "rvol_label":   (rvol_info.label if rvol_info else None),
     }
 
 
@@ -116,6 +132,12 @@ def run_discovery(top_n: int = 10, max_workers: int = 12) -> pd.DataFrame:
         return pd.DataFrame()
 
     closes = raw["Close"] if "Close" in raw.columns else raw.xs("Close", axis=1, level=0)
+    # Pull volumes for RVOL — same DataFrame, different field. Falls back
+    # gracefully if the field isn't present (shouldn't happen with yf).
+    try:
+        volumes = raw["Volume"] if "Volume" in raw.columns else raw.xs("Volume", axis=1, level=0)
+    except Exception:
+        volumes = None
 
     # Step 2: parallel ATM IV fetch + RV calculation
     results = []
@@ -127,7 +149,10 @@ def run_discovery(top_n: int = 10, max_workers: int = 12) -> pd.DataFrame:
             series = closes[sym].dropna()
             if len(series) < 35:
                 continue
-            futures[pool.submit(_quick_scan_ticker, sym, series)] = sym
+            vol_series = None
+            if volumes is not None and sym in volumes.columns:
+                vol_series = volumes[sym].dropna()
+            futures[pool.submit(_quick_scan_ticker, sym, series, vol_series)] = sym
 
         for fut in as_completed(futures):
             result = fut.result()
@@ -137,5 +162,13 @@ def run_discovery(top_n: int = 10, max_workers: int = 12) -> pd.DataFrame:
     if not results:
         return pd.DataFrame()
 
-    df = pd.DataFrame(results).sort_values("abs_spread", ascending=False)
+    df = pd.DataFrame(results)
+    # Composite rank: IV vs RV mismatch is primary, RVOL is a tiebreaker
+    # that pushes today's high-activity names to the front. A ticker with
+    # a 15% spread and 1.8× RVOL beats a ticker with 15% spread and 0.8×
+    # RVOL because we're more likely to find a live, tradeable signal in
+    # the chain of the busier name.
+    df["rvol_rank_boost"] = df["rvol"].fillna(1.0).clip(lower=0.3, upper=3.0)
+    df["composite_rank"] = df["abs_spread"] * df["rvol_rank_boost"]
+    df = df.sort_values("composite_rank", ascending=False)
     return df.head(top_n).reset_index(drop=True)

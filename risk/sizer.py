@@ -16,6 +16,12 @@ from __future__ import annotations
 import math
 from risk.config import RISK
 
+try:
+    from data.macro import macro_size_multiplier, get_vix_context
+    _MACRO_AVAILABLE = True
+except Exception:
+    _MACRO_AVAILABLE = False
+
 
 def size_trade(
     max_loss_per_contract: float,
@@ -23,6 +29,7 @@ def size_trade(
     win_rate_estimate: float = 0.55,
     avg_win_multiplier: float = 1.8,
     portfolio_override: float | None = None,
+    macro: dict | None = None,
 ) -> dict:
     """
     Calculate the number of contracts to trade.
@@ -65,6 +72,18 @@ def size_trade(
 
     target_risk = portfolio * risk_fraction
 
+    # ── Macro regime scaling ───────────────────────────────────────────
+    # Shrink size in hostile regimes (FEAR → 0.50×, ELEVATED → 0.75×).
+    # Upsize slightly in LOW VIX where options are cheap (1.10×).
+    macro_mult = 1.0
+    if _MACRO_AVAILABLE:
+        try:
+            m = macro if macro is not None else get_vix_context()
+            macro_mult = macro_size_multiplier(m)
+        except Exception:
+            macro_mult = 1.0
+    target_risk *= macro_mult
+
     # Cap by per-trade and daily limits
     target_risk = min(target_risk, max_cost, max_daily * 0.4)
 
@@ -89,6 +108,7 @@ def size_trade(
 
     rationale = (
         f"Score {score:.0f} → {risk_fraction*100:.0f}% risk fraction  |  "
+        f"Macro ×{macro_mult:.2f}  |  "
         f"Target risk ${target_risk:.0f}  |  "
         f"Max loss/contract ${max_loss_per_contract:.0f}  |  "
         f"Sized: {contracts} contract(s)  |  "
