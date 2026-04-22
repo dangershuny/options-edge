@@ -299,6 +299,16 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
     news      = get_news(symbol)
     divergence = get_divergence(symbol)
 
+    # News-drift pre-classification (one pass per ticker, results reused
+    # across every contract's per-contract loop below).
+    try:
+        from analysis.news_drift import classify_articles as _classify_news
+        news_classified = _classify_news(news)
+        news_has_events = any(a.get("event_category") for a in news_classified)
+    except Exception:
+        news_classified = news
+        news_has_events = False
+
     skew = calculate_skew(chain_full, price)
     gex  = calculate_gex(chain_full, price)
 
@@ -420,7 +430,28 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
                                         vol_signal=vol_signal, skew=skew, gex=gex, ivr=ivr,
                                         opt_type=opt_type, entry_price=entry_px_for_score,
                                         trend_pct=trend_pct)
-        sentiment_delta = divergence_score_adjustment(divergence, vol_signal)
+        # News/event drift delta — the tool's founding thesis: score how
+        # much directional drift the market hasn't priced in yet. Falls
+        # back to divergence_score_adjustment when no classifiable events.
+        news_event_summary = None
+        if news_has_events:
+            try:
+                from analysis.news_drift import news_drift_delta
+                _drift = news_drift_delta(
+                    news_classified, symbol, vol_signal, opt_type, price)
+                drift_delta = _drift.delta
+                news_event_summary = _drift.best_event
+            except Exception:
+                drift_delta = 0.0
+        else:
+            drift_delta = 0.0
+        # Divergence adjustment (sentinel's IV-vs-news read): kept as a
+        # complement, scaled to 0.5× when we also have an event-driven
+        # drift (so the two can't double-count) and full weight otherwise.
+        div_delta = divergence_score_adjustment(divergence, vol_signal,
+                                                 option_type=opt_type)
+        div_scale = 0.5 if drift_delta != 0 else 1.0
+        sentiment_delta = round(drift_delta + div_delta * div_scale, 1)
 
         # ── Per-contract enrichments ─────────────────────────────────────────
         try:
@@ -538,6 +569,14 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             "flow_signal":   row["flow_signal"],
             "score":         final_score,
             "sentiment_delta": sentiment_delta,
+            "news_drift_delta": drift_delta,
+            "news_event":    (news_event_summary.get("category") if news_event_summary else None),
+            "news_event_headline": (news_event_summary.get("title") if news_event_summary else None),
+            "news_event_residual_pct": (
+                news_event_summary.get("residual", {}).get("remaining_pct")
+                if news_event_summary else None),
+            "news_event_hours_elapsed": (
+                news_event_summary.get("hours_elapsed") if news_event_summary else None),
             "insider_delta": insider_delta,
             "short_delta":   short_delta,
             "blocks_delta":  blocks_delta,

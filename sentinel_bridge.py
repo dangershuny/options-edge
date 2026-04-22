@@ -134,14 +134,28 @@ def scan_ticker(ticker: str) -> dict | None:
     return _get(f"/scan?ticker={ticker.upper()}", timeout=SCAN_TIMEOUT)
 
 
-def divergence_score_adjustment(divergence: dict | None, vol_signal: str) -> float:
+def divergence_score_adjustment(divergence: dict | None, vol_signal: str,
+                                 option_type: str | None = None) -> float:
     """
-    Returns score delta (-15 to +15) based on sentiment/vol alignment.
+    Returns score delta (-15 to +15) based on sentiment/vol/direction alignment.
 
-    bearish_divergence + SELL VOL → confirms overpriced options → +boost
-    bearish_divergence + BUY VOL  → contradicts cheap-IV thesis → -penalty
-    bullish_divergence + BUY VOL  → confirms cheap options in recovery → +boost
-    bullish_divergence + SELL VOL → contradicts → -penalty
+    Direction matters: bearish news on a PUT is aligned (boost), bearish news
+    on a CALL is contradicted (penalty). Previously we only considered
+    vol_signal which stamped puts and calls with identical deltas.
+
+    bullish_divergence (news bullish, stock under-reacted):
+        BUY VOL CALL   → aligned: cheap call + bullish thesis     → +boost
+        BUY VOL PUT    → contradicted: cheap put vs bullish news  → -penalty
+        SELL VOL *     → contradicted: stock should move, not bleed → -penalty
+
+    bearish_divergence (news bearish, stock under-reacted):
+        BUY VOL PUT    → aligned: cheap put + bearish thesis      → +boost
+        BUY VOL CALL   → contradicted: cheap call vs bearish news → -penalty
+        SELL VOL *     → contradicted: stock should move          → -penalty
+
+    If option_type is not provided we fall back to the older symmetric logic
+    so old callers (e.g. tests) don't break — but the scorer now always
+    passes option_type.
     """
     if not divergence or not divergence.get("direction"):
         return 0.0
@@ -150,7 +164,27 @@ def divergence_score_adjustment(divergence: dict | None, vol_signal: str) -> flo
     div_score = float(divergence.get("divergence_score", 0))
     strength = min(div_score / 1.5, 1.0)
     max_delta = 15.0
+    ot = (option_type or "").lower()
 
+    # Direction-aware path (preferred)
+    if ot in ("call", "put"):
+        if direction == "bullish_divergence":
+            if vol_signal == "BUY VOL" and ot == "call":
+                return round(strength * max_delta, 1)
+            if vol_signal == "BUY VOL" and ot == "put":
+                return round(-strength * max_delta, 1)
+            if vol_signal == "SELL VOL":
+                return round(-strength * max_delta, 1)
+        elif direction == "bearish_divergence":
+            if vol_signal == "BUY VOL" and ot == "put":
+                return round(strength * max_delta, 1)
+            if vol_signal == "BUY VOL" and ot == "call":
+                return round(-strength * max_delta, 1)
+            if vol_signal == "SELL VOL":
+                return round(-strength * max_delta, 1)
+        return 0.0
+
+    # Legacy path (option_type unknown) — preserve old behaviour
     if direction == "bearish_divergence":
         if vol_signal == "SELL VOL":
             return round(strength * max_delta, 1)
