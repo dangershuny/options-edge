@@ -81,12 +81,29 @@ def _fmt_currency(x: float) -> str:
     return f"${x:,.2f}"
 
 
+def _build_client_order_id(tag: str, occ: str) -> str:
+    """
+    Build an Alpaca client_order_id that encodes the bankroll tier.
+
+    Format: {tag}-{occ}-{timestamp}
+    Alpaca limit: 128 chars, alphanumeric + dashes + underscores only.
+    Tag appears in Alpaca dashboard -> Orders -> "Client Order ID" column,
+    so you can filter your paper orders by tier.
+    """
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    # Sanitize tag: lowercase, alphanumeric only
+    clean_tag = "".join(c for c in tag.lower() if c.isalnum())[:12] or "sim"
+    coid = f"{clean_tag}-{occ}-{ts}"
+    return coid[:128]
+
+
 def _execute_trade(
     broker,
     trade: dict,
     bankroll_remaining: float,
     dry_run: bool,
     max_per_trade: float,
+    tag: str = "",
 ) -> dict:
     """Execute a single trade. Returns result dict."""
     symbol = trade["symbol"]
@@ -101,6 +118,7 @@ def _execute_trade(
         "expiry": expiry.isoformat(),
         "score": trade.get("score"),
         "signal": trade.get("vol_signal"),
+        "tag": tag,
         "status": "pending",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -154,14 +172,21 @@ def _execute_trade(
     limit_price = round(mid + 0.02, 2)  # aggressive take-the-offer mid+0.02
     result["limit_price"] = limit_price
 
+    # Build client_order_id tagged with the bankroll tier for Alpaca dashboard
+    coid = _build_client_order_id(tag, occ) if tag else None
+    result["client_order_id"] = coid
+
     if dry_run:
         result["status"] = "dry_run"
         result["note"] = f"Would BTO {qty}x {occ} at limit ${limit_price:.2f}"
+        if coid:
+            result["note"] += f" (COID: {coid})"
         return result
 
     # Live submit
     try:
-        order = broker.buy_option(occ, qty, limit_price=limit_price)
+        order = broker.buy_option(occ, qty, limit_price=limit_price,
+                                  client_order_id=coid)
         result["status"] = "submitted"
         result["order_id"] = getattr(order, "order_id", None) or getattr(order, "id", None)
         result["order_status"] = getattr(order, "status", "submitted")
@@ -179,6 +204,7 @@ def run(
     max_trades: int,
     dry_run: bool,
     max_per_trade: float | None = None,
+    tag: str = "",
 ) -> dict:
     # Load broker lazily — if no keys, stop before doing anything
     try:
@@ -225,6 +251,7 @@ def run(
     print(f"Per-trade cap: {_fmt_currency(max_per_trade)}")
     print(f"Min score: {min_score}")
     print(f"Max trades: {max_trades}")
+    print(f"Tag: {tag if tag else '(none)'}")
     print(f"Snapshot: {snapshot_path.name}")
     print(f"Candidates passing filter: {len(ranked)}")
     print()
@@ -239,7 +266,7 @@ def run(
               f"exp {trade['expiry']} (score {trade.get('score', 0):.1f}) ---")
 
         result = _execute_trade(
-            broker_mod, trade, bankroll_remaining, dry_run, max_per_trade
+            broker_mod, trade, bankroll_remaining, dry_run, max_per_trade, tag=tag,
         )
         orders.append(result)
 
@@ -295,6 +322,9 @@ def main() -> int:
                         help="Max cost per trade (default: 15%% of bankroll)")
     parser.add_argument("--live", action="store_true",
                         help="Actually submit orders (default is dry run)")
+    parser.add_argument("--tag", type=str, default="",
+                        help="Tier tag, e.g. 'sim500'. Prefixes Alpaca client_order_id "
+                             "so you can identify which bankroll each order was for.")
     args = parser.parse_args()
 
     snapshot_path = Path(args.snapshot) if args.snapshot else _latest_snapshot()
@@ -309,6 +339,7 @@ def main() -> int:
         max_trades=args.max_trades,
         dry_run=not args.live,
         max_per_trade=args.max_per_trade,
+        tag=args.tag,
     )
 
     if "error" in result:

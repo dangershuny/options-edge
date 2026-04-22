@@ -146,28 +146,42 @@ def _show_paper_trades(d: date) -> None:
         print(f"  (no paper trades attempted on {today_iso})")
         return
 
-    print(f"  Attempts today: {len(orders)}")
-    status_counts: dict[str, int] = {}
+    # Group by tier tag
+    by_tier: dict[str, list[dict]] = {}
     for o in orders:
-        s = o.get("status", "?")
-        status_counts[s] = status_counts.get(s, 0) + 1
-    for s, c in status_counts.items():
-        print(f"    {s}: {c}")
+        tag = o.get("tag") or "(untagged)"
+        by_tier.setdefault(tag, []).append(o)
 
-    print(f"\n  Details:")
-    for o in orders:
-        status = o.get("status", "?")
-        sym = o.get("symbol", "?")
-        ot = o.get("option_type", "?")
-        k = o.get("strike", "?")
-        exp = o.get("expiry", "?")
-        cost = o.get("total_cost")
-        cost_s = f"${cost:.2f}" if cost else "n/a"
-        err = o.get("error", "")
-        line = f"    [{status:<9}] {sym} {ot} ${k} {exp} cost={cost_s}"
-        if err:
-            line += f" — {err[:70]}"
-        print(line)
+    print(f"  Attempts today: {len(orders)} across {len(by_tier)} tier(s)")
+
+    for tier, tier_orders in sorted(by_tier.items()):
+        print(f"\n  Tier: {tier}  ({len(tier_orders)} attempts)")
+        status_counts: dict[str, int] = {}
+        total_cost = 0.0
+        for o in tier_orders:
+            s = o.get("status", "?")
+            status_counts[s] = status_counts.get(s, 0) + 1
+            if o.get("status") == "submitted":
+                total_cost += float(o.get("total_cost") or 0)
+        status_line = " ".join(f"{s}={c}" for s, c in status_counts.items())
+        print(f"    status: {status_line}   deployed: ${total_cost:.2f}")
+
+        for o in tier_orders:
+            status = o.get("status", "?")
+            sym = o.get("symbol", "?")
+            ot = o.get("option_type", "?")
+            k = o.get("strike", "?")
+            exp = o.get("expiry", "?")
+            cost = o.get("total_cost")
+            cost_s = f"${cost:.2f}" if cost else "n/a"
+            coid = o.get("client_order_id") or ""
+            err = o.get("error", "")
+            line = f"    [{status:<9}] {sym} {ot} ${k} {exp} cost={cost_s}"
+            if coid:
+                line += f" coid={coid[:40]}"
+            if err:
+                line += f" err={err[:60]}"
+            print(line)
 
 
 def _show_recent_errors(days: int = 1) -> None:

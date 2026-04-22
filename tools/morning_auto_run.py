@@ -74,13 +74,15 @@ def _run_subprocess(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             cwd=REPO_ROOT,
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
         return proc.returncode, proc.stdout or "", proc.stderr or ""
     except subprocess.TimeoutExpired as e:
-        return 124, e.stdout or "", f"TIMEOUT after {timeout}s: {e.stderr or ''}"
+        return 124, getattr(e, "stdout", "") or "", f"TIMEOUT after {timeout}s"
     except Exception as e:
         return 99, "", f"SUBPROCESS FAILED: {e}"
 
@@ -159,15 +161,21 @@ def step_verify_broker() -> dict:
 
 
 def step_paper_trade(snapshot_path: Path, bankroll: float, min_score: float,
-                     max_trades: int, dry_run: bool) -> dict:
-    print(f"\n=== STEP 4: Paper trades ({'DRY RUN' if dry_run else 'LIVE'}) ===")
+                     max_trades: int, dry_run: bool, tag: str = "",
+                     max_per_trade: float | None = None) -> dict:
+    tier_label = tag or f"bankroll-{int(bankroll)}"
+    print(f"\n--- Paper trades — tier {tier_label} "
+          f"({'DRY RUN' if dry_run else 'LIVE'}) ---")
     cmd = [
         _python_exe(), "-m", "tools.paper_trade",
         "--snapshot", str(snapshot_path),
         "--bankroll", str(bankroll),
         "--min-score", str(min_score),
         "--max-trades", str(max_trades),
+        "--tag", tag,
     ]
+    if max_per_trade is not None:
+        cmd.extend(["--max-per-trade", str(max_per_trade)])
     if not dry_run:
         cmd.append("--live")
 
@@ -176,12 +184,12 @@ def step_paper_trade(snapshot_path: Path, bankroll: float, min_score: float,
     if err and code != 0:
         print(f"stderr tail: {err[-500:]}")
     if code != 0:
-        return {"ok": False, "code": code, "error": err[-500:]}
+        return {"ok": False, "code": code, "error": err[-500:], "tag": tag}
 
-    # Parse the paper_trades.jsonl for today's new entries
+    # Parse the paper_trades.jsonl for today's new entries matching this tag
     log_path = REPO_ROOT / "logs" / "paper_trades.jsonl"
     today_iso = date.today().isoformat()
-    orders_today = []
+    orders_tagged = []
     if log_path.exists():
         try:
             with open(log_path) as f:
@@ -190,20 +198,59 @@ def step_paper_trade(snapshot_path: Path, bankroll: float, min_score: float,
                         o = json.loads(line.strip())
                     except Exception:
                         continue
-                    if o.get("timestamp", "").startswith(today_iso):
-                        orders_today.append(o)
+                    if (o.get("timestamp", "").startswith(today_iso)
+                            and o.get("tag") == tag):
+                        orders_tagged.append(o)
         except Exception:
             pass
 
-    return {"ok": True, "orders_today": orders_today, "stdout_tail": out[-1200:]}
+    return {
+        "ok": True, "tag": tag, "bankroll": bankroll,
+        "orders_today": orders_tagged, "stdout_tail": out[-1200:],
+    }
+
+
+def step_paper_trade_all_tiers(snapshot_path: Path, dry_run: bool,
+                               tiers: list[dict]) -> list[dict]:
+    """Run paper_trade once per tier, each with its own tag."""
+    print(f"\n=== STEP 4: Paper trades across {len(tiers)} tier(s) "
+          f"({'DRY RUN' if dry_run else 'LIVE'}) ===")
+    results = []
+    for tier in tiers:
+        r = step_paper_trade(
+            snapshot_path=snapshot_path,
+            bankroll=tier["bankroll"],
+            min_score=tier["min_score"],
+            max_trades=tier["max_trades"],
+            dry_run=dry_run,
+            tag=tier["tag"],
+            max_per_trade=tier.get("max_per_trade"),
+        )
+        results.append(r)
+    return results
+
+
+def default_tiers(min_score: float, max_trades: int) -> list[dict]:
+    """Three-tier bankroll simulation. Same signals, different risk envelopes."""
+    return [
+        {"tag": "sim500",  "bankroll": 500,  "min_score": min_score,
+         "max_trades": max_trades, "max_per_trade": 75},
+        {"tag": "sim1000", "bankroll": 1000, "min_score": min_score,
+         "max_trades": max_trades + 2, "max_per_trade": 150},
+        {"tag": "sim2000", "bankroll": 2000, "min_score": min_score,
+         "max_trades": max_trades + 5, "max_per_trade": 300},
+    ]
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bankroll", type=float, default=500.0)
-    parser.add_argument("--min-score", type=float, default=55.0)
-    parser.add_argument("--max-trades", type=int, default=3)
+    parser.add_argument("--min-score", type=float, default=60.0,
+                        help="Min signal score (default 60)")
+    parser.add_argument("--max-trades", type=int, default=3,
+                        help="Max trades for smallest tier; larger tiers add +2 and +5")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--single-tier", type=str, default=None,
+                        help="Override: only run one tier (sim500/sim1000/sim2000)")
     args = parser.parse_args()
 
     today = date.today().isoformat()
@@ -211,17 +258,27 @@ def main() -> int:
     tee = _Tee(log_path)
     sys.stdout = tee
 
+    tiers = default_tiers(args.min_score, args.max_trades)
+    if args.single_tier:
+        tiers = [t for t in tiers if t["tag"] == args.single_tier]
+        if not tiers:
+            print(f"Unknown tier: {args.single_tier}")
+            return 1
+
     start_ts = datetime.now(timezone.utc)
     print(f"\n{'#' * 60}")
     print(f"#  AUTONOMOUS MORNING RUN — {start_ts.isoformat()}")
-    print(f"#  Bankroll: ${args.bankroll} | Min score: {args.min_score} | Max trades: {args.max_trades}")
+    tier_labels = [f"{t['tag']} (${t['bankroll']})" for t in tiers]
+    print(f"#  Tiers: {', '.join(tier_labels)}")
+    print(f"#  Min score: {args.min_score} | Max trades (small): {args.max_trades}")
     print(f"#  Mode: {'DRY RUN' if args.dry_run else 'LIVE PAPER TRADING'}")
     print(f"{'#' * 60}\n")
 
     summary: dict = {
         "start": start_ts.isoformat(),
         "dry_run": args.dry_run,
-        "bankroll": args.bankroll,
+        "tiers": tiers,
+        "min_score": args.min_score,
     }
 
     try:
@@ -238,20 +295,19 @@ def main() -> int:
         s3 = step_verify_broker()
         summary["broker"] = s3
 
-        # Step 4: paper trade (skip if broker not ready unless dry run)
+        # Step 4: paper trade — one pass per tier
         if s3.get("ok") or args.dry_run:
             if snap_path.exists():
-                s4 = step_paper_trade(
-                    snap_path, args.bankroll, args.min_score,
-                    args.max_trades, args.dry_run,
+                tier_results = step_paper_trade_all_tiers(
+                    snap_path, args.dry_run, tiers,
                 )
-                summary["paper_trade"] = s4
+                summary["paper_trades_by_tier"] = tier_results
             else:
-                summary["paper_trade"] = {"ok": False, "error": "no snapshot available"}
+                summary["paper_trades_by_tier"] = [{"ok": False, "error": "no snapshot"}]
                 print("\n[SKIP] No snapshot available for paper trading.")
         else:
-            summary["paper_trade"] = {"ok": False, "error": "broker not ready; skipping"}
-            print(f"\n[SKIP] Skipping paper trade because broker check failed.")
+            summary["paper_trades_by_tier"] = [{"ok": False, "error": "broker not ready"}]
+            print(f"\n[SKIP] Skipping all tiers because broker check failed.")
 
     except Exception as e:
         print(f"\nFATAL: {e}")
@@ -288,18 +344,37 @@ def main() -> int:
         if summary.get("broker", {}).get("error") == "paper_account_unfunded":
             sev = "ERROR"
 
-    pt = summary.get("paper_trade", {})
-    if pt.get("ok"):
-        orders = pt.get("orders_today", [])
-        submitted = sum(1 for o in orders if o.get("status") == "submitted")
+    tier_results = summary.get("paper_trades_by_tier", [])
+    tier_summary_lines = []
+    tier_context = []
+    for tr in tier_results:
+        tag = tr.get("tag", "?")
+        if not tr.get("ok"):
+            tier_summary_lines.append(f"{tag}: FAILED ({str(tr.get('error', ''))[:60]})")
+            tier_context.append({"tag": tag, "error": tr.get("error")})
+            continue
+        orders = tr.get("orders_today", [])
+        sub = sum(1 for o in orders if o.get("status") == "submitted")
         dry = sum(1 for o in orders if o.get("status") == "dry_run")
-        skipped = sum(1 for o in orders if o.get("status") == "skipped")
-        failed = sum(1 for o in orders if o.get("status") == "failed")
-        status_bits.append(
-            f"paper: {submitted} submitted, {dry} dry-run, {skipped} skipped, {failed} failed"
-        )
-    else:
-        status_bits.append(f"paper trade FAILED: {pt.get('error', 'unknown')[:100]}")
+        skp = sum(1 for o in orders if o.get("status") == "skipped")
+        fld = sum(1 for o in orders if o.get("status") == "failed")
+        bits = f"{sub}S/{dry}D/{skp}K/{fld}F"
+        tier_summary_lines.append(f"{tag} (${tr.get('bankroll'):,.0f}): {bits}")
+        tier_context.append({
+            "tag": tag, "bankroll": tr.get("bankroll"),
+            "submitted": sub, "dry_run": dry, "skipped": skp, "failed": fld,
+            "orders": [
+                {
+                    "symbol": o.get("symbol"), "type": o.get("option_type"),
+                    "strike": o.get("strike"), "expiry": o.get("expiry"),
+                    "cost": o.get("total_cost"),
+                    "client_order_id": o.get("client_order_id"),
+                    "status": o.get("status"),
+                    "error": o.get("error"),
+                } for o in orders
+            ],
+        })
+    status_bits.append("tiers: " + "; ".join(tier_summary_lines))
 
     msg_summary = "; ".join(status_bits)
 
@@ -311,11 +386,10 @@ def main() -> int:
             symbol="",
             severity=sev,
             context={
-                "bankroll": args.bankroll,
+                "tiers": tier_context,
                 "dry_run": args.dry_run,
                 "summary_file": str(summary_path),
                 "log_file": str(log_path),
-                "paper_trade_stdout_tail": pt.get("stdout_tail", "")[:2000],
                 "broker": summary.get("broker", {}),
                 "elapsed_sec": summary["elapsed_sec"],
             },

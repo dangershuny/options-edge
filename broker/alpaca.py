@@ -532,22 +532,26 @@ def call_butterfly(low_occ: str, mid_occ: str, high_occ: str,
 # The engine still calls buy_option/sell_option by name; keep them working.
 
 def buy_option(occ: str, qty: int, limit_price: float | None = None,
-               time_in_force: str = "day") -> OrderResult:
+               time_in_force: str = "day",
+               client_order_id: str | None = None) -> OrderResult:
     """Back-compat: buy-to-open a long call/put. Prefer submit_option_order."""
     return submit_option_order(
         occ, qty, side=SIDE_BTO,
         order_type=("limit" if limit_price is not None else "market"),
         limit_price=limit_price, time_in_force=time_in_force,
+        client_order_id=client_order_id,
     )
 
 
 def sell_option(occ: str, qty: int, limit_price: float | None = None,
-                time_in_force: str = "day") -> OrderResult:
+                time_in_force: str = "day",
+                client_order_id: str | None = None) -> OrderResult:
     """Back-compat: sell-to-close an existing long. Prefer submit_option_order."""
     return submit_option_order(
         occ, qty, side=SIDE_STC,
         order_type=("limit" if limit_price is not None else "market"),
         limit_price=limit_price, time_in_force=time_in_force,
+        client_order_id=client_order_id,
     )
 
 
