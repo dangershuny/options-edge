@@ -17,12 +17,84 @@ USAGE (future automated layer):
 from __future__ import annotations
 
 
+# ── Account-size tiers ────────────────────────────────────────────────────────
+#
+# Dollar limits in RISK are auto-scaled to the current account equity.
+# `auto_select_mode(portfolio_size)` returns the right tier; `apply_mode()`
+# merges it into RISK before each scan. Tiers:
+#
+#   MICRO    — <$1,000.    Single concurrent position, $75/trade max,
+#              min_score 75, max contract premium $0.75. Stock price
+#              capped at $75 so OTM contracts stay affordable without
+#              relaxing max_otm_pct (which would kill the edge).
+#   STANDARD — $1,000-$5,000. Up to 4 concurrent, $150/trade, normal
+#              scorer thresholds.
+#   FULL     — >$5,000. Original $10K-calibrated limits, 8+ concurrent
+#              positions, full premium range.
+#
+# Never hand-edit the tier dicts at call site — use apply_mode().
+
+MICRO_MODE = {
+    "portfolio_size":               500,
+    "max_cost_per_trade":            75,
+    "max_total_open_risk":           150,
+    "max_risk_per_ticker":            75,
+    "max_positions_per_ticker":        1,
+    "max_concurrent_positions":        2,
+    "min_score_to_trade":             75,
+    "max_contract_premium":         0.75,   # scorer filters contracts > this
+    "max_underlying_price":           75,   # scorer skips TSLA/NVDA-priced names
+    "max_daily_loss":                 75,
+}
+
+STANDARD_MODE = {
+    "portfolio_size":             2_500,
+    "max_cost_per_trade":           150,
+    "max_total_open_risk":           600,
+    "max_risk_per_ticker":          200,
+    "max_positions_per_ticker":        2,
+    "max_concurrent_positions":        4,
+    "min_score_to_trade":             70,
+    "max_contract_premium":         2.50,
+    "max_underlying_price":          250,
+    "max_daily_loss":                200,
+}
+
+FULL_MODE = {
+    "portfolio_size":           10_000,
+    "max_cost_per_trade":           300,
+    "max_total_open_risk":         2_500,
+    "max_risk_per_ticker":          600,
+    "max_positions_per_ticker":        2,
+    "max_concurrent_positions":       10,
+    "min_score_to_trade":             65,
+    "max_contract_premium":        15.00,
+    "max_underlying_price":        1_000,
+    "max_daily_loss":                500,
+}
+
+
+def auto_select_mode(portfolio_size: float) -> dict:
+    """Pick the mode tier for an account of this size."""
+    if portfolio_size < 1_000:
+        return MICRO_MODE
+    if portfolio_size < 5_000:
+        return STANDARD_MODE
+    return FULL_MODE
+
+
+def apply_mode(mode_dict: dict) -> None:
+    """Merge a mode tier into the live RISK dict. Call before each scan."""
+    global RISK
+    RISK.update(mode_dict)
+
+
 RISK: dict = {
 
     # ── Portfolio-level limits ────────────────────────────────────────────────
 
     # Total capital allocated to this strategy ($)
-    "portfolio_size": 10_000,
+    "portfolio_size": 500,
 
     # Maximum total open risk across ALL positions at once.
     # For long options: sum of all max_loss_per_contract × contracts.
@@ -133,6 +205,13 @@ RISK: dict = {
     # remain after each new buy. Prevents accidentally spending unsettled
     # proceeds on the next entry.
     "min_settled_cash_fraction": 0.20,
+
+    # ── Account-size filters (set by apply_mode) ──────────────────────────────
+    # Defaults below match FULL_MODE so behavior is identical to pre-mode code
+    # when apply_mode() is never called.
+    "max_concurrent_positions":   10,
+    "max_contract_premium":    15.00,
+    "max_underlying_price":    1_000,
 }
 
 

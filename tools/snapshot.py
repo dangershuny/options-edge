@@ -27,7 +27,7 @@ from data.market import get_current_price, get_options_chain, check_market_cap
 from analysis.vol import calculate_rv, iv_rv_signal
 from analysis.scorer import analyze_ticker
 from analysis.discover import run_discovery
-from risk.config import RISK
+from risk.config import RISK, auto_select_mode, apply_mode
 from sentinel_bridge import ensure_sentinel_running, sentinel_last_error, scan_ticker as sentinel_scan_ticker
 from risk.exits import calibration_info
 
@@ -52,6 +52,19 @@ def run_and_save(tickers: list[str] | None = None) -> None:
     print(f"  OPTIONS EDGE — Trade Recommendation Snapshot")
     print(f"  Date      : {snap_date}  (last market close: Fri Apr 18 2026)")
     print(f"  Generated : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # Auto-select account-size mode from current portfolio. MICRO <$1K,
+    # STANDARD <$5K, FULL otherwise. Filters applied to this scan.
+    mode = auto_select_mode(RISK["portfolio_size"])
+    apply_mode(mode)
+    mode_name = ("MICRO" if RISK["portfolio_size"] < 1_000 else
+                 "STANDARD" if RISK["portfolio_size"] < 5_000 else "FULL")
+    print(f"  Mode      : {mode_name}  "
+          f"(portfolio ${RISK['portfolio_size']:,}, "
+          f"max/trade ${RISK['max_cost_per_trade']}, "
+          f"max premium ${RISK['max_contract_premium']:.2f}, "
+          f"max underlying ${RISK['max_underlying_price']})")
+
     ci = calibration_info()
     print(f"  Exits cal : {ci['source']}  (n={ci['n_contracts']}, "
           f"last {ci['last_updated']})")

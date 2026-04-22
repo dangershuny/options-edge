@@ -24,6 +24,7 @@ from analysis.gamma import calculate_gex
 from analysis.earnings_vol import analyze_earnings_edge
 from sentinel_bridge import get_divergence, divergence_score_adjustment
 from risk.sizer import size_trade
+from risk.config import RISK
 
 # ── New signal feeds (all SAFE-DEFAULT on failure) ───────────────────────────
 from data.insider import get_insider_activity, insider_score_delta
@@ -270,6 +271,16 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
     if len(prices) >= TREND_WINDOW_DAYS + 1:
         trend_pct = float(prices.iloc[-1] / prices.iloc[-(TREND_WINDOW_DAYS + 1)] - 1)
 
+    # Mode-based underlying-price filter — small accounts skip mega-cap names
+    # whose OTM contracts cost too much even at the 8% cap. See
+    # risk/config.py → MICRO_MODE / STANDARD_MODE.
+    max_underlying = RISK.get("max_underlying_price", 10_000)
+    if price > max_underlying:
+        return None, [], (
+            f"underlying ${price:.0f} above mode limit ${max_underlying} "
+            f"— use a larger account tier to trade this name"
+        ), None
+
     chain_filtered, earnings_date, err = get_options_chain(symbol)
     if err:
         return None, [], err, None
@@ -371,6 +382,15 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
         # Hard premium ceiling: drop absurdly expensive contracts outright.
         # Max-loss = premium, so a $25 contract risks $2,500 per lot.
         if vol_signal in ("BUY VOL", "FLOW BUY") and entry_px_for_score > MAX_PREMIUM_HIGH_BAR:
+            continue
+
+        # Mode-based per-contract premium cap. In MICRO mode this is $0.75;
+        # filters out contracts the account can't size into prudently. Keeps
+        # the OTM% filter intact (deeper OTM has worse risk-adjusted EV).
+        mode_premium_cap = RISK.get("max_contract_premium")
+        if (mode_premium_cap is not None
+                and vol_signal in ("BUY VOL", "FLOW BUY")
+                and entry_px_for_score > mode_premium_cap):
             continue
 
         base_score     = score_contract(iv, rv_dte, vol_oi, dte,
