@@ -1,11 +1,9 @@
 """
 Build a self-contained HTML dashboard of Options Edge activity.
 
-Two tabs:
-  1. TERMINAL — monospace, matches the `daily_review` PowerShell output
-     (same sections: snapshot, flow+news, paper trades, alerts)
-  2. ANALYSIS — tables + charts for deeper review of today's snapshot
-     and tier performance
+Single-page dashboard with cards, tables, and charts. Sections mirror the
+`daily_review` output: account, today's snapshot, per-tier paper trades,
+open positions, deployed-capital history, alerts.
 
 Data sources (all local):
   - snapshots/                             latest morning snapshot
@@ -19,7 +17,6 @@ Embedded as JSON in the HTML — no server needed. Chart.js loads from CDN.
 
 from __future__ import annotations
 
-import html
 import json
 import sys
 from collections import defaultdict
@@ -216,180 +213,138 @@ def _signal_breakdown(snap_trades):
     return {"by_signal": dict(by_sig), "by_type": dict(by_type)}
 
 
-# ── Terminal-style text rendering ───────────────────────────────────────────
+def _fetch_ticker_bars(symbols: list[str]) -> dict:
+    """
+    Fetch intraday + daily bars for each unique ticker.
+    Uses Alpaca's free IEX feed.
 
-def _render_terminal(data: dict) -> str:
-    """Produce the PowerShell-style text output embedded in the terminal tab."""
-    lines = []
-    push = lines.append
+    Returns:
+        {symbol: {
+            "intraday": [{t, o, h, l, c, v}, ...],  # 5-min bars, last 2 trading days
+            "daily":    [{t, o, h, l, c, v}, ...],  # daily bars, last 252 days
+            "last":     float,                      # most recent close
+            "last_ts":  str,                        # ISO timestamp of most recent bar
+        }}
+    """
+    if not symbols:
+        return {}
+    try:
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+        from alpaca.data.enums import DataFeed
+        import os
+    except Exception:
+        return {}
 
-    today = data["today"]
-    now = datetime.now().strftime("%H:%M:%S")
-    day_name = datetime.strptime(today, "%Y-%m-%d").strftime("%A")
+    key = os.environ.get("ALPACA_API_KEY")
+    sec = os.environ.get("ALPACA_API_SECRET")
+    if not key or not sec:
+        return {}
 
-    push("#" * 60)
-    push(f"#  DAILY REVIEW — {day_name}, {today}")
-    push(f"#  As of {now}")
-    push("#" * 60)
-    push("")
+    client = StockHistoricalDataClient(key, sec)
+    unique = sorted(set(s.upper() for s in symbols if s))
+    result: dict[str, dict] = {s: {"intraday": [], "daily": [], "last": None, "last_ts": None}
+                               for s in unique}
 
-    # ── Broker / account ────────────────────────────────────────────────
-    br = data.get("broker", {})
-    push("=" * 60)
-    push("  ACCOUNT")
-    push("=" * 60)
-    if br.get("connected"):
-        push(f"  Account:       {br.get('account_number', '—')}")
-        push(f"  Mode:          {'PAPER' if br.get('paper') else 'LIVE'}")
-        push(f"  Equity:        ${br.get('equity', 0):,.2f}")
-        push(f"  Cash:          ${br.get('cash', 0):,.2f}")
-        push(f"  Buying power:  ${br.get('buying_power', 0):,.2f}")
-        push(f"  Blocked:       {br.get('blocked', False)}")
-    else:
-        push(f"  NOT CONNECTED: {br.get('error', 'unknown error')}")
-    push("")
+    now = datetime.now(timezone.utc)
 
-    # ── Snapshot ───────────────────────────────────────────────────────
-    push("=" * 60)
-    push("  SNAPSHOT (morning recommendations)")
-    push("=" * 60)
-    snap = data.get("snap_trades", [])
-    if not snap:
-        push(f"  (no snapshot for {today})")
-    else:
-        if data.get("snap_path"):
-            push(f"  File: {Path(data['snap_path']).name}")
-        push(f"  Total flagged: {len(snap)}")
+    # Intraday: last ~4 days of 5-min bars (enough for a 1D and 5D view)
+    try:
+        req = StockBarsRequest(
+            symbol_or_symbols=unique,
+            timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+            start=now - timedelta(days=5),
+            end=now,
+            feed=DataFeed.IEX,
+        )
+        bars = client.get_stock_bars(req)
+        raw = getattr(bars, "data", {}) or {}
+        for sym, rows in raw.items():
+            ud = sym.upper()
+            result[ud]["intraday"] = [
+                {"t": b.timestamp.isoformat(), "o": float(b.open), "h": float(b.high),
+                 "l": float(b.low), "c": float(b.close), "v": int(b.volume or 0)}
+                for b in rows
+            ]
+            if rows:
+                result[ud]["last"] = float(rows[-1].close)
+                result[ud]["last_ts"] = rows[-1].timestamp.isoformat()
+    except Exception as e:
+        for s in unique:
+            result[s].setdefault("error", str(e)[:100])
 
-        by_sig: dict[str, int] = defaultdict(int)
-        for t in snap:
-            by_sig[t.get("vol_signal", "?")] += 1
-        for sig, n in sorted(by_sig.items()):
-            push(f"    {sig}: {n}")
+    # Daily: last 365 days (for 1M, 3M, 1Y toggles)
+    try:
+        req = StockBarsRequest(
+            symbol_or_symbols=unique,
+            timeframe=TimeFrame.Day,
+            start=now - timedelta(days=365),
+            end=now,
+            feed=DataFeed.IEX,
+        )
+        bars = client.get_stock_bars(req)
+        raw = getattr(bars, "data", {}) or {}
+        for sym, rows in raw.items():
+            ud = sym.upper()
+            result[ud]["daily"] = [
+                {"t": b.timestamp.date().isoformat(), "o": float(b.open),
+                 "h": float(b.high), "l": float(b.low), "c": float(b.close),
+                 "v": int(b.volume or 0)}
+                for b in rows
+            ]
+            # If we didn't get intraday, use latest daily as "last"
+            if rows and result[ud]["last"] is None:
+                result[ud]["last"] = float(rows[-1].close)
+                result[ud]["last_ts"] = rows[-1].timestamp.isoformat()
+    except Exception as e:
+        for s in unique:
+            result[s].setdefault("error", str(e)[:100])
 
-        push("")
-        push("  Top 10 by score:")
-        for t in snap[:10]:
-            sym = t.get("symbol", "")
-            ot = t.get("option_type", "")
-            k = t.get("strike", "")
-            exp = t.get("expiry", "")
-            entry = t.get("entry_price") or 0
-            score = t.get("score") or 0
-            push(
-                f"    {sym:<6} {ot:<5} ${k:<7} exp {exp:<12} "
-                f"entry ${entry:<6.2f}  score {score:<6.1f}  [{t.get('vol_signal','')}]"
-            )
-    push("")
-
-    # ── Flow + News ────────────────────────────────────────────────────
-    push("=" * 60)
-    push("  FLOW + NEWS signals")
-    push("=" * 60)
-    fn = data.get("flow_news", {})
-    push(f"  Scans today: {fn.get('scans', 0)}")
-    high = fn.get("high_conviction", [])
-    push(f"  HIGH CONVICTION signals: {len(high)}")
-    for r in high[:5]:
-        opt = (r.get("option_direction") or "?").upper()
-        push(f"    [{r.get('scan', '')}] {r.get('ticker','?')}: "
-             f"{opt} — {r.get('rationale','')}")
-    push("")
-
-    # ── Paper trades (grouped by tier) ─────────────────────────────────
-    push("=" * 60)
-    push("  PAPER TRADES")
-    push("=" * 60)
-    tiers = data.get("tier_stats", {}) or {}
-    if not tiers:
-        push("  (no paper trades attempted)")
-    else:
-        total = sum(t["total_attempts"] for t in tiers.values())
-        push(f"  Attempts: {total} across {len(tiers)} tier(s)")
-        for name in sorted(tiers.keys()):
-            t = tiers[name]
-            push("")
-            push(f"  Tier: {name}  ({t['total_attempts']} attempts)")
-            status_line = "  ".join(
-                f"{s}={t[s]}" for s in ("submitted", "dry_run", "skipped", "failed")
-            )
-            push(f"    {status_line}   deployed: ${t['deployed']:.2f}")
-            for o in t.get("orders", []):
-                status = o.get("status", "?")
-                sym = o.get("symbol", "?")
-                ot = o.get("option_type", "?")
-                strike = o.get("strike", "?")
-                exp = o.get("expiry", "?")
-                cost = o.get("total_cost")
-                coid = o.get("client_order_id") or ""
-                err = o.get("error", "")
-                cost_s = f"${cost:.2f}" if cost else "n/a"
-                line = f"    [{status:<9}] {sym} {ot} ${strike} {exp} cost={cost_s}"
-                if coid: line += f" coid={coid[:40]}"
-                if err:  line += f" err={err[:60]}"
-                push(line)
-    push("")
-
-    # ── Open positions ─────────────────────────────────────────────────
-    push("=" * 60)
-    push("  OPEN POSITIONS")
-    push("=" * 60)
-    positions = data.get("positions", [])
-    if not positions:
-        push("  (no open positions)")
-    else:
-        for p in positions:
-            push(f"  {p.get('symbol','?'):<22} qty={p.get('qty',0)}  "
-                 f"entry=${p.get('avg_entry',0):.2f}  mark=${p.get('mark',0):.2f}  "
-                 f"P&L=${p.get('unrealized_pl',0):+.2f} ({p.get('unrealized_pl_pct',0):+.1f}%)")
-    push("")
-
-    # ── Alerts ─────────────────────────────────────────────────────────
-    push("=" * 60)
-    push(f"  ALERTS (last 3 days)")
-    push("=" * 60)
-    alerts = data.get("alerts", [])
-    if not alerts:
-        push("  (no alerts)")
-    else:
-        push(f"  Alert files: {len(alerts)}")
-        for a in alerts[:15]:
-            ts = (a.get("timestamp") or "")[:19].replace("T", " ")
-            sev = a.get("severity", "?")
-            src = a.get("source", "?")
-            sym = a.get("symbol") or "-"
-            msg = (a.get("message") or "")[:90]
-            push(f"    [{sev}] {ts} {src} [{sym}]: {msg}")
-    push("")
-
-    # ── Footer ─────────────────────────────────────────────────────────
-    push("=" * 60)
-    push("  Helpful commands:")
-    push("    tools\\dashboard.bat                       # rebuild + open this page")
-    push("    python -m tools.snapshot                  # new scan")
-    push("    python -m tools.flow_news_monitor         # check unusual flow")
-    push("    python -m tools.paper_trade               # dry-run paper trade")
-    push("    python -m tools.paper_trade --live        # actually submit")
-    push("=" * 60)
-
-    return "\n".join(lines)
+    return result
 
 
 # ── Main build ──────────────────────────────────────────────────────────────
 
+def _best_recent_snapshot():
+    """
+    Walk back up to 7 days, preferring the snapshot with the most trades
+    (avoids picking empty end-of-day scans).
+    """
+    today = date.today()
+    best = None
+    best_count = -1
+    best_note = None
+    # Check today first (prefer even an empty scan from today over yesterday's)
+    for back in range(0, 8):
+        d = today - timedelta(days=back)
+        # Enumerate ALL of d's snapshots, not just the newest
+        snap_dir = REPO_ROOT / "snapshots"
+        for f in snap_dir.glob("*.json"):
+            if not f.is_file() or f.parent != snap_dir:
+                continue
+            if datetime.fromtimestamp(f.stat().st_mtime).date() != d:
+                continue
+            data = _safe_json_load(f)
+            if not isinstance(data, dict):
+                continue
+            n = len(data.get("trades", []) or [])
+            # Prefer most trades. If the picked snap is today, keep it unless 0.
+            if n > best_count:
+                best = (f, data)
+                best_count = n
+                best_note = None if back == 0 else d.isoformat()
+        # If today had any snap with trades, stop walking back
+        if back == 0 and best_count > 0:
+            break
+    if best:
+        return best[0], best[1], best_note
+    return None, {}, None
+
+
 def build() -> Path:
     today = date.today()
-    snap_path, snap = _latest_snapshot_for(today)
-    # If no snapshot for today, fall back to most recent in the last 7 days
-    fallback_note = None
-    if not snap:
-        for back in range(1, 8):
-            d = today - timedelta(days=back)
-            p, s = _latest_snapshot_for(d)
-            if s:
-                snap_path, snap = p, s
-                fallback_note = d.isoformat()
-                break
+    snap_path, snap, fallback_note = _best_recent_snapshot()
 
     snap_trades = sorted(
         snap.get("trades", []),
@@ -408,6 +363,14 @@ def build() -> Path:
     score_hist = _score_distribution(snap_trades)
     sig_break = _signal_breakdown(snap_trades)
 
+    # Gather unique tickers for bar fetching
+    unique_tickers = sorted({
+        (t.get("symbol") or "").upper()
+        for t in snap_trades
+        if t.get("symbol")
+    })[:20]  # cap at 20 to keep file size reasonable
+    ticker_bars = _fetch_ticker_bars(unique_tickers)
+
     data = {
         "generated": datetime.now().isoformat(),
         "today": today.isoformat(),
@@ -425,16 +388,11 @@ def build() -> Path:
         "score_histogram": score_hist,
         "signal_breakdown": sig_break,
         "trades_last_30d": len(trades_log),
+        "unique_tickers": unique_tickers,
+        "ticker_bars": ticker_bars,
     }
 
-    terminal_text = _render_terminal(data)
-
-    body = _HTML_TEMPLATE.replace(
-        "__TERMINAL_TEXT__", html.escape(terminal_text)
-    ).replace(
-        "__DATA__", json.dumps(data, default=str)
-    )
-
+    body = _HTML_TEMPLATE.replace("__DATA__", json.dumps(data, default=str))
     DASHBOARD_PATH.write_text(body, encoding="utf-8")
     return DASHBOARD_PATH
 
@@ -445,109 +403,213 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Options Edge Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 <style>
   :root {
-    --bg: #0c0c0c;
-    --card: #161616;
-    --fg: #dcdcdc;
-    --mute: #8a8a8a;
-    --accent: #4fc3f7;
-    --ok: #4caf50;
-    --warn: #ffb300;
-    --err: #ef5350;
-    --border: #2a2a2a;
-    --prompt: #50fa7b;
+    --bg: #0f1117;
+    --bg-elev: #181b24;
+    --card: #1d212d;
+    --card-hover: #242936;
+    --border: #2a2f3e;
+    --fg: #e8ebf4;
+    --mute: #8b93a7;
+    --subtle: #5a617a;
+    --accent: #7aa2f7;
+    --accent-2: #bb9af7;
+    --ok: #9ece6a;
+    --warn: #e0af68;
+    --err: #f7768e;
+    --info: #7dcfff;
+    --gradient-a: linear-gradient(135deg, rgba(122,162,247,0.15) 0%, rgba(122,162,247,0) 100%);
+    --shadow: 0 2px 8px rgba(0,0,0,0.3);
   }
   * { box-sizing: border-box; }
   html, body { background: var(--bg); color: var(--fg); }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    margin: 0; padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    margin: 0; padding: 0; min-height: 100vh;
+    background: radial-gradient(ellipse at top, #1a1f2e 0%, #0f1117 50%);
+    background-attachment: fixed;
   }
-  .page {
-    max-width: 1400px; margin: 0 auto; padding: 16px 24px 40px;
-  }
+  .page { max-width: 1500px; margin: 0 auto; padding: 24px 32px 48px; }
+
   header {
-    display: flex; justify-content: space-between; align-items: baseline;
-    padding: 10px 0 14px; border-bottom: 1px solid var(--border); margin-bottom: 14px;
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border);
   }
-  header h1 { margin: 0; font-size: 20px; color: var(--fg); }
-  .subtitle { color: var(--mute); font-size: 12px; margin-top: 2px; }
+  header h1 {
+    margin: 0; font-size: 22px; font-weight: 600;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .subtitle { color: var(--mute); font-size: 12px; margin-top: 4px; }
+  .header-actions { display: flex; gap: 8px; align-items: center; }
+  .btn {
+    background: var(--card); color: var(--fg); border: 1px solid var(--border);
+    padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    transition: all 0.15s;
+  }
+  .btn:hover { background: var(--card-hover); border-color: var(--accent); }
+  .btn.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 500; }
+  .btn.primary:hover { filter: brightness(1.1); }
+
   .tabs {
-    display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid var(--border);
+    display: flex; gap: 4px; margin-bottom: 24px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+    padding: 4px;
   }
   .tab {
-    padding: 10px 18px; cursor: pointer; color: var(--mute);
-    font-size: 14px; border-bottom: 2px solid transparent;
-    user-select: none;
+    padding: 8px 18px; cursor: pointer; color: var(--mute);
+    font-size: 13px; border-radius: 5px; user-select: none;
+    transition: all 0.15s;
   }
-  .tab.active { color: var(--fg); border-bottom-color: var(--accent); }
-  .tab:hover { color: var(--fg); }
-  .tab-content { display: none; }
+  .tab.active { color: var(--fg); background: var(--bg-elev); }
+  .tab:hover:not(.active) { color: var(--fg); }
+  .tab-content { display: none; animation: fadeIn 0.2s; }
   .tab-content.active { display: block; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 
-  /* Terminal tab */
-  .terminal {
-    background: #0c0c0c; border: 1px solid var(--border); border-radius: 6px;
-    padding: 16px 20px;
-    font-family: "Cascadia Mono", "Consolas", "SF Mono", "Menlo", monospace;
-    font-size: 13px; line-height: 1.45;
-    color: #d4d4d4;
-    white-space: pre;
-    overflow-x: auto;
-    min-height: 500px;
+  section { margin-bottom: 28px; }
+  .section-title {
+    display: flex; align-items: center; gap: 10px; margin: 0 0 14px;
+    font-size: 14px; font-weight: 500; color: var(--mute);
+    text-transform: uppercase; letter-spacing: 0.8px;
   }
-  .terminal .prompt { color: var(--prompt); }
-  .toolbar {
-    display: flex; gap: 8px; margin-bottom: 8px;
+  .section-title .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent); box-shadow: 0 0 6px var(--accent);
   }
-  .btn {
-    background: #1e1e1e; color: var(--fg); border: 1px solid var(--border);
-    padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;
+  .section-title .count {
+    font-size: 11px; padding: 1px 8px; border-radius: 10px;
+    background: var(--card); color: var(--fg); letter-spacing: 0;
   }
-  .btn:hover { background: #2a2a2a; }
 
-  /* Analysis tab */
-  h2 { margin: 20px 0 10px; font-size: 15px;
-       color: var(--mute); text-transform: uppercase; letter-spacing: 0.6px;
-       border-bottom: 1px solid var(--border); padding-bottom: 4px; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 16px; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; }
-  .card .label { color: var(--mute); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
-  .card .value { font-size: 20px; font-weight: 500; margin-top: 3px; }
-  .card .sub { color: var(--mute); font-size: 11px; margin-top: 2px; }
+  /* Cards */
+  .cards-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+  .stat-card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px 20px; position: relative; overflow: hidden;
+    transition: border-color 0.15s;
+  }
+  .stat-card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    opacity: 0.6;
+  }
+  .stat-card:hover { border-color: var(--accent); }
+  .stat-card .label {
+    color: var(--mute); font-size: 11px; font-weight: 500;
+    text-transform: uppercase; letter-spacing: 0.8px;
+  }
+  .stat-card .value { font-size: 24px; font-weight: 600; margin-top: 6px; letter-spacing: -0.5px; }
+  .stat-card .sub { color: var(--subtle); font-size: 11px; margin-top: 4px; }
+
+  /* Tables */
+  .table-wrap {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    overflow: hidden; box-shadow: var(--shadow);
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+  th {
+    background: var(--bg-elev); color: var(--mute); font-weight: 500;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px;
+    position: sticky; top: 0;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+  .mono { font-family: "JetBrains Mono", "SF Mono", "Cascadia Mono", Consolas, monospace; font-size: 12px; }
+
   .pos { color: var(--ok); }
   .neg { color: var(--err); }
+  .warn-txt { color: var(--warn); }
 
-  table { width: 100%; border-collapse: collapse; font-size: 12px;
-          background: var(--card); border-radius: 6px; overflow: hidden; margin-bottom: 14px; }
-  th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border); }
-  th { background: #1a1a1a; color: var(--mute); font-weight: 500;
-       font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
-  tr:last-child td { border-bottom: none; }
-  tr:hover td { background: rgba(255,255,255,0.03); }
-  .mono { font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; }
+  .badge {
+    display: inline-block; padding: 3px 10px; border-radius: 12px;
+    font-size: 10px; font-weight: 600; letter-spacing: 0.5px;
+    background: rgba(122,162,247,0.15); color: var(--accent);
+  }
+  .badge.ok  { background: rgba(158,206,106,0.15); color: var(--ok); }
+  .badge.warn{ background: rgba(224,175,104,0.15); color: var(--warn); }
+  .badge.err { background: rgba(247,118,142,0.15); color: var(--err); }
+  .badge.info{ background: rgba(125,207,255,0.15); color: var(--info); }
 
-  .tier-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; margin-bottom: 16px; }
-  .tier-card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; }
-  .tier-card h3 { margin: 0 0 8px; font-size: 14px; color: var(--fg); }
-  .stats-row { display: flex; gap: 14px; margin-bottom: 8px; font-size: 12px; }
-  .stats-row .s { color: var(--mute); }
-  .stats-row strong { color: var(--fg); }
+  /* Tier cards */
+  .tier-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 14px; }
+  .tier-card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px 20px;
+  }
+  .tier-card h3 { margin: 0 0 14px; font-size: 15px; color: var(--fg); display: flex; align-items: center; gap: 8px; }
+  .tier-card h3 .tier-icon {
+    width: 24px; height: 24px; border-radius: 6px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 700; color: var(--bg);
+  }
+  .tier-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
+  .tier-stat { text-align: center; padding: 8px; background: var(--bg-elev); border-radius: 6px; }
+  .tier-stat .n { font-size: 16px; font-weight: 600; color: var(--fg); }
+  .tier-stat .l { font-size: 10px; color: var(--mute); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
 
-  .badge { display: inline-block; padding: 1px 6px; border-radius: 10px;
-           font-size: 10px; font-weight: 500; background: #253649; color: var(--accent); }
-  .badge.ok { background: rgba(76,175,80,0.18); color: var(--ok); }
-  .badge.warn { background: rgba(255,179,0,0.18); color: var(--warn); }
-  .badge.err { background: rgba(239,83,80,0.18); color: var(--err); }
+  /* Chart wraps */
+  .chart-card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 20px; position: relative;
+  }
+  .chart-card h3 {
+    margin: 0 0 12px; font-size: 14px; color: var(--fg); display: flex;
+    justify-content: space-between; align-items: center;
+  }
+  .chart-card canvas { max-height: 260px; }
+  .ticker-chart-card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; transition: border-color 0.15s;
+  }
+  .ticker-chart-card:hover { border-color: var(--accent); }
+  .ticker-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 10px;
+  }
+  .ticker-head .sym { font-size: 17px; font-weight: 600; }
+  .ticker-head .last { font-size: 16px; color: var(--fg); margin-left: 8px; }
+  .ticker-head .change { font-size: 13px; margin-left: 6px; }
 
-  .chart-wrap { background: var(--card); border: 1px solid var(--border); border-radius: 6px;
-                padding: 14px; margin-bottom: 14px; }
-  .chart-wrap h2 { margin-top: 0; border: none; padding: 0; }
-  canvas { max-height: 260px; }
-  .empty { color: var(--mute); font-size: 12px; padding: 14px; text-align: center; }
+  .tf-toggles { display: inline-flex; background: var(--bg-elev); border-radius: 6px; padding: 2px; }
+  .tf-btn {
+    padding: 4px 10px; font-size: 11px; color: var(--mute);
+    background: transparent; border: none; cursor: pointer; border-radius: 4px;
+    transition: all 0.15s;
+  }
+  .tf-btn.active { background: var(--accent); color: var(--bg); font-weight: 600; }
+  .tf-btn:hover:not(.active) { color: var(--fg); }
+
+  .ticker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 14px; }
+  .ticker-chart-card canvas { max-height: 180px; }
+
+  .empty {
+    color: var(--mute); font-size: 13px; padding: 20px; text-align: center;
+    background: var(--card); border: 1px dashed var(--border); border-radius: 8px;
+  }
+
+  .alert-card {
+    background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--err);
+    border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; font-size: 13px;
+  }
+  .alert-card.info { border-left-color: var(--info); }
+  .alert-card.warn { border-left-color: var(--warn); }
+  .alert-card .alert-meta { color: var(--mute); font-size: 11px; margin-bottom: 4px; }
+  .alert-card .alert-msg { color: var(--fg); }
+
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 900px) {
+    .two-col { grid-template-columns: 1fr; }
+    .tier-grid, .ticker-grid { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
@@ -558,71 +620,101 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <h1>Options Edge Dashboard</h1>
     <div class="subtitle" id="subtitle"></div>
   </div>
-  <div class="toolbar">
-    <button class="btn" onclick="location.reload()">Refresh</button>
+  <div class="header-actions">
+    <button class="btn" onclick="location.reload()">Refresh page</button>
   </div>
 </header>
 
 <div class="tabs">
-  <div class="tab active" data-tab="terminal">Terminal</div>
+  <div class="tab active" data-tab="overview">Overview</div>
   <div class="tab" data-tab="analysis">Analysis</div>
+  <div class="tab" data-tab="trades">Trades</div>
 </div>
 
-<!-- TERMINAL TAB -->
-<div class="tab-content active" id="tab-terminal">
-<pre class="terminal">__TERMINAL_TEXT__</pre>
+<!-- OVERVIEW -->
+<div class="tab-content active" id="tab-overview">
+  <section>
+    <div class="section-title"><span class="dot"></span> Account <span id="ov-account-sub" class="count"></span></div>
+    <div class="cards-grid" id="account-cards"></div>
+  </section>
+
+  <section>
+    <div class="section-title"><span class="dot"></span> Today's snapshot <span class="count" id="snap-count">0</span></div>
+    <div class="cards-grid" id="snap-summary-cards"></div>
+  </section>
+
+  <section>
+    <div class="section-title"><span class="dot"></span> Open positions <span class="count" id="pos-count">0</span></div>
+    <div id="positions-wrap"></div>
+  </section>
+
+  <section>
+    <div class="section-title"><span class="dot"></span> Paper trades by tier</div>
+    <div class="tier-grid" id="tier-grid"></div>
+  </section>
+
+  <section>
+    <div class="section-title"><span class="dot"></span> Recent alerts <span class="count" id="alert-count">0</span></div>
+    <div id="alerts-wrap"></div>
+  </section>
 </div>
 
-<!-- ANALYSIS TAB -->
+<!-- ANALYSIS -->
 <div class="tab-content" id="tab-analysis">
+  <section>
+    <div class="section-title"><span class="dot"></span> Score distribution</div>
+    <div class="chart-card"><canvas id="scoreChart"></canvas></div>
+  </section>
 
-<section>
-  <h2>Account</h2>
-  <div class="cards" id="account-cards"></div>
-</section>
+  <section>
+    <div class="section-title">
+      <span class="dot"></span> Live price per ticker
+      <span class="count" id="ticker-count">0</span>
+    </div>
+    <div class="subtitle" style="margin-bottom: 14px;">Data from Alpaca IEX feed. Toggle timeframe per chart.</div>
+    <div class="ticker-grid" id="ticker-charts"></div>
+  </section>
 
-<section>
-  <h2>Today's snapshot — summary</h2>
-  <div class="cards" id="snap-summary-cards"></div>
-  <div class="chart-wrap">
-    <h2 style="margin: 0 0 8px; text-transform:none; letter-spacing:0; color: var(--fg); font-size: 14px;">Score distribution</h2>
-    <canvas id="scoreChart"></canvas>
-  </div>
-</section>
+  <section>
+    <div class="section-title"><span class="dot"></span> Top snapshot candidates</div>
+    <div class="table-wrap" id="snap-table-wrap"></div>
+  </section>
 
-<section>
-  <h2>Top snapshot candidates</h2>
-  <div id="snap-table-wrap"></div>
-</section>
+  <section>
+    <div class="section-title"><span class="dot"></span> Deployed capital (last 30d)</div>
+    <div class="chart-card"><canvas id="pnlChart"></canvas></div>
+  </section>
+</div>
 
-<section>
-  <h2>Paper trades by tier</h2>
-  <div class="tier-grid" id="tier-grid"></div>
-</section>
-
-<section>
-  <h2>Open positions</h2>
-  <div id="positions-wrap"></div>
-</section>
-
-<section>
-  <h2>Deployed capital (last 30 days)</h2>
-  <div class="chart-wrap"><canvas id="pnlChart"></canvas></div>
-</section>
-
-<section>
-  <h2>Recent alerts (3 days)</h2>
-  <div id="alerts-wrap"></div>
-</section>
-
-</div><!-- /analysis tab -->
+<!-- TRADES -->
+<div class="tab-content" id="tab-trades">
+  <section>
+    <div class="section-title"><span class="dot"></span> All paper trade attempts (30 days)</div>
+    <div class="table-wrap" id="all-trades-wrap"></div>
+  </section>
+</div>
 
 </div><!-- /page -->
 
 <script>
 const DATA = __DATA__;
 
-// Tab switching
+function fmtMoney(n) {
+  if (n == null) return '—';
+  return '$' + Number(n).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+function pnlClass(n) { if (!n) return ''; return n > 0 ? 'pos' : 'neg'; }
+function pctText(n) {
+  if (n == null) return '';
+  const sign = n > 0 ? '+' : '';
+  return `${sign}${Number(n).toFixed(2)}%`;
+}
+
+// ── Subtitle
+document.getElementById('subtitle').textContent =
+  `Generated ${new Date(DATA.generated).toLocaleString()}  ·  ${DATA.today}  ·  Log: ${DATA.trades_last_30d} entries (30d)`;
+
+// ── Tab switching
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -630,69 +722,155 @@ document.querySelectorAll('.tab').forEach(tab => {
     tab.classList.add('active');
     document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
     if (tab.dataset.tab === 'analysis') initAnalysis();
+    if (tab.dataset.tab === 'trades') initTrades();
   });
 });
 
-// Subtitle
-document.getElementById('subtitle').textContent =
-  `Generated ${new Date(DATA.generated).toLocaleString()}  ·  Today: ${DATA.today}  ·  Trade log entries (30d): ${DATA.trades_last_30d}`;
+// ── OVERVIEW TAB ────────────────────────────────────────────────────────────
 
-function fmtMoney(n) {
-  if (n == null) return '—';
-  return '$' + Number(n).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
-}
-function pnlClass(n) { if (!n) return ''; return n > 0 ? 'pos' : 'neg'; }
-
-let _analysisInitialized = false;
-function initAnalysis() {
-  if (_analysisInitialized) return;
-  _analysisInitialized = true;
-
-  // Account
+function renderOverview() {
+  // Account cards
   const acc = DATA.broker || {};
   const accEl = document.getElementById('account-cards');
   if (acc.connected) {
+    document.getElementById('ov-account-sub').textContent = acc.paper ? 'PAPER' : 'LIVE';
     accEl.innerHTML = `
-      <div class="card"><div class="label">Account</div>
-        <div class="value mono" style="font-size:14px;">${acc.account_number || '—'}</div>
-        <div class="sub">${acc.paper ? 'Paper' : 'Live'}${acc.blocked ? ' · BLOCKED' : ''}</div></div>
-      <div class="card"><div class="label">Equity</div><div class="value">${fmtMoney(acc.equity)}</div></div>
-      <div class="card"><div class="label">Cash</div><div class="value">${fmtMoney(acc.cash)}</div></div>
-      <div class="card"><div class="label">Buying power</div><div class="value">${fmtMoney(acc.buying_power)}</div></div>
+      <div class="stat-card"><div class="label">Account</div>
+        <div class="value mono" style="font-size:15px;">${acc.account_number || '—'}</div>
+        <div class="sub">${acc.blocked ? 'BLOCKED' : 'Active'}</div></div>
+      <div class="stat-card"><div class="label">Equity</div>
+        <div class="value">${fmtMoney(acc.equity)}</div></div>
+      <div class="stat-card"><div class="label">Cash</div>
+        <div class="value">${fmtMoney(acc.cash)}</div></div>
+      <div class="stat-card"><div class="label">Buying power</div>
+        <div class="value">${fmtMoney(acc.buying_power)}</div></div>
     `;
   } else {
-    accEl.innerHTML = `<div class="card">Broker not reachable: ${acc.error || ''}</div>`;
+    accEl.innerHTML = `<div class="stat-card"><div class="label">Broker</div><div class="value warn-txt">Disconnected</div><div class="sub">${acc.error || ''}</div></div>`;
   }
 
   // Snapshot summary cards
   const snap = DATA.snap_trades || [];
   const sb = DATA.signal_breakdown || {by_signal: {}, by_type: {}};
-  const snapEl = document.getElementById('snap-summary-cards');
   const topScore = snap.length ? Math.max(...snap.map(t => Number(t.score || 0))) : 0;
   const avgScore = snap.length ? (snap.reduce((s, t) => s + Number(t.score || 0), 0) / snap.length) : 0;
-  snapEl.innerHTML = `
-    <div class="card"><div class="label">Candidates</div><div class="value">${DATA.snap_total ?? snap.length}</div>${DATA.snap_fallback_date ? `<div class="sub">Using ${DATA.snap_fallback_date} (no scan today)</div>` : ''}</div>
-    <div class="card"><div class="label">Top score</div><div class="value">${topScore.toFixed(1)}</div></div>
-    <div class="card"><div class="label">Avg score</div><div class="value">${avgScore.toFixed(1)}</div></div>
-    <div class="card"><div class="label">Calls vs Puts</div><div class="value">${(sb.by_type.call || 0)} / ${(sb.by_type.put || 0)}</div></div>
+  const fallbackNote = DATA.snap_fallback_date ? `Using ${DATA.snap_fallback_date} (no today scan)` : '';
+  document.getElementById('snap-count').textContent = DATA.snap_total || snap.length;
+  document.getElementById('snap-summary-cards').innerHTML = `
+    <div class="stat-card"><div class="label">Candidates</div>
+      <div class="value">${DATA.snap_total ?? snap.length}</div>
+      ${fallbackNote ? `<div class="sub warn-txt">${fallbackNote}</div>` : ''}</div>
+    <div class="stat-card"><div class="label">Top score</div>
+      <div class="value">${topScore.toFixed(1)}</div></div>
+    <div class="stat-card"><div class="label">Avg score</div>
+      <div class="value">${avgScore.toFixed(1)}</div></div>
+    <div class="stat-card"><div class="label">Calls / Puts</div>
+      <div class="value">${(sb.by_type.call || 0)} / ${(sb.by_type.put || 0)}</div></div>
   `;
 
-  // Score distribution chart
+  // Positions
+  const positions = DATA.positions || [];
+  document.getElementById('pos-count').textContent = positions.length;
+  const posWrap = document.getElementById('positions-wrap');
+  if (!positions.length) {
+    posWrap.innerHTML = '<div class="empty">No open positions.</div>';
+  } else {
+    let h = `<div class="table-wrap"><table><thead><tr>
+      <th>Symbol</th><th>Qty</th><th>Entry</th><th>Mark</th><th>Value</th>
+      <th>Unrealized</th><th>%</th></tr></thead><tbody>`;
+    positions.forEach(p => {
+      h += `<tr>
+        <td class="mono">${p.symbol}</td>
+        <td>${p.qty}</td>
+        <td>${fmtMoney(p.avg_entry)}</td>
+        <td>${fmtMoney(p.mark)}</td>
+        <td>${fmtMoney(p.market_value)}</td>
+        <td class="${pnlClass(p.unrealized_pl)}">${fmtMoney(p.unrealized_pl)}</td>
+        <td class="${pnlClass(p.unrealized_pl)}">${pctText(p.unrealized_pl_pct)}</td>
+      </tr>`;
+    });
+    h += '</tbody></table></div>';
+    posWrap.innerHTML = h;
+  }
+
+  // Tier cards
+  const tiers = DATA.tier_stats || {};
+  const tierNames = Object.keys(tiers).sort();
+  const tierEl = document.getElementById('tier-grid');
+  if (!tierNames.length) {
+    tierEl.innerHTML = '<div class="empty">No paper trades recorded yet. Starts tomorrow at 9:35 AM.</div>';
+  } else {
+    tierEl.innerHTML = tierNames.map(name => {
+      const t = tiers[name];
+      const iconLetter = name.replace(/\D/g, '').slice(0, 2) || name.slice(0, 2).toUpperCase();
+      const rows = (t.orders || []).slice(0, 6).map(o => {
+        const cls = o.status === 'submitted' ? 'ok' :
+                    o.status === 'skipped' ? 'warn' :
+                    o.status === 'failed' ? 'err' : '';
+        return `<tr>
+          <td><span class="badge ${cls}">${o.status || '?'}</span></td>
+          <td>${o.symbol || ''} ${(o.option_type || '').charAt(0).toUpperCase()}</td>
+          <td>$${o.strike || '—'}</td>
+          <td>${fmtMoney(o.total_cost)}</td>
+        </tr>`;
+      }).join('');
+      return `<div class="tier-card">
+        <h3><span class="tier-icon">${iconLetter}</span>${name}</h3>
+        <div class="tier-stats">
+          <div class="tier-stat"><div class="n">${t.submitted}</div><div class="l">Submitted</div></div>
+          <div class="tier-stat"><div class="n">${t.skipped}</div><div class="l">Skipped</div></div>
+          <div class="tier-stat"><div class="n">${t.failed}</div><div class="l">Failed</div></div>
+          <div class="tier-stat"><div class="n">${fmtMoney(t.deployed)}</div><div class="l">Deployed</div></div>
+        </div>
+        ${rows ? `<table style="font-size:11px;"><thead><tr><th>Status</th><th>Contract</th><th>Strike</th><th>Cost</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty" style="padding:10px;">No attempts</div>'}
+      </div>`;
+    }).join('');
+  }
+
+  // Alerts
+  const alerts = DATA.alerts || [];
+  document.getElementById('alert-count').textContent = alerts.length;
+  const alertsWrap = document.getElementById('alerts-wrap');
+  if (!alerts.length) {
+    alertsWrap.innerHTML = '<div class="empty">No recent alerts.</div>';
+  } else {
+    alertsWrap.innerHTML = alerts.slice(0, 10).map(a => {
+      const sev = (a.severity || 'ERROR').toUpperCase();
+      const cls = sev === 'INFO' ? 'info' : sev === 'WARN' ? 'warn' : '';
+      const ts = (a.timestamp || '').slice(0, 19).replace('T', ' ');
+      return `<div class="alert-card ${cls}">
+        <div class="alert-meta"><span class="badge ${cls || 'err'}">${sev}</span> ${a.source || '?'} · ${ts} ${a.symbol ? '· ' + a.symbol : ''}</div>
+        <div class="alert-msg">${(a.message || '').replace(/[<>]/g, '')}</div>
+      </div>`;
+    }).join('');
+  }
+}
+
+// ── ANALYSIS TAB ────────────────────────────────────────────────────────────
+
+let _analysisReady = false;
+function initAnalysis() {
+  if (_analysisReady) return;
+  _analysisReady = true;
+
+  // Score distribution
   const hist = DATA.score_histogram || {};
   const histLabels = Object.keys(hist);
   const histValues = histLabels.map(k => hist[k]);
-  if (histLabels.length && histValues.reduce((a,b)=>a+b,0) > 0) {
+  const total = histValues.reduce((a, b) => a + b, 0);
+  if (total > 0) {
     new Chart(document.getElementById('scoreChart').getContext('2d'), {
       type: 'bar',
       data: { labels: histLabels, datasets: [{
         label: 'Candidates', data: histValues,
-        backgroundColor: '#4fc3f7',
+        backgroundColor: 'rgba(122,162,247,0.6)',
+        borderColor: 'rgba(122,162,247,1)', borderWidth: 1,
       }]},
       options: {
         plugins: { legend: { display: false } },
         scales: {
-          x: { ticks: { color: '#8a8a8a' }, grid: { color: '#222' } },
-          y: { ticks: { color: '#8a8a8a', precision: 0 }, grid: { color: '#222' }, beginAtZero: true },
+          x: { ticks: { color: '#8b93a7' }, grid: { color: '#2a2f3e' } },
+          y: { ticks: { color: '#8b93a7', precision: 0 }, grid: { color: '#2a2f3e' }, beginAtZero: true },
         },
       },
     });
@@ -702,19 +880,20 @@ function initAnalysis() {
   }
 
   // Snapshot top table
+  const snap = DATA.snap_trades || [];
   const tblWrap = document.getElementById('snap-table-wrap');
   if (!snap.length) {
-    tblWrap.innerHTML = '<div class="empty">No snapshot available.</div>';
+    tblWrap.outerHTML = '<div class="empty">No snapshot available.</div>';
   } else {
     let h = `<table><thead><tr>
-      <th>Rank</th><th>Score</th><th>Sym</th><th>Type</th><th>Strike</th>
+      <th>#</th><th>Score</th><th>Sym</th><th>Type</th><th>Strike</th>
       <th>Expiry</th><th>DTE</th><th>Entry</th><th>Signal</th>
     </tr></thead><tbody>`;
-    snap.slice(0, 25).forEach((t, i) => {
+    snap.slice(0, 30).forEach((t, i) => {
       h += `<tr>
         <td>${i+1}</td>
         <td><strong>${Number(t.score || 0).toFixed(1)}</strong></td>
-        <td>${t.symbol || ''}</td>
+        <td><strong>${t.symbol || ''}</strong></td>
         <td>${(t.option_type || '').toUpperCase()}</td>
         <td>$${t.strike || '—'}</td>
         <td class="mono">${t.expiry || ''}</td>
@@ -727,67 +906,10 @@ function initAnalysis() {
     tblWrap.innerHTML = h;
   }
 
-  // Tier grid
-  const tiers = DATA.tier_stats || {};
-  const tierEl = document.getElementById('tier-grid');
-  const tierNames = Object.keys(tiers).sort();
-  if (!tierNames.length) {
-    tierEl.innerHTML = '<div class="empty">No paper trades recorded yet.</div>';
-  } else {
-    tierEl.innerHTML = tierNames.map(name => {
-      const t = tiers[name];
-      const rows = (t.orders || []).map(o => {
-        const cls = o.status === 'submitted' ? 'ok' :
-                    o.status === 'skipped' ? 'warn' :
-                    o.status === 'failed' ? 'err' : '';
-        return `<tr>
-          <td><span class="badge ${cls}">${o.status || '?'}</span></td>
-          <td>${o.symbol || ''} ${(o.option_type || '').charAt(0).toUpperCase()} $${o.strike || '—'}</td>
-          <td class="mono">${o.expiry || ''}</td>
-          <td>${fmtMoney(o.total_cost)}</td>
-          <td>${Number(o.score || 0).toFixed(0)}</td>
-          <td class="mono" style="font-size:10px;">${(o.timestamp || '').slice(11,19)}</td>
-        </tr>`;
-      }).join('');
-      return `<div class="tier-card">
-        <h3>${name}</h3>
-        <div class="stats-row">
-          <div><span class="s">Submitted:</span> <strong>${t.submitted}</strong></div>
-          <div><span class="s">Skipped:</span> <strong>${t.skipped}</strong></div>
-          <div><span class="s">Failed:</span> <strong>${t.failed}</strong></div>
-          <div><span class="s">Deployed:</span> <strong>${fmtMoney(t.deployed)}</strong></div>
-        </div>
-        ${rows ? `<table><thead><tr><th>Status</th><th>Contract</th><th>Exp</th><th>Cost</th><th>Scr</th><th>Time</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No attempts</div>'}
-      </div>`;
-    }).join('');
-  }
-
-  // Positions
-  const positions = DATA.positions || [];
-  const posWrap = document.getElementById('positions-wrap');
-  if (!positions.length) {
-    posWrap.innerHTML = '<div class="empty">No open positions.</div>';
-  } else {
-    let h = `<table><thead><tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>Mark</th><th>Value</th><th>Unrealized</th><th>%</th></tr></thead><tbody>`;
-    positions.forEach(p => {
-      h += `<tr>
-        <td class="mono">${p.symbol}</td>
-        <td>${p.qty}</td>
-        <td>${fmtMoney(p.avg_entry)}</td>
-        <td>${fmtMoney(p.mark)}</td>
-        <td>${fmtMoney(p.market_value)}</td>
-        <td class="${pnlClass(p.unrealized_pl)}">${fmtMoney(p.unrealized_pl)}</td>
-        <td class="${pnlClass(p.unrealized_pl)}">${Number(p.unrealized_pl_pct || 0).toFixed(2)}%</td>
-      </tr>`;
-    });
-    h += '</tbody></table>';
-    posWrap.innerHTML = h;
-  }
-
-  // 30-day deployed chart
+  // Deployed capital chart
   const pnl = DATA.deployed_history || {};
   if (pnl.days && pnl.days.length && pnl.tiers.length) {
-    const palette = ['#4fc3f7', '#ab47bc', '#66bb6a', '#ffb300', '#ef5350'];
+    const palette = ['#7aa2f7', '#bb9af7', '#9ece6a', '#e0af68', '#f7768e'];
     new Chart(document.getElementById('pnlChart').getContext('2d'), {
       type: 'line',
       data: {
@@ -797,45 +919,224 @@ function initAnalysis() {
           data: pnl.series[tier],
           borderColor: palette[i % palette.length],
           backgroundColor: palette[i % palette.length] + '22',
-          tension: 0.2, pointRadius: 3,
+          tension: 0.25, pointRadius: 3, borderWidth: 2,
         })),
       },
       options: {
         responsive: true,
-        plugins: { legend: { labels: { color: '#dcdcdc' } } },
+        plugins: { legend: { labels: { color: '#e8ebf4' } } },
         scales: {
-          x: { ticks: { color: '#8a8a8a' }, grid: { color: '#222' } },
-          y: { ticks: { color: '#8a8a8a', callback: v => '$' + v }, grid: { color: '#222' }, beginAtZero: true },
+          x: { ticks: { color: '#8b93a7' }, grid: { color: '#2a2f3e' } },
+          y: { ticks: { color: '#8b93a7', callback: v => '$' + v }, grid: { color: '#2a2f3e' }, beginAtZero: true },
         },
       },
     });
   } else {
-    document.querySelector('#tab-analysis .chart-wrap:last-of-type').innerHTML =
-      '<div class="empty">No trade history yet.</div>';
+    document.querySelectorAll('#tab-analysis .chart-card').forEach((el, idx) => {
+      if (idx === 1) el.innerHTML = '<div class="empty">No trade history yet — builds as the scheduled runs log data.</div>';
+    });
   }
 
-  // Alerts
-  const alerts = DATA.alerts || [];
-  const alertsWrap = document.getElementById('alerts-wrap');
-  if (!alerts.length) {
-    alertsWrap.innerHTML = '<div class="empty">No alerts.</div>';
-  } else {
-    alertsWrap.innerHTML = alerts.map(a => {
-      const sev = (a.severity || 'ERROR').toUpperCase();
-      const cls = sev === 'INFO' ? 'ok' : sev === 'WARN' ? 'warn' : 'err';
-      const ts = (a.timestamp || '').slice(0, 19).replace('T', ' ');
-      return `<div class="card" style="margin-bottom:6px; border-left: 3px solid var(--${cls === 'ok' ? 'accent' : cls}); padding:8px 12px;">
-        <div class="small"><span class="badge ${cls}">${sev}</span> ${a.source || '?'} · ${ts} ${a.symbol ? '· ' + a.symbol : ''}</div>
-        <div style="margin-top:4px; font-size: 12px;">${a.message || ''}</div>
-      </div>`;
-    }).join('');
-  }
+  // Ticker live charts
+  initTickerCharts();
 }
+
+function initTickerCharts() {
+  const tickers = DATA.unique_tickers || [];
+  const bars = DATA.ticker_bars || {};
+  const grid = document.getElementById('ticker-charts');
+  document.getElementById('ticker-count').textContent = tickers.length;
+
+  if (!tickers.length) {
+    grid.innerHTML = '<div class="empty">No tickers in today\'s snapshot.</div>';
+    return;
+  }
+
+  grid.innerHTML = '';
+  tickers.forEach(sym => {
+    const data = bars[sym] || {};
+    const card = document.createElement('div');
+    card.className = 'ticker-chart-card';
+    card.dataset.sym = sym;
+
+    const intraday = data.intraday || [];
+    const daily = data.daily || [];
+    const last = data.last;
+    // Compute day change
+    let change = null, changePct = null;
+    if (intraday.length >= 2) {
+      // Use first intraday bar of today vs last intraday
+      const todayStr = intraday[intraday.length - 1].t.slice(0, 10);
+      const todayBars = intraday.filter(b => b.t.slice(0, 10) === todayStr);
+      if (todayBars.length >= 2) {
+        const openPrice = todayBars[0].o;
+        change = todayBars[todayBars.length - 1].c - openPrice;
+        changePct = (change / openPrice) * 100;
+      }
+    }
+
+    const changeHtml = change != null
+      ? `<span class="change ${change > 0 ? 'pos' : 'neg'}">${change > 0 ? '+' : ''}${change.toFixed(2)} (${changePct > 0 ? '+' : ''}${changePct.toFixed(2)}%)</span>`
+      : '';
+
+    card.innerHTML = `
+      <div class="ticker-head">
+        <div>
+          <span class="sym">${sym}</span>
+          <span class="last">${last != null ? '$' + last.toFixed(2) : '—'}</span>
+          ${changeHtml}
+        </div>
+        <div class="tf-toggles" data-sym="${sym}">
+          <button class="tf-btn active" data-tf="1D">1D</button>
+          <button class="tf-btn" data-tf="5D">5D</button>
+          <button class="tf-btn" data-tf="1M">1M</button>
+          <button class="tf-btn" data-tf="3M">3M</button>
+          <button class="tf-btn" data-tf="1Y">1Y</button>
+        </div>
+      </div>
+      <canvas id="chart-${sym}"></canvas>
+    `;
+    grid.appendChild(card);
+
+    // Initial render: 1D
+    renderTickerChart(sym, '1D');
+
+    // Wire toggles
+    card.querySelectorAll('.tf-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        card.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        renderTickerChart(sym, btn.dataset.tf);
+      });
+    });
+  });
+}
+
+const _chartInstances = {};
+
+function renderTickerChart(sym, tf) {
+  const bars = (DATA.ticker_bars || {})[sym] || {};
+  const intraday = bars.intraday || [];
+  const daily = bars.daily || [];
+
+  let points = [];
+  let label = tf;
+
+  if (tf === '1D' && intraday.length) {
+    const lastDay = intraday[intraday.length - 1].t.slice(0, 10);
+    points = intraday.filter(b => b.t.slice(0, 10) === lastDay).map(b => ({ x: b.t, y: b.c }));
+  } else if (tf === '5D' && intraday.length) {
+    points = intraday.map(b => ({ x: b.t, y: b.c }));
+  } else if (tf === '1M' && daily.length) {
+    points = daily.slice(-22).map(b => ({ x: b.t, y: b.c }));
+  } else if (tf === '3M' && daily.length) {
+    points = daily.slice(-65).map(b => ({ x: b.t, y: b.c }));
+  } else if (tf === '1Y' && daily.length) {
+    points = daily.map(b => ({ x: b.t, y: b.c }));
+  }
+
+  const canvas = document.getElementById('chart-' + sym);
+  if (!canvas) return;
+
+  // Destroy prior instance if exists
+  if (_chartInstances[sym]) _chartInstances[sym].destroy();
+
+  if (!points.length) {
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#8b93a7';
+    ctx.font = '12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`No ${tf} data`, canvas.width / 2, 60);
+    return;
+  }
+
+  const color = points[0].y > points[points.length - 1].y ? '#f7768e' : '#9ece6a';
+
+  _chartInstances[sym] = new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: {
+      datasets: [{
+        label: sym,
+        data: points,
+        borderColor: color,
+        backgroundColor: color + '20',
+        tension: 0.2, pointRadius: 0, fill: true, borderWidth: 2,
+      }],
+    },
+    options: {
+      responsive: true,
+      animation: { duration: 250 },
+      plugins: { legend: { display: false },
+                 tooltip: { mode: 'index', intersect: false } },
+      scales: {
+        x: {
+          type: 'time',
+          time: { unit: tf === '1D' ? 'hour' : tf === '5D' ? 'day' : 'day' },
+          ticks: { color: '#8b93a7', maxTicksLimit: 6 },
+          grid: { color: '#2a2f3e' },
+        },
+        y: {
+          ticks: { color: '#8b93a7', callback: v => '$' + Number(v).toFixed(2) },
+          grid: { color: '#2a2f3e' },
+        },
+      },
+    },
+  });
+}
+
+// ── TRADES TAB ──────────────────────────────────────────────────────────────
+
+let _tradesReady = false;
+function initTrades() {
+  if (_tradesReady) return;
+  _tradesReady = true;
+
+  // Flatten all tier orders
+  const tiers = DATA.tier_stats || {};
+  const all = [];
+  Object.keys(tiers).forEach(name => {
+    (tiers[name].orders || []).forEach(o => all.push({ tier: name, ...o }));
+  });
+  all.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+
+  const wrap = document.getElementById('all-trades-wrap');
+  if (!all.length) {
+    wrap.outerHTML = '<div class="empty">No trade attempts logged yet.</div>';
+    return;
+  }
+  let h = `<table><thead><tr>
+    <th>Time</th><th>Tier</th><th>Status</th><th>Symbol</th><th>Type</th>
+    <th>Strike</th><th>Exp</th><th>Cost</th><th>Score</th><th>Client Order ID</th>
+  </tr></thead><tbody>`;
+  all.forEach(o => {
+    const cls = o.status === 'submitted' ? 'ok' :
+                o.status === 'skipped' ? 'warn' :
+                o.status === 'failed' ? 'err' : '';
+    h += `<tr>
+      <td class="mono">${(o.timestamp || '').slice(11, 19)}</td>
+      <td><span class="badge info">${o.tier || ''}</span></td>
+      <td><span class="badge ${cls}">${o.status || '?'}</span></td>
+      <td><strong>${o.symbol || ''}</strong></td>
+      <td>${(o.option_type || '').toUpperCase()}</td>
+      <td>$${o.strike || '—'}</td>
+      <td class="mono">${o.expiry || ''}</td>
+      <td>${fmtMoney(o.total_cost)}</td>
+      <td>${Number(o.score || 0).toFixed(0)}</td>
+      <td class="mono" style="font-size:10px;">${o.client_order_id || ''}</td>
+    </tr>`;
+  });
+  h += '</tbody></table>';
+  wrap.innerHTML = h;
+}
+
+renderOverview();
 </script>
 
 </body>
 </html>
 """
+
 
 
 def main() -> int:
