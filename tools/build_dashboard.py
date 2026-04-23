@@ -213,18 +213,42 @@ def _signal_breakdown(snap_trades):
     return {"by_signal": dict(by_sig), "by_type": dict(by_type)}
 
 
+def _classify_session(ts_iso: str) -> str:
+    """Classify a UTC timestamp into regular/pre/post session (ET-based)."""
+    try:
+        dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        # ET = UTC - 4 (DST) or UTC - 5 (EST). Use -4 as approximation; IEX feed
+        # is DST-aware so bars are already at correct clock times.
+        # 9:30 AM ET = 13:30 UTC (DST) / 14:30 UTC (EST)
+        # 4:00 PM ET = 20:00 UTC (DST) / 21:00 UTC (EST)
+        # 4:00 AM ET = 08:00 UTC (DST) / 09:00 UTC (EST)
+        # 8:00 PM ET = 00:00 UTC (DST, next day)
+        hour_utc = dt.hour + dt.minute / 60
+        # Regular session 13:30-20:00 UTC (DST) is most accurate
+        if 13.5 <= hour_utc < 20:
+            return "regular"
+        elif 8 <= hour_utc < 13.5:
+            return "pre"
+        else:
+            return "post"
+    except Exception:
+        return "regular"
+
+
 def _fetch_ticker_bars(symbols: list[str]) -> dict:
     """
     Fetch intraday + daily bars for each unique ticker.
-    Uses Alpaca's free IEX feed.
+    Uses Alpaca's free IEX feed, which includes extended-hours bars.
 
     Returns:
         {symbol: {
-            "intraday": [{t, o, h, l, c, v}, ...],  # 5-min bars, last 2 trading days
-            "daily":    [{t, o, h, l, c, v}, ...],  # daily bars, last 252 days
-            "last":     float,                      # most recent close
-            "last_ts":  str,                        # ISO timestamp of most recent bar
+            "intraday": [{t, o, h, l, c, v, s}, ...],  # 5-min bars, ~5 days, s=session
+            "daily":    [{t, o, h, l, c, v}, ...],     # daily bars, ~365 days
+            "last":     float,                          # most recent close
+            "last_ts":  str,                            # ISO timestamp of most recent bar
         }}
+
+    Session (s) values: "regular", "pre", "post" — client-side toggles hide/show.
     """
     if not symbols:
         return {}
@@ -263,8 +287,13 @@ def _fetch_ticker_bars(symbols: list[str]) -> dict:
         for sym, rows in raw.items():
             ud = sym.upper()
             result[ud]["intraday"] = [
-                {"t": b.timestamp.isoformat(), "o": float(b.open), "h": float(b.high),
-                 "l": float(b.low), "c": float(b.close), "v": int(b.volume or 0)}
+                {
+                    "t": b.timestamp.isoformat(),
+                    "o": float(b.open), "h": float(b.high),
+                    "l": float(b.low), "c": float(b.close),
+                    "v": int(b.volume or 0),
+                    "s": _classify_session(b.timestamp.isoformat()),
+                }
                 for b in rows
             ]
             if rows:
@@ -302,6 +331,66 @@ def _fetch_ticker_bars(symbols: list[str]) -> dict:
             result[s].setdefault("error", str(e)[:100])
 
     return result
+
+
+def _load_user_watchlist() -> list[str]:
+    """
+    Load ticker watchlist from watchlist.json at repo root.
+
+    Format: ["AAPL", "TSLA", ...]   (raw list)
+           or  {"tickers": [...]}   (wrapped)
+
+    Returns [] on any failure.
+    """
+    path = REPO_ROOT / "watchlist.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [str(x).upper() for x in data if x]
+        if isinstance(data, dict):
+            items = data.get("tickers") or data.get("watchlist") or []
+            return [str(x).upper() for x in items if x]
+    except Exception:
+        pass
+    return []
+
+
+def _fetch_news_per_ticker(symbols: list[str], per_ticker: int = 6) -> dict:
+    """
+    Pull recent news for each ticker using existing data/news.py.
+
+    Returns: {symbol: [{title, link, published, summary, source, sentiment}, ...]}
+    Failures per ticker are silent — we return {} for that ticker.
+    """
+    if not symbols:
+        return {}
+    try:
+        from data.news import get_news
+    except Exception:
+        return {sym: [] for sym in symbols}
+
+    out: dict[str, list[dict]] = {}
+    for sym in symbols:
+        try:
+            articles = get_news(sym, max_age_days=3, limit=per_ticker) or []
+            # Normalize shape
+            out[sym] = [
+                {
+                    "title": a.get("title", "")[:160],
+                    "link": a.get("link") or a.get("url") or "",
+                    "published": a.get("published") or "",
+                    "summary": (a.get("summary") or "")[:300],
+                    "source": a.get("source") or "",
+                    "sentiment": a.get("sentiment"),
+                }
+                for a in articles
+                if a.get("title")
+            ]
+        except Exception:
+            out[sym] = []
+    return out
 
 
 # ── Main build ──────────────────────────────────────────────────────────────
@@ -363,13 +452,33 @@ def build() -> Path:
     score_hist = _score_distribution(snap_trades)
     sig_break = _signal_breakdown(snap_trades)
 
-    # Gather unique tickers for bar fetching
-    unique_tickers = sorted({
+    # Gather tickers: snapshot tickers + user watchlist + popular benchmarks
+    snap_tickers = sorted({
         (t.get("symbol") or "").upper()
         for t in snap_trades
         if t.get("symbol")
-    })[:20]  # cap at 20 to keep file size reasonable
-    ticker_bars = _fetch_ticker_bars(unique_tickers)
+    })
+    user_watchlist = _load_user_watchlist()
+    benchmarks = ["SPY", "QQQ", "IWM", "VIX"]  # always included
+    all_tickers = []
+    seen = set()
+    for t in snap_tickers + user_watchlist + benchmarks:
+        if t and t not in seen:
+            seen.add(t)
+            all_tickers.append(t)
+    # Cap at 30 to keep file size reasonable
+    all_tickers = all_tickers[:30]
+
+    ticker_bars = _fetch_ticker_bars(all_tickers)
+
+    # News — only fetch for a small set (news fetch is slow); use snapshot + watchlist
+    news_set = []
+    news_seen = set()
+    for t in snap_tickers + user_watchlist:
+        if t and t not in news_seen and len(news_set) < 20:
+            news_seen.add(t)
+            news_set.append(t)
+    ticker_news = _fetch_news_per_ticker(news_set, per_ticker=6)
 
     data = {
         "generated": datetime.now().isoformat(),
@@ -388,8 +497,12 @@ def build() -> Path:
         "score_histogram": score_hist,
         "signal_breakdown": sig_break,
         "trades_last_30d": len(trades_log),
-        "unique_tickers": unique_tickers,
+        "snap_tickers": snap_tickers,           # today's highlighted tickers (buttons)
+        "user_watchlist": user_watchlist,       # user's watchlist.json
+        "benchmarks": benchmarks,
+        "unique_tickers": all_tickers,          # superset used for charts/search
         "ticker_bars": ticker_bars,
+        "ticker_news": ticker_news,
     }
 
     body = _HTML_TEMPLATE.replace("__DATA__", json.dumps(data, default=str))
@@ -579,6 +692,43 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   .ticker-head .last { font-size: 16px; color: var(--fg); margin-left: 8px; }
   .ticker-head .change { font-size: 13px; margin-left: 6px; }
 
+  .indicator-bar {
+    display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
+  }
+  .ind-btn {
+    padding: 3px 10px; font-size: 11px; font-weight: 500;
+    background: var(--bg-elev); color: var(--mute);
+    border: 1px solid var(--border); border-radius: 4px;
+    cursor: pointer; transition: all 0.15s;
+  }
+  .ind-btn:hover { color: var(--fg); border-color: var(--accent); }
+  .ind-btn.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .ind-btn.ext { background: var(--bg-elev); }
+  .ind-btn.ext.active { background: var(--warn); color: var(--bg); border-color: var(--warn); }
+  .quick-btn {
+    display: inline-block; padding: 5px 12px; margin: 2px 4px 2px 0;
+    font-size: 12px; font-weight: 500;
+    background: var(--card); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 14px;
+    cursor: pointer; transition: all 0.15s;
+  }
+  .quick-btn:hover { background: var(--card-hover); border-color: var(--accent); }
+  .quick-btn.watch { border-color: var(--accent-2); }
+  .quick-btn .rm {
+    margin-left: 6px; color: var(--err); font-weight: 600; font-size: 14px;
+    cursor: pointer;
+  }
+  .news-item {
+    background: var(--card); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent); border-radius: 8px;
+    padding: 12px 16px; margin-bottom: 8px;
+  }
+  .news-item.pos { border-left-color: var(--ok); }
+  .news-item.neg { border-left-color: var(--err); }
+  .news-item a { color: var(--fg); text-decoration: none; font-weight: 500; font-size: 14px; }
+  .news-item a:hover { color: var(--accent); }
+  .news-item .meta { color: var(--mute); font-size: 11px; margin-top: 4px; }
+  .news-item .summary { color: var(--mute); font-size: 12px; margin-top: 6px; line-height: 1.5; }
   .tf-toggles { display: inline-flex; background: var(--bg-elev); border-radius: 6px; padding: 2px; }
   .tf-btn {
     padding: 4px 10px; font-size: 11px; color: var(--mute);
@@ -621,13 +771,23 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="subtitle" id="subtitle"></div>
   </div>
   <div class="header-actions">
-    <button class="btn" onclick="location.reload()">Refresh page</button>
+    <label style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--mute); cursor:pointer;">
+      <input type="checkbox" id="auto-refresh-cb" style="cursor:pointer;"> Auto-refresh
+      <select id="auto-refresh-sec" style="background:var(--bg-elev); color:var(--fg);
+              border:1px solid var(--border); padding:3px 6px; border-radius:4px; font-size:11px;">
+        <option value="30">30s</option>
+        <option value="60" selected>1m</option>
+        <option value="300">5m</option>
+      </select>
+    </label>
+    <button class="btn" onclick="location.reload()">Refresh now</button>
   </div>
 </header>
 
 <div class="tabs">
   <div class="tab active" data-tab="overview">Overview</div>
   <div class="tab" data-tab="analysis">Analysis</div>
+  <div class="tab" data-tab="lookup">Ticker Lookup</div>
   <div class="tab" data-tab="trades">Trades</div>
 </div>
 
@@ -686,6 +846,55 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   </section>
 </div>
 
+<!-- TICKER LOOKUP -->
+<div class="tab-content" id="tab-lookup">
+  <section>
+    <div class="section-title"><span class="dot"></span> Ticker search</div>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px;">
+      <input id="lookup-search" type="text" placeholder="Type a ticker..." autocomplete="off"
+             style="background:var(--bg-elev); color:var(--fg); border:1px solid var(--border);
+                    padding:10px 14px; border-radius:6px; font-size:14px; min-width:220px;">
+      <button class="btn primary" id="lookup-go">Show</button>
+      <span class="subtitle" id="lookup-hint">Or click a ticker below</span>
+    </div>
+    <div id="lookup-quick-buttons" style="margin-bottom:10px;"></div>
+    <div id="lookup-watchlist-buttons" style="margin-bottom:10px;"></div>
+    <div style="display:flex; gap:10px; align-items:center; margin-bottom:14px;">
+      <input id="lookup-wl-add" type="text" placeholder="Add ticker to watchlist" autocomplete="off"
+             style="background:var(--bg-elev); color:var(--fg); border:1px solid var(--border);
+                    padding:6px 12px; border-radius:6px; font-size:13px;">
+      <button class="btn" id="lookup-wl-add-btn">+ Add to watchlist</button>
+      <span class="subtitle">Stored in your browser</span>
+    </div>
+  </section>
+
+  <section id="lookup-chart-section" style="display:none;">
+    <div class="chart-card" id="lookup-main-chart-wrap">
+      <div class="ticker-head">
+        <div>
+          <span class="sym" id="lookup-sym">—</span>
+          <span class="last" id="lookup-last"></span>
+          <span class="change" id="lookup-change"></span>
+        </div>
+        <div class="tf-toggles" id="lookup-tf-toggles">
+          <button class="tf-btn active" data-tf="1D">1D</button>
+          <button class="tf-btn" data-tf="5D">5D</button>
+          <button class="tf-btn" data-tf="1M">1M</button>
+          <button class="tf-btn" data-tf="3M">3M</button>
+          <button class="tf-btn" data-tf="1Y">1Y</button>
+        </div>
+      </div>
+      <div class="indicator-bar" id="lookup-ind-bar"></div>
+      <canvas id="lookup-chart" style="max-height:380px;"></canvas>
+    </div>
+  </section>
+
+  <section id="lookup-news-section" style="display:none;">
+    <div class="section-title"><span class="dot"></span> News for <span id="lookup-news-sym">—</span> <span class="count" id="lookup-news-count">0</span></div>
+    <div id="lookup-news-wrap"></div>
+  </section>
+</div>
+
 <!-- TRADES -->
 <div class="tab-content" id="tab-trades">
   <section>
@@ -714,6 +923,29 @@ function pctText(n) {
 document.getElementById('subtitle').textContent =
   `Generated ${new Date(DATA.generated).toLocaleString()}  ·  ${DATA.today}  ·  Log: ${DATA.trades_last_30d} entries (30d)`;
 
+// ── Auto-refresh (persists to localStorage)
+(function initAutoRefresh() {
+  const cb = document.getElementById('auto-refresh-cb');
+  const sel = document.getElementById('auto-refresh-sec');
+  const savedOn = localStorage.getItem('optionsEdge.autoRefresh') === '1';
+  const savedSec = localStorage.getItem('optionsEdge.autoRefreshSec') || '60';
+  cb.checked = savedOn;
+  sel.value = savedSec;
+  let timer = null;
+  function apply() {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (cb.checked) {
+      const ms = parseInt(sel.value, 10) * 1000;
+      timer = setTimeout(() => location.reload(), ms);
+    }
+    localStorage.setItem('optionsEdge.autoRefresh', cb.checked ? '1' : '0');
+    localStorage.setItem('optionsEdge.autoRefreshSec', sel.value);
+  }
+  cb.addEventListener('change', apply);
+  sel.addEventListener('change', apply);
+  apply();
+})();
+
 // ── Tab switching
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
@@ -723,6 +955,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
     if (tab.dataset.tab === 'analysis') initAnalysis();
     if (tab.dataset.tab === 'trades') initTrades();
+    if (tab.dataset.tab === 'lookup') initLookup();
   });
 });
 
@@ -941,8 +1174,88 @@ function initAnalysis() {
   initTickerCharts();
 }
 
+// Indicator helpers: compute VWAP, SMA, Bollinger Bands, RSI
+// All take an array of bars [{t, o, h, l, c, v}]; return aligned point arrays.
+
+function calcSMA(bars, window) {
+  const out = [];
+  let sum = 0;
+  for (let i = 0; i < bars.length; i++) {
+    sum += bars[i].c;
+    if (i >= window) sum -= bars[i - window].c;
+    out.push(i >= window - 1 ? { x: bars[i].t, y: sum / window } : { x: bars[i].t, y: null });
+  }
+  return out;
+}
+
+function calcVWAP(bars) {
+  // Typical price * volume, cumulative
+  const out = [];
+  let cumPV = 0, cumV = 0;
+  let lastDay = null;
+  for (const b of bars) {
+    const day = (b.t || '').slice(0, 10);
+    if (day !== lastDay) { cumPV = 0; cumV = 0; lastDay = day; }
+    const tp = (b.h + b.l + b.c) / 3;
+    cumPV += tp * (b.v || 0);
+    cumV += (b.v || 0);
+    out.push({ x: b.t, y: cumV > 0 ? cumPV / cumV : null });
+  }
+  return out;
+}
+
+function calcBollinger(bars, window, mult) {
+  const out = { upper: [], mid: [], lower: [] };
+  for (let i = 0; i < bars.length; i++) {
+    if (i < window - 1) {
+      out.upper.push({ x: bars[i].t, y: null });
+      out.mid.push({   x: bars[i].t, y: null });
+      out.lower.push({ x: bars[i].t, y: null });
+      continue;
+    }
+    let sum = 0;
+    for (let j = i - window + 1; j <= i; j++) sum += bars[j].c;
+    const mean = sum / window;
+    let sqSum = 0;
+    for (let j = i - window + 1; j <= i; j++) sqSum += (bars[j].c - mean) ** 2;
+    const sd = Math.sqrt(sqSum / window);
+    out.upper.push({ x: bars[i].t, y: mean + mult * sd });
+    out.mid.push({   x: bars[i].t, y: mean });
+    out.lower.push({ x: bars[i].t, y: mean - mult * sd });
+  }
+  return out;
+}
+
+function calcRSI(bars, period) {
+  const out = [];
+  if (bars.length < period + 1) {
+    return bars.map(b => ({ x: b.t, y: null }));
+  }
+  let gain = 0, loss = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = bars[i].c - bars[i - 1].c;
+    if (d > 0) gain += d; else loss -= d;
+  }
+  gain /= period; loss /= period;
+  out.push(...bars.slice(0, period).map(b => ({ x: b.t, y: null })));
+  out.push({ x: bars[period].t, y: loss === 0 ? 100 : 100 - (100 / (1 + gain / loss)) });
+  for (let i = period + 1; i < bars.length; i++) {
+    const d = bars[i].c - bars[i - 1].c;
+    const g = d > 0 ? d : 0;
+    const l = d < 0 ? -d : 0;
+    gain = (gain * (period - 1) + g) / period;
+    loss = (loss * (period - 1) + l) / period;
+    out.push({ x: bars[i].t, y: loss === 0 ? 100 : 100 - (100 / (1 + gain / loss)) });
+  }
+  return out;
+}
+
+// Per-chart state: { sym -> { tf, indicators: Set, showExt: bool } }
+const _chartState = {};
+const _chartInstances = {};
+
 function initTickerCharts() {
-  const tickers = DATA.unique_tickers || [];
+  const tickers = DATA.snap_tickers || [];  // Analysis shows snap tickers only
   const bars = DATA.ticker_bars || {};
   const grid = document.getElementById('ticker-charts');
   document.getElementById('ticker-count').textContent = tickers.length;
@@ -960,24 +1273,24 @@ function initTickerCharts() {
     card.dataset.sym = sym;
 
     const intraday = data.intraday || [];
-    const daily = data.daily || [];
     const last = data.last;
-    // Compute day change
+
+    // Day change from today's regular-session bars
     let change = null, changePct = null;
     if (intraday.length >= 2) {
-      // Use first intraday bar of today vs last intraday
       const todayStr = intraday[intraday.length - 1].t.slice(0, 10);
-      const todayBars = intraday.filter(b => b.t.slice(0, 10) === todayStr);
-      if (todayBars.length >= 2) {
-        const openPrice = todayBars[0].o;
-        change = todayBars[todayBars.length - 1].c - openPrice;
-        changePct = (change / openPrice) * 100;
+      const regBars = intraday.filter(b => b.t.slice(0, 10) === todayStr && b.s === 'regular');
+      if (regBars.length >= 2) {
+        const openPx = regBars[0].o;
+        change = regBars[regBars.length - 1].c - openPx;
+        changePct = (change / openPx) * 100;
       }
     }
-
     const changeHtml = change != null
       ? `<span class="change ${change > 0 ? 'pos' : 'neg'}">${change > 0 ? '+' : ''}${change.toFixed(2)} (${changePct > 0 ? '+' : ''}${changePct.toFixed(2)}%)</span>`
       : '';
+
+    _chartState[sym] = { tf: '1D', indicators: new Set(), showExt: false };
 
     card.innerHTML = `
       <div class="ticker-head">
@@ -986,7 +1299,7 @@ function initTickerCharts() {
           <span class="last">${last != null ? '$' + last.toFixed(2) : '—'}</span>
           ${changeHtml}
         </div>
-        <div class="tf-toggles" data-sym="${sym}">
+        <div class="tf-toggles">
           <button class="tf-btn active" data-tf="1D">1D</button>
           <button class="tf-btn" data-tf="5D">5D</button>
           <button class="tf-btn" data-tf="1M">1M</button>
@@ -994,95 +1307,357 @@ function initTickerCharts() {
           <button class="tf-btn" data-tf="1Y">1Y</button>
         </div>
       </div>
+      <div class="indicator-bar">
+        <button class="ind-btn" data-ind="vwap">VWAP</button>
+        <button class="ind-btn" data-ind="ma20">MA20</button>
+        <button class="ind-btn" data-ind="ma50">MA50</button>
+        <button class="ind-btn" data-ind="boll">BOLL</button>
+        <button class="ind-btn" data-ind="rsi">RSI</button>
+        <button class="ind-btn ext" data-ind="ext">Pre/After</button>
+      </div>
       <canvas id="chart-${sym}"></canvas>
     `;
     grid.appendChild(card);
 
-    // Initial render: 1D
-    renderTickerChart(sym, '1D');
-
-    // Wire toggles
+    // Wire timeframe buttons
     card.querySelectorAll('.tf-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         card.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
-        renderTickerChart(sym, btn.dataset.tf);
+        _chartState[sym].tf = btn.dataset.tf;
+        renderTickerChart(sym, `chart-${sym}`, _chartState[sym]);
       });
     });
+    // Wire indicator buttons
+    card.querySelectorAll('.ind-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const k = btn.dataset.ind;
+        btn.classList.toggle('active');
+        if (k === 'ext') {
+          _chartState[sym].showExt = btn.classList.contains('active');
+        } else {
+          if (btn.classList.contains('active')) _chartState[sym].indicators.add(k);
+          else _chartState[sym].indicators.delete(k);
+        }
+        renderTickerChart(sym, `chart-${sym}`, _chartState[sym]);
+      });
+    });
+
+    // Initial render
+    renderTickerChart(sym, `chart-${sym}`, _chartState[sym]);
   });
 }
 
-const _chartInstances = {};
-
-function renderTickerChart(sym, tf) {
+function _sliceBarsForTF(sym, tf, showExt) {
   const bars = (DATA.ticker_bars || {})[sym] || {};
   const intraday = bars.intraday || [];
   const daily = bars.daily || [];
 
-  let points = [];
-  let label = tf;
+  let filteredIntra = showExt ? intraday : intraday.filter(b => b.s === 'regular');
 
-  if (tf === '1D' && intraday.length) {
-    const lastDay = intraday[intraday.length - 1].t.slice(0, 10);
-    points = intraday.filter(b => b.t.slice(0, 10) === lastDay).map(b => ({ x: b.t, y: b.c }));
-  } else if (tf === '5D' && intraday.length) {
-    points = intraday.map(b => ({ x: b.t, y: b.c }));
+  if (tf === '1D' && filteredIntra.length) {
+    const lastDay = filteredIntra[filteredIntra.length - 1].t.slice(0, 10);
+    return filteredIntra.filter(b => b.t.slice(0, 10) === lastDay);
+  } else if (tf === '5D' && filteredIntra.length) {
+    return filteredIntra;
   } else if (tf === '1M' && daily.length) {
-    points = daily.slice(-22).map(b => ({ x: b.t, y: b.c }));
+    return daily.slice(-22);
   } else if (tf === '3M' && daily.length) {
-    points = daily.slice(-65).map(b => ({ x: b.t, y: b.c }));
+    return daily.slice(-65);
   } else if (tf === '1Y' && daily.length) {
-    points = daily.map(b => ({ x: b.t, y: b.c }));
+    return daily;
   }
+  return [];
+}
 
-  const canvas = document.getElementById('chart-' + sym);
+function renderTickerChart(sym, canvasId, state) {
+  const bars = _sliceBarsForTF(sym, state.tf, state.showExt);
+  const canvas = document.getElementById(canvasId);
   if (!canvas) return;
+  if (_chartInstances[canvasId]) { _chartInstances[canvasId].destroy(); }
 
-  // Destroy prior instance if exists
-  if (_chartInstances[sym]) _chartInstances[sym].destroy();
-
-  if (!points.length) {
+  if (!bars.length) {
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = '#8b93a7';
-    ctx.font = '12px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(`No ${tf} data`, canvas.width / 2, 60);
+    ctx.fillStyle = '#8b93a7'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(`No ${state.tf} data`, canvas.width / 2, 60);
     return;
   }
 
-  const color = points[0].y > points[points.length - 1].y ? '#f7768e' : '#9ece6a';
+  const pricePoints = bars.map(b => ({ x: b.t, y: b.c }));
+  const color = pricePoints[0].y > pricePoints[pricePoints.length - 1].y ? '#f7768e' : '#9ece6a';
 
-  _chartInstances[sym] = new Chart(canvas.getContext('2d'), {
-    type: 'line',
-    data: {
-      datasets: [{
-        label: sym,
-        data: points,
-        borderColor: color,
-        backgroundColor: color + '20',
-        tension: 0.2, pointRadius: 0, fill: true, borderWidth: 2,
-      }],
+  const datasets = [{
+    label: sym,
+    data: pricePoints,
+    borderColor: color,
+    backgroundColor: color + '20',
+    tension: 0.2, pointRadius: 0, fill: true, borderWidth: 2,
+    yAxisID: 'y',
+  }];
+
+  const ind = state.indicators;
+  if (ind.has('vwap')) {
+    datasets.push({
+      label: 'VWAP', data: calcVWAP(bars),
+      borderColor: '#e0af68', borderWidth: 1.5, pointRadius: 0,
+      fill: false, borderDash: [4, 3], yAxisID: 'y',
+    });
+  }
+  if (ind.has('ma20')) {
+    datasets.push({
+      label: 'MA20', data: calcSMA(bars, 20),
+      borderColor: '#7dcfff', borderWidth: 1.5, pointRadius: 0, fill: false, yAxisID: 'y',
+    });
+  }
+  if (ind.has('ma50')) {
+    datasets.push({
+      label: 'MA50', data: calcSMA(bars, 50),
+      borderColor: '#bb9af7', borderWidth: 1.5, pointRadius: 0, fill: false, yAxisID: 'y',
+    });
+  }
+  if (ind.has('boll')) {
+    const b = calcBollinger(bars, 20, 2);
+    datasets.push({ label: 'BB Upper', data: b.upper, borderColor: '#9ece6a80', borderWidth: 1, pointRadius: 0, fill: false, yAxisID: 'y' });
+    datasets.push({ label: 'BB Mid',   data: b.mid,   borderColor: '#9ece6a', borderWidth: 1, pointRadius: 0, fill: false, borderDash: [3, 3], yAxisID: 'y' });
+    datasets.push({ label: 'BB Lower', data: b.lower, borderColor: '#9ece6a80', borderWidth: 1, pointRadius: 0, fill: false, yAxisID: 'y' });
+  }
+
+  // RSI on a separate axis (right)
+  const useRSI = ind.has('rsi');
+  if (useRSI) {
+    datasets.push({
+      label: 'RSI', data: calcRSI(bars, 14),
+      borderColor: '#f7768e', borderWidth: 1.5, pointRadius: 0, fill: false, yAxisID: 'yRSI',
+    });
+  }
+
+  const scales = {
+    x: {
+      type: 'time',
+      time: { unit: state.tf === '1D' ? 'hour' : 'day' },
+      ticks: { color: '#8b93a7', maxTicksLimit: 6 },
+      grid: { color: '#2a2f3e' },
     },
+    y: {
+      ticks: { color: '#8b93a7', callback: v => '$' + Number(v).toFixed(2) },
+      grid: { color: '#2a2f3e' },
+    },
+  };
+  if (useRSI) {
+    scales.yRSI = {
+      position: 'right', min: 0, max: 100,
+      ticks: { color: '#f7768e' }, grid: { drawOnChartArea: false },
+    };
+  }
+
+  _chartInstances[canvasId] = new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: { datasets },
     options: {
       responsive: true,
-      animation: { duration: 250 },
-      plugins: { legend: { display: false },
-                 tooltip: { mode: 'index', intersect: false } },
-      scales: {
-        x: {
-          type: 'time',
-          time: { unit: tf === '1D' ? 'hour' : tf === '5D' ? 'day' : 'day' },
-          ticks: { color: '#8b93a7', maxTicksLimit: 6 },
-          grid: { color: '#2a2f3e' },
-        },
-        y: {
-          ticks: { color: '#8b93a7', callback: v => '$' + Number(v).toFixed(2) },
-          grid: { color: '#2a2f3e' },
-        },
+      animation: { duration: 200 },
+      plugins: {
+        legend: { labels: { color: '#e8ebf4', font: { size: 10 } }, display: ind.size > 0 },
+        tooltip: { mode: 'index', intersect: false },
       },
+      scales,
     },
   });
+}
+
+// ── TICKER LOOKUP TAB ───────────────────────────────────────────────────────
+let _lookupReady = false;
+let _lookupState = { sym: null, tf: '1D', indicators: new Set(), showExt: false };
+
+function initLookup() {
+  if (_lookupReady) return;
+  _lookupReady = true;
+
+  // Quick buttons for today's tickers
+  const snap = DATA.snap_tickers || [];
+  const benchmarks = DATA.benchmarks || [];
+  const qb = document.getElementById('lookup-quick-buttons');
+  qb.innerHTML = '<div class="subtitle" style="margin-bottom:4px;">Today\'s highlighted tickers + benchmarks:</div>' +
+    [...snap, ...benchmarks].map(s =>
+      `<button class="quick-btn" data-sym="${s}">${s}</button>`
+    ).join('');
+
+  qb.querySelectorAll('.quick-btn').forEach(btn => {
+    btn.addEventListener('click', () => selectLookup(btn.dataset.sym));
+  });
+
+  // Watchlist (localStorage)
+  renderWatchlistButtons();
+
+  // Manual text search
+  const inp = document.getElementById('lookup-search');
+  const go = document.getElementById('lookup-go');
+  const submit = () => { const s = (inp.value || '').trim().toUpperCase(); if (s) selectLookup(s); };
+  go.addEventListener('click', submit);
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+
+  // Watchlist add
+  const addInp = document.getElementById('lookup-wl-add');
+  const addBtn = document.getElementById('lookup-wl-add-btn');
+  const doAdd = () => {
+    const s = (addInp.value || '').trim().toUpperCase();
+    if (!s) return;
+    const wl = loadBrowserWatchlist();
+    if (!wl.includes(s)) wl.push(s);
+    saveBrowserWatchlist(wl);
+    addInp.value = '';
+    renderWatchlistButtons();
+  };
+  addBtn.addEventListener('click', doAdd);
+  addInp.addEventListener('keydown', e => { if (e.key === 'Enter') doAdd(); });
+
+  // Auto-select first snap ticker if any
+  if (snap.length) selectLookup(snap[0]);
+}
+
+function loadBrowserWatchlist() {
+  try {
+    const raw = localStorage.getItem('optionsEdge.watchlist');
+    return raw ? JSON.parse(raw) : [];
+  } catch (_) { return []; }
+}
+function saveBrowserWatchlist(list) {
+  try { localStorage.setItem('optionsEdge.watchlist', JSON.stringify(list)); } catch (_) {}
+}
+function renderWatchlistButtons() {
+  const wl = loadBrowserWatchlist();
+  const div = document.getElementById('lookup-watchlist-buttons');
+  if (!wl.length) {
+    div.innerHTML = '<div class="subtitle">Your watchlist is empty. Add tickers below.</div>';
+    return;
+  }
+  div.innerHTML = '<div class="subtitle" style="margin-bottom:4px;">Your watchlist:</div>' +
+    wl.map(s =>
+      `<button class="quick-btn watch" data-sym="${s}">${s}<span class="rm" data-rm="${s}" title="Remove">×</span></button>`
+    ).join('');
+  div.querySelectorAll('.quick-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
+      if (e.target.classList.contains('rm')) {
+        const sym = e.target.dataset.rm;
+        saveBrowserWatchlist(loadBrowserWatchlist().filter(x => x !== sym));
+        renderWatchlistButtons();
+      } else {
+        selectLookup(btn.dataset.sym);
+      }
+    });
+  });
+}
+
+function selectLookup(sym) {
+  _lookupState.sym = sym;
+  document.getElementById('lookup-sym').textContent = sym;
+  document.getElementById('lookup-chart-section').style.display = '';
+  document.getElementById('lookup-news-section').style.display = '';
+
+  const bars = (DATA.ticker_bars || {})[sym] || {};
+  const last = bars.last;
+  document.getElementById('lookup-last').textContent = last != null ? `$${last.toFixed(2)}` : '—';
+
+  // Day change
+  const intra = bars.intraday || [];
+  let change = null, pct = null;
+  if (intra.length) {
+    const lastDay = intra[intra.length - 1].t.slice(0, 10);
+    const todayReg = intra.filter(b => b.t.slice(0, 10) === lastDay && b.s === 'regular');
+    if (todayReg.length >= 2) {
+      change = todayReg[todayReg.length - 1].c - todayReg[0].o;
+      pct = (change / todayReg[0].o) * 100;
+    }
+  }
+  const ce = document.getElementById('lookup-change');
+  if (change != null) {
+    ce.className = `change ${change > 0 ? 'pos' : 'neg'}`;
+    ce.textContent = `${change > 0 ? '+' : ''}${change.toFixed(2)} (${pct > 0 ? '+' : ''}${pct.toFixed(2)}%)`;
+  } else {
+    ce.textContent = '';
+  }
+
+  // Build indicator bar if not built
+  const bar = document.getElementById('lookup-ind-bar');
+  if (!bar.dataset.built) {
+    bar.innerHTML = `
+      <button class="ind-btn" data-ind="vwap">VWAP</button>
+      <button class="ind-btn" data-ind="ma20">MA20</button>
+      <button class="ind-btn" data-ind="ma50">MA50</button>
+      <button class="ind-btn" data-ind="boll">BOLL</button>
+      <button class="ind-btn" data-ind="rsi">RSI</button>
+      <button class="ind-btn ext" data-ind="ext">Pre/After</button>
+    `;
+    bar.dataset.built = '1';
+    bar.querySelectorAll('.ind-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const k = btn.dataset.ind;
+        btn.classList.toggle('active');
+        if (k === 'ext') {
+          _lookupState.showExt = btn.classList.contains('active');
+        } else {
+          if (btn.classList.contains('active')) _lookupState.indicators.add(k);
+          else _lookupState.indicators.delete(k);
+        }
+        renderLookupChart();
+      });
+    });
+    document.querySelectorAll('#lookup-tf-toggles .tf-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#lookup-tf-toggles .tf-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        _lookupState.tf = btn.dataset.tf;
+        renderLookupChart();
+      });
+    });
+  }
+
+  renderLookupChart();
+  renderLookupNews(sym);
+}
+
+function renderLookupChart() {
+  const sym = _lookupState.sym;
+  if (!sym) return;
+  const bars = (DATA.ticker_bars || {})[sym];
+  if (!bars) {
+    document.getElementById('lookup-main-chart-wrap').insertAdjacentHTML('beforeend',
+      `<div class="empty" id="no-data">No Alpaca data for ${sym}. Add it to watchlist.json and rebuild.</div>`);
+    return;
+  }
+  renderTickerChart(sym, 'lookup-chart', _lookupState);
+}
+
+function renderLookupNews(sym) {
+  document.getElementById('lookup-news-sym').textContent = sym;
+  const news = (DATA.ticker_news || {})[sym] || [];
+  document.getElementById('lookup-news-count').textContent = news.length;
+  const wrap = document.getElementById('lookup-news-wrap');
+  if (!news.length) {
+    wrap.innerHTML = `<div class="empty">No recent news for ${sym}. (Only snapshot + watchlist tickers have pre-fetched news.)</div>`;
+    return;
+  }
+  wrap.innerHTML = news.map(a => {
+    let cls = '';
+    if (typeof a.sentiment === 'number') {
+      if (a.sentiment > 0.15) cls = 'pos';
+      else if (a.sentiment < -0.15) cls = 'neg';
+    }
+    const sentBadge = typeof a.sentiment === 'number'
+      ? `<span class="badge ${cls === 'pos' ? 'ok' : cls === 'neg' ? 'err' : 'info'}">${a.sentiment.toFixed(2)}</span>`
+      : '';
+    const time = a.published ? new Date(a.published).toLocaleString() : '';
+    const link = a.link
+      ? `<a href="${a.link}" target="_blank" rel="noopener">${a.title}</a>`
+      : `<span>${a.title}</span>`;
+    const summary = a.summary ? `<div class="summary">${a.summary}</div>` : '';
+    return `<div class="news-item ${cls}">
+      ${link}
+      <div class="meta">${a.source || 'rss'} · ${time} ${sentBadge}</div>
+      ${summary}
+    </div>`;
+  }).join('');
 }
 
 // ── TRADES TAB ──────────────────────────────────────────────────────────────
