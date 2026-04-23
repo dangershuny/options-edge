@@ -370,8 +370,14 @@ def divergence_score_adjustment(divergence: dict | None, vol_signal: str,
     direction = divergence["direction"]
     div_score = float(divergence.get("divergence_score", 0))
     strength = min(div_score / 1.5, 1.0)
+    # Base ceiling: 15. Upgraded to 20 when backed by a recent 8-K filing
+    # (material-event filing → concrete catalyst, not pure chatter).
+    base_ceiling = 20.0 if divergence.get("has_recent_8k") else 15.0
+    # Then scale by freshness — pre-market signals get full weight, stale
+    # signals get downweighted. Combines to ~26 max for a fresh 8-K-backed
+    # divergence and ~9 for a stale chatter-only one.
     freshness = _freshness_multiplier(divergence)
-    max_delta = 15.0 * freshness
+    max_delta = base_ceiling * freshness
     ot = (option_type or "").lower()
 
     # Direction-aware path (preferred)
@@ -523,6 +529,26 @@ def _build_priority_order(tickers: list[str]) -> list[str]:
         return priority + sorted(rest)
     except Exception:
         return [t.upper() for t in tickers if t]
+
+
+def divergence_context(divergence: dict | None) -> dict:
+    """
+    Human-readable context flags from a divergence event, for display in
+    the options-edge UI (expanders, tooltips).
+    """
+    if not divergence or not divergence.get("direction"):
+        return {}
+    return {
+        "direction": divergence.get("direction"),
+        "score": divergence.get("divergence_score"),
+        "article_count": divergence.get("article_count"),
+        "social_count": divergence.get("social_count"),
+        "wsb_attention": divergence.get("wsb_attention"),
+        "wsb_mentions_24h": divergence.get("wsb_mentions_24h"),
+        "has_recent_8k": bool(divergence.get("has_recent_8k")),
+        "recent_8k_titles": divergence.get("recent_8k_titles"),
+        "haiku_summary": divergence.get("haiku_summary"),
+    }
 
 
 def sentinel_status() -> str:
