@@ -22,7 +22,9 @@ from analysis.flow import enrich_flow, classify_flow
 from analysis.skew import calculate_skew
 from analysis.gamma import calculate_gex
 from analysis.earnings_vol import analyze_earnings_edge
-from sentinel_bridge import get_divergence, divergence_score_adjustment
+from sentinel_bridge import (
+    get_divergence, divergence_score_adjustment, sentiment_velocity,
+)
 from risk.sizer import size_trade
 from risk.config import RISK
 
@@ -342,7 +344,17 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
     chain_full = chain_filtered.copy()
 
     news      = get_news(symbol)
-    divergence = get_divergence(symbol)
+    # Use loose+convergence thresholds so we catch both disagreements AND
+    # strong agreements. The scorer downstream handles each strategy type
+    # (BUY VOL / DIRECTIONAL / MOMENTUM / REVERSION) appropriately, and the
+    # divergence_score naturally scales by magnitude so weak signals give
+    # weak deltas — no need for separate calls per tier.
+    divergence = get_divergence(symbol, strategy="directional")
+    # Sentiment velocity: rate-of-change of news sentiment over last 12h.
+    # Positive = accelerating bullish, negative = accelerating bearish.
+    # One fetch per ticker; used for per-contract score tilt.
+    try:    sent_velocity = sentiment_velocity(symbol, window_hours=12)
+    except Exception: sent_velocity = None
 
     # News-drift pre-classification (one pass per ticker, results reused
     # across every contract's per-contract loop below).
@@ -496,7 +508,22 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
         div_delta = divergence_score_adjustment(divergence, vol_signal,
                                                  option_type=opt_type)
         div_scale = 0.5 if drift_delta != 0 else 1.0
-        sentiment_delta = round(drift_delta + div_delta * div_scale, 1)
+
+        # Sentiment velocity — accelerating sentiment in our direction is
+        # worth +5, against us is -3. Caps at |velocity| ≥ 0.4. Independent
+        # of divergence events so it fires on quiet names with quiet drift.
+        velocity_delta = 0.0
+        if sent_velocity is not None and abs(sent_velocity) >= 0.05:
+            v_norm = max(min(sent_velocity / 0.4, 1.0), -1.0)
+            aligned = ((opt_type == "call" and v_norm > 0)
+                       or (opt_type == "put" and v_norm < 0))
+            if aligned:
+                velocity_delta = round(abs(v_norm) * 5.0, 1)
+            else:
+                velocity_delta = round(-abs(v_norm) * 3.0, 1)
+
+        sentiment_delta = round(
+            drift_delta + div_delta * div_scale + velocity_delta, 1)
 
         # ── Per-contract enrichments ─────────────────────────────────────────
         try:

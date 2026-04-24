@@ -116,14 +116,106 @@ def _get(path: str, timeout: float = TIMEOUT) -> dict | None:
         return None
 
 
-def get_divergence(ticker: str, max_age_hours: int = 24) -> dict | None:
+def get_divergence(ticker: str, max_age_hours: int = 24,
+                    strategy: str | None = None) -> dict | None:
     """
     Returns the latest FRESH divergence event for ticker, or None.
 
-    Server filters by flagged_at >= now - max_age_hours so a stale divergence
-    flagged days ago can't keep scoring today's trades. Default 24h.
+    When `strategy` is provided, uses Tier-2 tunable thresholds appropriate
+    for that trading style. Otherwise uses the server's default (options-
+    trading profile, stored-event fast path):
+
+      strategy="cheap_vol" (default for BUY VOL)   — tight thresholds,
+                                                     require strong disagreement.
+      strategy="directional"                        — looser + detect_convergence,
+                                                     catches continuation too.
+      strategy="reversion"                          — wide + detect_convergence,
+                                                     flags overreactions to fade.
+
+    Server filters by flagged_at >= now - max_age_hours. Default 24h.
     """
-    return _get(f"/divergence?ticker={ticker.upper()}&max_age_hours={max_age_hours}")
+    url = f"/divergence?ticker={ticker.upper()}&max_age_hours={max_age_hours}"
+    if strategy == "directional":
+        url += ("&market_bullish=0.2&market_bearish=-0.2"
+                "&news_bullish=0.03&news_bearish=-0.03&detect_convergence=1")
+    elif strategy == "reversion":
+        url += ("&market_bullish=0.15&market_bearish=-0.15"
+                "&news_bullish=0.03&news_bearish=-0.03&detect_convergence=1")
+    return _get(url)
+
+
+def get_sentiment(ticker: str, hours: int = 24,
+                   weights: str | None = None) -> dict | None:
+    """
+    Weighted composite sentiment over the last N hours.
+
+    Returns a dict with components (news_avg, social_avg, haiku) and a
+    composite_score from -1.0 to +1.0. More informative than /divergence
+    alone — we get the raw sentiment even when there's no divergence event.
+
+    weights override format: "news:0.7,social:0.3". Defaults: 0.5/0.3/0.2.
+    """
+    q = f"/sentiment?ticker={ticker.upper()}&hours={hours}"
+    if weights:
+        q += f"&weights={weights}"
+    return _get(q)
+
+
+def get_sentiment_series(ticker: str, days: int = 5,
+                          bucket: str = "hourly") -> dict | None:
+    """
+    Time-bucketed sentiment for trend/velocity analysis.
+
+    bucket: "hourly" or "daily". Spans up to 30 days (archive + live).
+    Used for the sentiment-velocity signal: is news momentum accelerating?
+    """
+    return _get(f"/sentiment/series?ticker={ticker.upper()}&days={days}&bucket={bucket}")
+
+
+def get_catalysts(ticker: str, hours_8k: int = 72) -> dict | None:
+    """
+    Standalone catalyst signals — recent 8-K SEC filings + market context.
+
+    Useful independently of divergence: a fresh 8-K is a catalyst even
+    when sentiment hasn't diverged from analyst ratings yet.
+    """
+    return _get(f"/catalysts?ticker={ticker.upper()}&hours_8k={hours_8k}")
+
+
+def get_attention(ticker: str) -> dict | None:
+    """
+    Retail attention level — primarily WSB mention count.
+
+    Spikes in retail attention can lead/lag real moves depending on regime.
+    """
+    return _get(f"/attention?ticker={ticker.upper()}")
+
+
+def sentiment_velocity(ticker: str, window_hours: int = 12) -> float | None:
+    """
+    Rate-of-change of news sentiment over the last N hours.
+
+    Returns a float: positive = accelerating bullish, negative = accelerating
+    bearish, near-zero = flat. None if insufficient data.
+
+    Computed as: (avg of last half of window) - (avg of first half of window).
+    Magnitude bounded by the underlying sentiment range [-1, +1], so values
+    outside ±0.4 are unusually strong.
+    """
+    days = max(1, (window_hours + 23) // 24)
+    series = get_sentiment_series(ticker, days=days, bucket="hourly")
+    if not series:
+        return None
+    rows = [r for r in (series.get("series") or []) if r.get("news_avg") is not None]
+    if len(rows) < 4:
+        return None
+    rows = rows[-window_hours:] if len(rows) > window_hours else rows
+    mid = len(rows) // 2
+    first = [r["news_avg"] for r in rows[:mid]]
+    second = [r["news_avg"] for r in rows[mid:]]
+    if not first or not second:
+        return None
+    return round((sum(second) / len(second)) - (sum(first) / len(first)), 3)
 
 
 def scan_ticker(ticker: str) -> dict | None:
@@ -219,6 +311,29 @@ def divergence_score_adjustment(divergence: dict | None, vol_signal: str,
                 return round(-strength * max_delta, 1)
             if vol_signal == "SELL VOL":
                 return round(-strength * max_delta, 1)
+        # Convergence (both market + news agree strongly) — weaker signal than
+        # divergence but confirms the direction. Scaled to 0.6× because
+        # consensus is less actionable than contradiction.
+        elif direction == "bullish_convergence":
+            conv_delta = max_delta * 0.6
+            if ot == "call" and vol_signal in ("BUY VOL", "MOMENTUM BUY",
+                                                "DIRECTIONAL BUY"):
+                return round(strength * conv_delta, 1)
+            # For REVERSION BUY of puts (fading an up-move), convergence at
+            # overbought levels actually strengthens the fade case.
+            if ot == "put" and vol_signal == "REVERSION BUY":
+                return round(strength * conv_delta, 1)
+            if ot == "put" and vol_signal == "BUY VOL":
+                return round(-strength * conv_delta, 1)
+        elif direction == "bearish_convergence":
+            conv_delta = max_delta * 0.6
+            if ot == "put" and vol_signal in ("BUY VOL", "MOMENTUM BUY",
+                                               "DIRECTIONAL BUY"):
+                return round(strength * conv_delta, 1)
+            if ot == "call" and vol_signal == "REVERSION BUY":
+                return round(strength * conv_delta, 1)
+            if ot == "call" and vol_signal == "BUY VOL":
+                return round(-strength * conv_delta, 1)
         return 0.0
 
     # Legacy path (option_type unknown) — preserve old behaviour
