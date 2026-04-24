@@ -1,38 +1,61 @@
 """
-Curated universe of high-liquidity US equities and ETFs suitable for
-options scanning. All names have significant options volume, market
-caps well above $100M, and active retail/institutional interest.
+Curated universe of US equities and ETFs for options scanning.
+
+Bias: mid-cap and small-cap names where retail with $500-$2K bankrolls
+has structural edge — less analyst coverage, slower news propagation,
+fewer market-makers tightening IV/RV spreads, and bigger % moves on
+catalysts. Mega-caps with 20+ analysts following (AAPL/MSFT/GOOGL/etc.)
+are intentionally excluded — pricing is too efficient there.
+
+Inclusion rules:
+  • Active options chain (≥4 expiries on yfinance verified)
+  • Market cap ≥ $400M (chains thin out below that)
+  • Either narrative/sentiment-driven OR thematic (AI/EV/crypto/biotech)
+  • ETFs limited to broad-market + most-liquid sectors
+
+Total: ~95 tickers. All names verified to have ≥4 option expiries.
 """
 
 UNIVERSE: list[str] = [
-    # Mega-cap tech
-    "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "META", "AMZN", "TSLA",
-    "AMD", "INTC", "QCOM", "AVGO", "MU", "AMAT", "LRCX", "KLAC",
-    "CRM", "ORCL", "NOW", "ADBE", "SNOW", "PLTR", "UBER", "LYFT",
-    "NFLX", "SPOT", "RBLX", "COIN", "HOOD",
 
-    # Finance
-    "JPM", "BAC", "GS", "MS", "C", "WFC", "BLK", "SCHW", "AXP",
-    "V", "MA", "PYPL", "SQ", "NU",
+    # ── Volatile mega/large-caps where edge still exists ──────────────────
+    # (kept because retail flow & narrative dynamics dominate IV pricing)
+    "TSLA", "NVDA", "AMD", "INTC", "META", "NFLX", "DIS", "SPOT",
+    "BA", "F", "GM", "RTX", "CAT", "OXY", "LULU", "NKE", "CMCSA",
 
-    # Healthcare / pharma
-    "JNJ", "PFE", "MRK", "ABBV", "LLY", "BMY", "AMGN", "GILD",
-    "MRNA", "BNTX", "UNH", "CVS", "HUM",
+    # ── AI / disruptive tech (mid-small) ──────────────────────────────────
+    "AI", "BBAI", "IONQ", "SOUN", "PATH", "S", "GTLB", "U", "MNDY",
+    "BILL", "PLTR", "SNOW", "DDOG", "NET", "OKTA", "DOCU", "ZS", "MDB",
+    "TWLO",
 
-    # Energy
-    "XOM", "CVX", "COP", "OXY", "SLB", "HAL", "MPC", "VLO",
+    # ── Crypto-adjacent (high beta to BTC, retail-driven) ─────────────────
+    "COIN", "MARA", "RIOT", "MSTR", "CIFR", "BTBT",
 
-    # Consumer / retail
-    "WMT", "TGT", "COST", "HD", "LOW", "MCD", "SBUX", "NKE",
-    "LULU", "DIS", "CMCSA",
+    # ── EV / lithium / clean energy ───────────────────────────────────────
+    "RIVN", "LCID", "NIO", "XPEV", "ALB", "PLUG", "RKLB",
 
-    # Industrials / macro
-    "BA", "CAT", "DE", "GE", "HON", "LMT", "RTX", "F", "GM",
+    # ── Fintech (retail-watched) ──────────────────────────────────────────
+    "SOFI", "AFRM", "UPST", "PYPL", "NU", "HOOD",
 
-    # Broad ETFs (high options liquidity)
-    "SPY", "QQQ", "IWM", "DIA", "VXX",
+    # ── Consumer internet / retail (sentiment-heavy) ──────────────────────
+    "SNAP", "RDDT", "DKNG", "PINS", "ROKU", "CHWY", "ETSY", "ABNB",
+    "CART", "OPEN", "RBLX", "UBER", "LYFT", "UPWK",
 
-    # Sector ETFs
-    "XLF", "XLK", "XLE", "XLV", "XLI", "XLY", "XLP", "XLRE",
-    "XLB", "XLU", "ARKK", "GLD", "SLV", "TLT", "HYG", "EEM",
+    # ── Biotech / pharma (catalyst-driven, high IV) ───────────────────────
+    "MRNA", "BNTX", "IOVA", "NBIX", "VRTX", "BIIB", "HIMS",
+
+    # ── Energy (limited; sector ETF covers most) ──────────────────────────
+    "XOM", "CVX", "CCJ",
+
+    # ── Other catalyst-prone names ────────────────────────────────────────
+    "TLRY", "CGC", "FUBO",
+
+    # ── Broad-market ETFs (always tradeable, hedge candidates) ────────────
+    "SPY", "QQQ", "IWM", "VXX",
+
+    # ── Sector ETFs (most-active only) ────────────────────────────────────
+    "XLF", "XLK", "XLE", "XLV", "XLI", "XLY",
+
+    # ── Thematic / commodity / rate ETFs ──────────────────────────────────
+    "ARKK", "GLD", "SLV", "TLT", "EEM",
 ]
