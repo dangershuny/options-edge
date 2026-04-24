@@ -16,12 +16,12 @@ ETFs are also intentionally excluded:
   • Macro/VIX regime is handled separately by data/macro.py
 
 Inclusion rules:
-  • Active options chain (≥4 expiries on yfinance verified)
+  • Active options chain (≥5 expiries on yfinance verified)
   • Market cap ≥ $400M (chains thin out below that)
   • Either narrative/sentiment-driven OR thematic (AI/EV/crypto/biotech)
+  • Live ticker (not renamed/delisted)
 
-Total: ~83 individual equity tickers. All names verified to have ≥4
-option expiries.
+Total: ~120 individual equity tickers.
 """
 
 UNIVERSE: list[str] = [
@@ -31,29 +31,48 @@ UNIVERSE: list[str] = [
     "TSLA", "NVDA", "AMD", "INTC", "META", "NFLX", "DIS", "SPOT",
     "BA", "F", "GM", "RTX", "CAT", "OXY", "LULU", "NKE", "CMCSA",
 
-    # ── AI / disruptive tech (mid-small) ──────────────────────────────────
+    # ── AI / SaaS / disruptive tech (mid + a few large) ───────────────────
     "AI", "BBAI", "IONQ", "SOUN", "PATH", "S", "GTLB", "U", "MNDY",
     "BILL", "PLTR", "SNOW", "DDOG", "NET", "OKTA", "DOCU", "ZS", "MDB",
-    "TWLO",
+    "TWLO", "ESTC", "FROG", "FRSH", "GLBE", "RPD", "TEAM", "ZM",
 
     # ── Crypto-adjacent (high beta to BTC, retail-driven) ─────────────────
     "COIN", "MARA", "RIOT", "MSTR", "CIFR", "BTBT",
+    "HUT", "HIVE", "IREN", "GLXY", "APLD", "CLSK",
 
     # ── EV / lithium / clean energy ───────────────────────────────────────
     "RIVN", "LCID", "NIO", "XPEV", "ALB", "PLUG", "RKLB",
+    "BE", "CHPT", "QS", "ENPH", "FSLR", "RUN", "SEDG",
 
     # ── Fintech (retail-watched) ──────────────────────────────────────────
     "SOFI", "AFRM", "UPST", "PYPL", "NU", "HOOD",
+    "LMND", "ROOT", "COMP",
 
     # ── Consumer internet / retail (sentiment-heavy) ──────────────────────
     "SNAP", "RDDT", "DKNG", "PINS", "ROKU", "CHWY", "ETSY", "ABNB",
     "CART", "OPEN", "RBLX", "UBER", "LYFT", "UPWK",
 
+    # ── Travel / leisure (cyclical, news-driven) ──────────────────────────
+    "CCL", "RCL",
+
+    # ── Media / sentiment-prone ───────────────────────────────────────────
+    "WBD",
+
     # ── Biotech / pharma (catalyst-driven, high IV) ───────────────────────
     "MRNA", "BNTX", "IOVA", "NBIX", "VRTX", "BIIB", "HIMS",
+    "ARWR", "BEAM", "CRSP", "CYTK", "NTLA", "AXSM", "TGTX", "IMRX",
 
-    # ── Energy / commodities (catalyst-prone names only) ──────────────────
-    "XOM", "CVX", "CCJ",
+    # ── Materials / commodities (cyclical, news-driven) ───────────────────
+    "AA", "CLF", "FCX", "MP", "CCJ",
+
+    # ── Energy single-names (sector ETF excluded by design) ───────────────
+    "XOM", "CVX",
+
+    # ── Defense (small/mid, news-driven) ──────────────────────────────────
+    "KTOS", "AVAV",
+
+    # ── Asia tech (Chinese / Asian, less US analyst coverage) ─────────────
+    "PDD", "SE",
 
     # ── Other catalyst-prone names ────────────────────────────────────────
     "TLRY", "CGC", "FUBO",
