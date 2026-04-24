@@ -1,5 +1,5 @@
 """
-Curated universe of US equities and ETFs for options scanning.
+Curated universe of US equities for options scanning.
 
 Bias: mid-cap and small-cap names where retail with $500-$2K bankrolls
 has structural edge — less analyst coverage, slower news propagation,
@@ -7,13 +7,21 @@ fewer market-makers tightening IV/RV spreads, and bigger % moves on
 catalysts. Mega-caps with 20+ analysts following (AAPL/MSFT/GOOGL/etc.)
 are intentionally excluded — pricing is too efficient there.
 
+ETFs are also intentionally excluded:
+  • No idiosyncratic catalysts (8-Ks, insider trades, earnings)
+  • Sentinel divergence/sentiment signals don't apply
+  • Options markets are already hyper-efficient (SPY is the most-traded
+    options contract in the world; spreads are pinned by HFT)
+  • Sector rotation is captured indirectly via individual sector stocks
+  • Macro/VIX regime is handled separately by data/macro.py
+
 Inclusion rules:
   • Active options chain (≥4 expiries on yfinance verified)
   • Market cap ≥ $400M (chains thin out below that)
   • Either narrative/sentiment-driven OR thematic (AI/EV/crypto/biotech)
-  • ETFs limited to broad-market + most-liquid sectors
 
-Total: ~95 tickers. All names verified to have ≥4 option expiries.
+Total: ~83 individual equity tickers. All names verified to have ≥4
+option expiries.
 """
 
 UNIVERSE: list[str] = [
@@ -44,18 +52,9 @@ UNIVERSE: list[str] = [
     # ── Biotech / pharma (catalyst-driven, high IV) ───────────────────────
     "MRNA", "BNTX", "IOVA", "NBIX", "VRTX", "BIIB", "HIMS",
 
-    # ── Energy (limited; sector ETF covers most) ──────────────────────────
+    # ── Energy / commodities (catalyst-prone names only) ──────────────────
     "XOM", "CVX", "CCJ",
 
     # ── Other catalyst-prone names ────────────────────────────────────────
     "TLRY", "CGC", "FUBO",
-
-    # ── Broad-market ETFs (always tradeable, hedge candidates) ────────────
-    "SPY", "QQQ", "IWM", "VXX",
-
-    # ── Sector ETFs (most-active only) ────────────────────────────────────
-    "XLF", "XLK", "XLE", "XLV", "XLI", "XLY",
-
-    # ── Thematic / commodity / rate ETFs ──────────────────────────────────
-    "ARKK", "GLD", "SLV", "TLT", "EEM",
 ]
