@@ -1,79 +1,90 @@
 """
 Curated universe of US equities for options scanning.
 
-Bias: mid-cap and small-cap names where retail with $500-$2K bankrolls
-has structural edge — less analyst coverage, slower news propagation,
-fewer market-makers tightening IV/RV spreads, and bigger % moves on
-catalysts. Mega-caps with 20+ analysts following (AAPL/MSFT/GOOGL/etc.)
-are intentionally excluded — pricing is too efficient there.
+Selection thesis: edge is in names where retail/crowd flow dominates IV
+pricing, not analyst-driven institutional flow. Two paths qualify:
 
-ETFs are also intentionally excluded:
-  • No idiosyncratic catalysts (8-Ks, insider trades, earnings)
+  1. Small/mid-cap (<$10B market cap) — natural edge zone with thinner
+     analyst coverage and slower news propagation.
+
+  2. Large/mega-cap that BEHAVES like a small-cap because of retail/WSB
+     speculation flow — meme stocks (GME, AMC, RDDT), crypto plays
+     (COIN, MSTR, MARA), narrative-driven (PLTR, TSLA, NVDA, RKLB),
+     and pure-speculation tickers (DJT, DKNG). These names are large
+     by market cap but their IV is set by retail crowd dynamics, not
+     by HFT-tightened institutional pricing.
+
+Excluded: large-caps with deep analyst coverage AND no retail crowd
+flow — INTC, ROKU, CHWY, ETSY, MRNA, FSLR, KTOS, etc. Too efficient.
+
+ETFs are intentionally excluded:
+  • No idiosyncratic catalysts (no 8-Ks, insiders, earnings)
   • Sentinel divergence/sentiment signals don't apply
-  • Options markets are already hyper-efficient (SPY is the most-traded
-    options contract in the world; spreads are pinned by HFT)
-  • Sector rotation is captured indirectly via individual sector stocks
+  • Options markets are already hyper-efficient (institutional)
   • Macro/VIX regime is handled separately by data/macro.py
 
 Inclusion rules:
   • Active options chain (≥5 expiries on yfinance verified)
   • Market cap ≥ $400M (chains thin out below that)
-  • Either narrative/sentiment-driven OR thematic (AI/EV/crypto/biotech)
   • Live ticker (not renamed/delisted)
 
-Total: ~120 individual equity tickers.
+Total: ~110 individual equity tickers.
 """
 
 UNIVERSE: list[str] = [
 
-    # ── Volatile mega/large-caps where edge still exists ──────────────────
-    # (kept because retail flow & narrative dynamics dominate IV pricing)
-    "TSLA", "NVDA", "AMD", "INTC", "META", "NFLX", "DIS", "SPOT",
-    "BA", "F", "GM", "RTX", "CAT", "OXY", "LULU", "NKE", "CMCSA",
+    # ── WSB / retail-driven mega+large (kept despite size) ────────────────
+    # These trade on crowd flow, not analyst consensus. IV is set by
+    # retail option-buying, which mis-prices regularly.
+    "TSLA", "NVDA", "AMD", "META",        # mega — narrative-driven
+    "PLTR", "COIN", "MSTR",                # WSB favorites
+    "RDDT", "HOOD", "DKNG",                # retail platforms
+    "RKLB", "LCID", "RIVN", "NIO", "XPEV", # space + EV speculation
+    "SOFI", "AFRM",                        # retail fintech
+    "IONQ",                                # quantum speculation
 
-    # ── AI / SaaS / disruptive tech (mid + a few large) ───────────────────
-    "AI", "BBAI", "IONQ", "SOUN", "PATH", "S", "GTLB", "U", "MNDY",
-    "BILL", "PLTR", "SNOW", "DDOG", "NET", "OKTA", "DOCU", "ZS", "MDB",
-    "TWLO", "ESTC", "FROG", "FRSH", "GLBE", "RPD", "TEAM", "ZM",
+    # ── AI / SaaS / disruptive tech (mid + small) ─────────────────────────
+    "AI", "BBAI", "SOUN", "PATH", "S", "GTLB", "MNDY", "BILL",
+    "ESTC", "FROG", "FRSH", "GLBE", "RPD",
+    "RGTI", "QUBT", "LAES",                # quantum / chip-edge speculation
 
     # ── Crypto-adjacent (high beta to BTC, retail-driven) ─────────────────
-    "COIN", "MARA", "RIOT", "MSTR", "CIFR", "BTBT",
+    "MARA", "RIOT", "CIFR", "BTBT",
     "HUT", "HIVE", "IREN", "GLXY", "APLD", "CLSK",
+    "BTDR", "WULF",
 
-    # ── EV / lithium / clean energy ───────────────────────────────────────
-    "RIVN", "LCID", "NIO", "XPEV", "ALB", "PLUG", "RKLB",
-    "BE", "CHPT", "QS", "ENPH", "FSLR", "RUN", "SEDG",
+    # ── EV / clean energy / nuclear (speculation-heavy) ───────────────────
+    "PLUG", "QS", "RUN", "SEDG",
+    "OKLO", "SMR", "EOSE", "UEC", "DNN",   # nuclear / battery speculation
+    "EVGO", "BLNK", "CHPT",                # EV charging small
 
-    # ── Fintech (retail-watched) ──────────────────────────────────────────
-    "SOFI", "AFRM", "UPST", "PYPL", "NU", "HOOD",
-    "LMND", "ROOT", "COMP",
+    # ── Fintech edge (retail-watched) ─────────────────────────────────────
+    "UPST", "NU", "PYPL", "LMND", "ROOT", "COMP",
+    "DLO",                                 # LatAm fintech
 
-    # ── Consumer internet / retail (sentiment-heavy) ──────────────────────
-    "SNAP", "RDDT", "DKNG", "PINS", "ROKU", "CHWY", "ETSY", "ABNB",
-    "CART", "OPEN", "RBLX", "UBER", "LYFT", "UPWK",
+    # ── Sentiment / meme / speculation small ──────────────────────────────
+    "GME", "AMC", "DJT", "BB",             # legacy WSB / meme
+    "CLOV",                                # micro speculation
 
-    # ── Travel / leisure (cyclical, news-driven) ──────────────────────────
-    "CCL", "RCL",
+    # ── Consumer internet / sentiment-heavy mid ───────────────────────────
+    "OPEN", "RBLX", "UPWK", "SG",          # mid-cap retail-followed
+    "HIMS",                                # recent WSB favorite
 
-    # ── Media / sentiment-prone ───────────────────────────────────────────
-    "WBD",
+    # ── Biotech catalyst small/mid (high IV, news-driven) ─────────────────
+    "IOVA", "BEAM", "CRSP", "NTLA", "TGTX", "IMRX",
+    "AGEN", "OCGN", "ATAI",                # micro biotech volatility
+    "BCRX", "CLDX", "DAWN",                # mid biotech catalyst
 
-    # ── Biotech / pharma (catalyst-driven, high IV) ───────────────────────
-    "MRNA", "BNTX", "IOVA", "NBIX", "VRTX", "BIIB", "HIMS",
-    "ARWR", "BEAM", "CRSP", "CYTK", "NTLA", "AXSM", "TGTX", "IMRX",
+    # ── Materials / commodities (cyclical, retail-followed) ───────────────
+    "CLF", "MP", "TMC",                    # commodity speculation
+    "HCC", "UAMY",                         # specialty mining
 
-    # ── Materials / commodities (cyclical, news-driven) ───────────────────
-    "AA", "CLF", "FCX", "MP", "CCJ",
+    # ── Cannabis (high IV, sentiment-driven) ──────────────────────────────
+    "TLRY", "CGC", "CRON",
 
-    # ── Energy single-names (sector ETF excluded by design) ───────────────
-    "XOM", "CVX",
+    # ── Recent IPO / SPAC volatility ──────────────────────────────────────
+    "LUNR", "CART",                        # space + recent IPO
 
-    # ── Defense (small/mid, news-driven) ──────────────────────────────────
-    "KTOS", "AVAV",
-
-    # ── Asia tech (Chinese / Asian, less US analyst coverage) ─────────────
-    "PDD", "SE",
-
-    # ── Other catalyst-prone names ────────────────────────────────────────
-    "TLRY", "CGC", "FUBO",
+    # ── Other catalyst-prone small ────────────────────────────────────────
+    "FUBO",
 ]
