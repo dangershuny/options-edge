@@ -162,7 +162,8 @@ def step_verify_broker() -> dict:
 
 def step_paper_trade(snapshot_path: Path, bankroll: float, min_score: float,
                      max_trades: int, dry_run: bool, tag: str = "",
-                     max_per_trade: float | None = None) -> dict:
+                     max_per_trade: float | None = None,
+                     signals: str = "BUY VOL,FLOW BUY") -> dict:
     tier_label = tag or f"bankroll-{int(bankroll)}"
     print(f"\n--- Paper trades — tier {tier_label} "
           f"({'DRY RUN' if dry_run else 'LIVE'}) ---")
@@ -173,6 +174,7 @@ def step_paper_trade(snapshot_path: Path, bankroll: float, min_score: float,
         "--min-score", str(min_score),
         "--max-trades", str(max_trades),
         "--tag", tag,
+        "--signals", signals,
     ]
     if max_per_trade is not None:
         cmd.extend(["--max-per-trade", str(max_per_trade)])
@@ -225,20 +227,55 @@ def step_paper_trade_all_tiers(snapshot_path: Path, dry_run: bool,
             dry_run=dry_run,
             tag=tier["tag"],
             max_per_trade=tier.get("max_per_trade"),
+            signals=tier.get("signals", "BUY VOL,FLOW BUY"),
         )
         results.append(r)
     return results
 
 
 def default_tiers(min_score: float, max_trades: int) -> list[dict]:
-    """Three-tier bankroll simulation. Same signals, different risk envelopes."""
+    """
+    Nine-tier bankroll simulation — 3 bankrolls × 3 strategy groups:
+
+    "sim{N}"  : BUY VOL + FLOW BUY (cheap-vol primary path)
+    "sim{N}d" : DIRECTIONAL BUY (post-event continuation, directional stack)
+    "sim{N}x" : MOMENTUM BUY + REVERSION BUY (unorthodox experimental)
+
+    Each strategy group is tagged separately so performance stays isolated
+    in the trade log — we can see which one actually earns its keep.
+    """
+    EXP_MIN_SCORE = max(min_score + 5, 60.0)   # a bit above cheap-vol bar
     return [
+        # Primary cheap-vol path
         {"tag": "sim500",  "bankroll": 500,  "min_score": min_score,
-         "max_trades": max_trades, "max_per_trade": 75},
+         "max_trades": max_trades, "max_per_trade": 75,
+         "signals": "BUY VOL,FLOW BUY"},
         {"tag": "sim1000", "bankroll": 1000, "min_score": min_score,
-         "max_trades": max_trades + 2, "max_per_trade": 150},
+         "max_trades": max_trades + 2, "max_per_trade": 150,
+         "signals": "BUY VOL,FLOW BUY"},
         {"tag": "sim2000", "bankroll": 2000, "min_score": min_score,
-         "max_trades": max_trades + 5, "max_per_trade": 300},
+         "max_trades": max_trades + 5, "max_per_trade": 300,
+         "signals": "BUY VOL,FLOW BUY"},
+        # Directional path — catches post-event continuation (LYFT-style)
+        {"tag": "sim500d",  "bankroll": 500,  "min_score": EXP_MIN_SCORE,
+         "max_trades": 2, "max_per_trade": 75,
+         "signals": "DIRECTIONAL BUY"},
+        {"tag": "sim1000d", "bankroll": 1000, "min_score": EXP_MIN_SCORE,
+         "max_trades": 3, "max_per_trade": 150,
+         "signals": "DIRECTIONAL BUY"},
+        {"tag": "sim2000d", "bankroll": 2000, "min_score": EXP_MIN_SCORE,
+         "max_trades": 5, "max_per_trade": 300,
+         "signals": "DIRECTIONAL BUY"},
+        # Experimental path — momentum-following + contrarian reversion fades
+        {"tag": "sim500x",  "bankroll": 500,  "min_score": EXP_MIN_SCORE,
+         "max_trades": 2, "max_per_trade": 75,
+         "signals": "MOMENTUM BUY,REVERSION BUY"},
+        {"tag": "sim1000x", "bankroll": 1000, "min_score": EXP_MIN_SCORE,
+         "max_trades": 3, "max_per_trade": 150,
+         "signals": "MOMENTUM BUY,REVERSION BUY"},
+        {"tag": "sim2000x", "bankroll": 2000, "min_score": EXP_MIN_SCORE,
+         "max_trades": 5, "max_per_trade": 300,
+         "signals": "MOMENTUM BUY,REVERSION BUY"},
     ]
 
 
@@ -250,7 +287,8 @@ def main() -> int:
                         help="Max trades for smallest tier; larger tiers add +2 and +5")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--single-tier", type=str, default=None,
-                        help="Override: only run one tier (sim500/sim1000/sim2000)")
+                        help="Override: only run one tier "
+                             "(sim500/sim1000/sim2000 or sim500d/sim1000d/sim2000d)")
     args = parser.parse_args()
 
     today = date.today().isoformat()

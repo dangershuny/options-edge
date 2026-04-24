@@ -67,12 +67,21 @@ def _expiry_to_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-def _rank_trades(trades: list[dict], min_score: float) -> list[dict]:
-    """Filter + sort by score descending."""
+DEFAULT_ALLOWED_SIGNALS = ("BUY VOL", "FLOW BUY")
+
+
+def _rank_trades(trades: list[dict], min_score: float,
+                 allowed_signals: tuple[str, ...] = DEFAULT_ALLOWED_SIGNALS) -> list[dict]:
+    """Filter + sort by score descending.
+
+    allowed_signals: which vol_signal values qualify. Defaults to the
+    cheap-vol primary path. For directional-only tiers pass
+    ("DIRECTIONAL BUY",) to isolate that experiment from BUY VOL data.
+    """
     filtered = [
         t for t in trades
         if t.get("score", 0) >= min_score
-        and t.get("vol_signal") in ("BUY VOL", "FLOW BUY")
+        and t.get("vol_signal") in allowed_signals
     ]
     return sorted(filtered, key=lambda x: -x.get("score", 0))
 
@@ -205,6 +214,7 @@ def run(
     dry_run: bool,
     max_per_trade: float | None = None,
     tag: str = "",
+    allowed_signals: tuple[str, ...] = DEFAULT_ALLOWED_SIGNALS,
 ) -> dict:
     # Load broker lazily — if no keys, stop before doing anything
     try:
@@ -234,7 +244,7 @@ def run(
     # Load snapshot
     snap = _load_snapshot(snapshot_path)
     all_trades = snap.get("trades", [])
-    ranked = _rank_trades(all_trades, min_score)[:max_trades]
+    ranked = _rank_trades(all_trades, min_score, allowed_signals)[:max_trades]
 
     if max_per_trade is None:
         max_per_trade = bankroll * 0.15  # 15% of bankroll per trade, default
@@ -251,6 +261,7 @@ def run(
     print(f"Per-trade cap: {_fmt_currency(max_per_trade)}")
     print(f"Min score: {min_score}")
     print(f"Max trades: {max_trades}")
+    print(f"Signals:   {'+'.join(allowed_signals)}")
     print(f"Tag: {tag if tag else '(none)'}")
     print(f"Snapshot: {snapshot_path.name}")
     print(f"Candidates passing filter: {len(ranked)}")
@@ -325,12 +336,18 @@ def main() -> int:
     parser.add_argument("--tag", type=str, default="",
                         help="Tier tag, e.g. 'sim500'. Prefixes Alpaca client_order_id "
                              "so you can identify which bankroll each order was for.")
+    parser.add_argument("--signals", type=str, default="BUY VOL,FLOW BUY",
+                        help="Comma-separated vol_signal values to accept. "
+                             "Default: 'BUY VOL,FLOW BUY'. For directional-only "
+                             "tiers use 'DIRECTIONAL BUY'.")
     args = parser.parse_args()
 
     snapshot_path = Path(args.snapshot) if args.snapshot else _latest_snapshot()
     if not snapshot_path or not snapshot_path.exists():
         print(f"Snapshot not found: {snapshot_path}")
         return 1
+
+    allowed_signals = tuple(s.strip() for s in args.signals.split(",") if s.strip())
 
     result = run(
         snapshot_path=snapshot_path,
@@ -340,6 +357,7 @@ def main() -> int:
         dry_run=not args.live,
         max_per_trade=args.max_per_trade,
         tag=args.tag,
+        allowed_signals=allowed_signals,
     )
 
     if "error" in result:

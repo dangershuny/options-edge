@@ -10,7 +10,7 @@ import pandas as pd
 # ── Signal thresholds ──────────────────────────────────────────────────────────
 # Relaxed from -20%/-25% to surface more tradeable candidates.
 # Score does the ranking; thresholds just gate eligibility.
-BUY_VOL_THRESHOLD  = -0.10   # IV is 10%+ below RV  → cheap options, buy
+BUY_VOL_THRESHOLD  = -0.05   # IV is 5%+ below RV  → cheap options, buy (relaxed from -10%)
 SELL_VOL_THRESHOLD =  0.15   # IV is 15%+ above RV  → expensive options, sell/spread
 
 

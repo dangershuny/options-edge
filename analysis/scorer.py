@@ -62,6 +62,29 @@ TREND_STRETCHED_PCT   = 0.08   # 8% move in 10d = stretched
 FLOW_BUY_MIN_VOL_OI  = 1.5   # vol/OI ≥ 1.5× = very strong unusual activity
 FLOW_BUY_GEX_SIGNALS = {"EXPLOSIVE"}  # GEX regime that amplifies moves
 
+# DIRECTIONAL BUY override: catches post-event continuation plays where
+# cheap-vol entry was already crushed but directional signals stack strongly
+# (e.g. LYFT earnings beat — puts flagged BUY VOL, but calls were the right trade).
+# Tier-level min_score filters (60 at "x" tier) provide final quality bar.
+DIR_BUY_MIN_STACK    = 8.0   # relaxed from 15 — catches more setups
+DIR_BUY_MAX_IV_RANK  = 0.85  # relaxed from 0.70 — include post-earnings names
+
+# MOMENTUM BUY: simple trend-following. Edge not from cheap vol — from directional
+# momentum confirmed by price + volume. Retail's bread-and-butter edge.
+MOMENTUM_MIN_MOVE_PCT = 0.05   # stock must be up/down ≥5% in last 10 days
+MOMENTUM_MAX_IV_RANK  = 0.90   # skip if IV is blown out
+
+# REVERSION BUY (unorthodox): the "day 3-7 reversal" fade. Most pros chase
+# momentum in first 1-3 days after a catalyst. The uncrowded edge is buying
+# against the overreaction once the dust settles. Single-stock moves >7% on
+# clean news tend to partially revert within 5-10 days in 55-60% of cases.
+# Especially true for small/mid-caps with high short interest (short-cover moves
+# that overshoot) and for sentiment-driven moves without fundamental support.
+REVERSION_MIN_MOVE_PCT   = 0.07   # stock moved ≥7% in last 3 days (any direction)
+REVERSION_MAX_IV_RANK    = 0.90   # high IV (typical post-event) fine for us
+REVERSION_MIN_RSI_BUY    = 75     # stock up-trending into overbought → buy PUT (fade)
+REVERSION_MAX_RSI_BUY    = 25     # stock down-trending into oversold → buy CALL (bounce)
+
 
 def _midpoint(bid: float, ask: float) -> float:
     if bid > 0 and ask > 0:
@@ -218,7 +241,9 @@ def score_contract(
 
     # 2. Trend exhaustion: buying puts on a stock already down sharply (or
     #    calls on one already up sharply) is chasing a move that's priced in.
-    if trend_pct is not None and vol_signal in ("BUY VOL", "FLOW BUY"):
+    # Note: MOMENTUM BUY intentionally exempt — it WANTS the trend.
+    #       REVERSION BUY intentionally exempt — it trades AGAINST the trend.
+    if trend_pct is not None and vol_signal in ("BUY VOL", "FLOW BUY", "DIRECTIONAL BUY"):
         _te = _w("contra.trend_exhaust", -12.0)
         if opt_type == "put" and trend_pct < -TREND_STRETCHED_PCT:
             score += _te  # stock already down >8% in 10d — late on puts
@@ -279,6 +304,26 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
     trend_pct = None
     if len(prices) >= TREND_WINDOW_DAYS + 1:
         trend_pct = float(prices.iloc[-1] / prices.iloc[-(TREND_WINDOW_DAYS + 1)] - 1)
+
+    # 3-day move — used for REVERSION BUY (overreaction fade)
+    trend_3d = None
+    if len(prices) >= 4:
+        trend_3d = float(prices.iloc[-1] / prices.iloc[-4] - 1)
+
+    # RSI(14) on underlying — used for momentum/reversion signals
+    rsi14 = None
+    if len(prices) >= 15:
+        try:
+            delta = prices.diff().iloc[-14:]
+            gain = delta.where(delta > 0, 0).mean()
+            loss = -delta.where(delta < 0, 0).mean()
+            if loss == 0:
+                rsi14 = 100.0
+            else:
+                rs = gain / loss
+                rsi14 = float(100.0 - (100.0 / (1.0 + rs)))
+        except Exception:
+            rsi14 = None
 
     # Mode-based underlying-price filter — small accounts skip mega-cap names
     # whose OTM contracts cost too much even at the 8% cap. See
@@ -529,11 +574,115 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
                         + catalyst_delta + pin_delta
                         + vol_deltas["volume_delta_total"] + trend_delta
                         + delta_delta + macro_delta + conf_delta)
+
+        # ── DIRECTIONAL BUY upgrade ──────────────────────────────────────────
+        # If IV isn't cheap (NEUTRAL or SELL VOL) but directional signals stack
+        # up strongly AND IV rank isn't blown out, upgrade to DIRECTIONAL BUY.
+        # This catches post-event continuation plays (e.g. LYFT earnings beat)
+        # where cheap-vol entry was already crushed but direction is clear.
+        #
+        # Uses a directional-only subset of extras_delta — volume, news drift,
+        # insider, catalyst, trend, confluence — which are all opt_type-aware
+        # and sum positive for "this direction is right".
+        directional_stack = (
+            insider_delta + short_delta + blocks_delta
+            + catalyst_delta + drift_delta + trend_delta + conf_delta
+            + vol_deltas.get("dir_bias_delta", 0.0)
+            + vol_deltas.get("vwap_delta", 0.0)
+        )
+        iv_rank_val = (ivr or {}).get("iv_rank")
+        if (vol_signal in ("NEUTRAL", "SELL VOL")
+                and directional_stack >= DIR_BUY_MIN_STACK
+                and (iv_rank_val is None or iv_rank_val < DIR_BUY_MAX_IV_RANK)):
+            # Upgrade — rebuild as a long-premium buy like BUY VOL
+            vol_signal = "DIRECTIONAL BUY"
+            trade = _buy_trade_detail(row)
+            action = f"BUY {opt_type.upper()} (DIR)"
+            entry_px_for_score = float(trade.get("entry_price") or 0)
+            # Re-apply premium caps (skip if too expensive for bankroll)
+            if entry_px_for_score > MAX_PREMIUM_HIGH_BAR:
+                continue
+            if (mode_premium_cap is not None
+                    and entry_px_for_score > mode_premium_cap):
+                continue
+            base_score = score_contract(
+                iv, rv_dte, vol_oi, dte,
+                vol_signal=vol_signal, skew=skew, gex=gex, ivr=ivr,
+                opt_type=opt_type, entry_price=entry_px_for_score,
+                trend_pct=trend_pct,
+            )
+
+        # ── MOMENTUM BUY upgrade ─────────────────────────────────────────────
+        # Simple trend-following. Retail's bread-and-butter edge: stock moving
+        # strongly in a direction, RSI not extreme, aligned options.
+        elif (vol_signal in ("NEUTRAL", "SELL VOL")
+                and trend_pct is not None
+                and abs(trend_pct) >= MOMENTUM_MIN_MOVE_PCT
+                and (iv_rank_val is None or iv_rank_val < MOMENTUM_MAX_IV_RANK)
+                and rsi14 is not None and 30 < rsi14 < 75):
+            aligned = ((opt_type == "call" and trend_pct > 0) or
+                       (opt_type == "put"  and trend_pct < 0))
+            if aligned:
+                vol_signal = "MOMENTUM BUY"
+                trade = _buy_trade_detail(row)
+                action = f"BUY {opt_type.upper()} (MOM)"
+                entry_px_for_score = float(trade.get("entry_price") or 0)
+                if entry_px_for_score > MAX_PREMIUM_HIGH_BAR:
+                    continue
+                if (mode_premium_cap is not None
+                        and entry_px_for_score > mode_premium_cap):
+                    continue
+                base_score = score_contract(
+                    iv, rv_dte, vol_oi, dte,
+                    vol_signal=vol_signal, skew=skew, gex=gex, ivr=ivr,
+                    opt_type=opt_type, entry_price=entry_px_for_score,
+                    trend_pct=trend_pct,
+                )
+
+        # ── REVERSION BUY upgrade (UNORTHODOX) ──────────────────────────────
+        # The "day 3-7 reversal" edge. Most pros chase momentum in the first
+        # 1-3 days after a catalyst. The uncrowded trade is buying against
+        # the overreaction once dust settles. Requires:
+        #  • Stock moved ≥7% in last 3 days
+        #  • RSI crossed overbought (>75) for up-moves → BUY PUT (fade)
+        #    or oversold (<25) for down-moves → BUY CALL (bounce)
+        #  • Contrarian direction (buy opposite of the move)
+        elif (vol_signal in ("NEUTRAL", "SELL VOL")
+                and trend_3d is not None
+                and abs(trend_3d) >= REVERSION_MIN_MOVE_PCT
+                and rsi14 is not None
+                and (iv_rank_val is None or iv_rank_val < REVERSION_MAX_IV_RANK)):
+            # Contrarian setup: stock up + overbought → fade with PUT,
+            # stock down + oversold → fade with CALL
+            reversion_fire = False
+            if trend_3d > 0 and rsi14 >= REVERSION_MIN_RSI_BUY and opt_type == "put":
+                reversion_fire = True
+            elif trend_3d < 0 and rsi14 <= REVERSION_MAX_RSI_BUY and opt_type == "call":
+                reversion_fire = True
+
+            if reversion_fire:
+                vol_signal = "REVERSION BUY"
+                trade = _buy_trade_detail(row)
+                action = f"BUY {opt_type.upper()} (REV)"
+                entry_px_for_score = float(trade.get("entry_price") or 0)
+                if entry_px_for_score > MAX_PREMIUM_HIGH_BAR:
+                    continue
+                if (mode_premium_cap is not None
+                        and entry_px_for_score > mode_premium_cap):
+                    continue
+                base_score = score_contract(
+                    iv, rv_dte, vol_oi, dte,
+                    vol_signal=vol_signal, skew=skew, gex=gex, ivr=ivr,
+                    opt_type=opt_type, entry_price=entry_px_for_score,
+                    trend_pct=trend_pct,
+                )
+
         final_score = round(min(max(
             base_score + sentiment_delta + extras_delta, 0), 100), 1)
 
         # Secondary soft filter: keep >$15 contracts only if score is strong
-        if (vol_signal in ("BUY VOL", "FLOW BUY")
+        if (vol_signal in ("BUY VOL", "FLOW BUY", "DIRECTIONAL BUY",
+                            "MOMENTUM BUY", "REVERSION BUY")
                 and entry_px_for_score > MAX_PREMIUM_HARD
                 and final_score < 80):
             continue
