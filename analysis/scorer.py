@@ -22,6 +22,7 @@ from analysis.flow import enrich_flow, classify_flow
 from analysis.skew import calculate_skew
 from analysis.gamma import calculate_gex
 from analysis.earnings_vol import analyze_earnings_edge
+from analysis.momentum import rsi_info, rsi_score_delta
 from sentinel_bridge import (
     get_divergence, divergence_score_adjustment, sentiment_velocity,
     get_sentiment, get_catalysts as get_sentinel_catalysts,
@@ -315,20 +316,13 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
     if len(prices) >= 4:
         trend_3d = float(prices.iloc[-1] / prices.iloc[-4] - 1)
 
-    # RSI(14) on underlying — used for momentum/reversion signals
-    rsi14 = None
-    if len(prices) >= 15:
-        try:
-            delta = prices.diff().iloc[-14:]
-            gain = delta.where(delta > 0, 0).mean()
-            loss = -delta.where(delta < 0, 0).mean()
-            if loss == 0:
-                rsi14 = 100.0
-            else:
-                rs = gain / loss
-                rsi14 = float(100.0 - (100.0 / (1.0 + rs)))
-        except Exception:
-            rsi14 = None
+    # 14-period Wilder RSI — used in two places:
+    #   1. As a gating condition for MOMENTUM BUY (must be 30 < rsi < 75)
+    #      and REVERSION BUY (must be ≤25 or ≥75 with right direction).
+    #   2. As a per-contract score delta via rsi_score_delta() — ±5 at
+    #      extremes only. See analysis/momentum.py docstring.
+    rsi = rsi_info(prices)
+    rsi14 = (rsi or {}).get("rsi_14")
 
     # Mode-based underlying-price filter — small accounts skip mega-cap names
     # whose OTM contracts cost too much even at the 8% cap. See
@@ -577,6 +571,8 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
         except Exception: catalyst_delta = 0.0
         try:    pin_delta     = pin_risk_score_delta(pin_info)
         except Exception: pin_delta = 0.0
+        try:    rsi_delta     = rsi_score_delta(rsi, vol_signal, opt_type)
+        except Exception: rsi_delta = 0.0
 
         # ── Volume-family deltas + trend confirmation ────────────────────
         try:
@@ -640,11 +636,17 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
         except Exception:
             sector_delta, sector_info = 0.0, None
 
+        # RSI score delta — ±5 at 25/75 extremes only, 0 elsewhere
+        try:
+            rsi_delta = rsi_score_delta(rsi, vol_signal, opt_type)
+        except Exception:
+            rsi_delta = 0.0
+
         extras_delta = (insider_delta + short_delta + blocks_delta
                         + catalyst_delta + pin_delta
                         + vol_deltas["volume_delta_total"] + trend_delta
                         + delta_delta + macro_delta + conf_delta
-                        + sector_delta)
+                        + sector_delta + rsi_delta)
 
         # ── DIRECTIONAL BUY upgrade ──────────────────────────────────────────
         # If IV isn't cheap (NEUTRAL or SELL VOL) but directional signals stack
@@ -873,6 +875,9 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             "sector":        (sector_info or {}).get("sector"),
             "sector_regime": (sector_info or {}).get("regime"),
             "sector_leader_5d_pct": (sector_info or {}).get("leader_return_5d"),
+            "rsi_delta":     rsi_delta,
+            "rsi_14":        (rsi or {}).get("rsi_14"),
+            "rsi_zone":      (rsi or {}).get("rsi_zone"),
             "delta":         delta_val,
             "confluence_label": (conf.label if conf else None),
             "confluence_agree":  (conf.agree if conf else None),
