@@ -648,6 +648,35 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             + vol_deltas.get("vwap_delta", 0.0)
         )
         iv_rank_val = (ivr or {}).get("iv_rank")
+
+        # ── Secondary "experimental" tags ────────────────────────────────────
+        # Independent of the BUY VOL / NEUTRAL primary signal — these flag
+        # whether a contract ALSO qualifies for the directional, momentum, or
+        # reversion experimental tiers. Lets cheap-vol contracts that ALSO
+        # have strong directional backing show up in the d/x experiment
+        # tracks instead of disappearing because the primary signal absorbed
+        # them.
+        is_directional_setup = (
+            directional_stack >= DIR_BUY_MIN_STACK
+            and (iv_rank_val is None or iv_rank_val < DIR_BUY_MAX_IV_RANK)
+        )
+        is_momentum_setup = (
+            trend_pct is not None
+            and abs(trend_pct) >= MOMENTUM_MIN_MOVE_PCT
+            and (iv_rank_val is None or iv_rank_val < MOMENTUM_MAX_IV_RANK)
+            and rsi14 is not None and 30 < rsi14 < 75
+            and ((opt_type == "call" and trend_pct > 0)
+                 or (opt_type == "put"  and trend_pct < 0))
+        )
+        is_reversion_setup = False
+        if (trend_3d is not None
+                and abs(trend_3d) >= REVERSION_MIN_MOVE_PCT
+                and rsi14 is not None
+                and (iv_rank_val is None or iv_rank_val < REVERSION_MAX_IV_RANK)):
+            if trend_3d > 0 and rsi14 >= REVERSION_MIN_RSI_BUY and opt_type == "put":
+                is_reversion_setup = True
+            elif trend_3d < 0 and rsi14 <= REVERSION_MAX_RSI_BUY and opt_type == "call":
+                is_reversion_setup = True
         if (vol_signal in ("NEUTRAL", "SELL VOL")
                 and directional_stack >= DIR_BUY_MIN_STACK
                 and (iv_rank_val is None or iv_rank_val < DIR_BUY_MAX_IV_RANK)):
@@ -768,6 +797,16 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             "rv_pct":        round(rv_dte * 100, 1),
             "iv_rv_spread":  round(iv_rv_spread * 100, 1),
             "vol_signal":    vol_signal,
+            # Secondary tags so d/x tiers can pick up qualifying BUY VOL
+            # contracts that the primary signal absorbed. Tiers can filter on
+            # these regardless of vol_signal value.
+            "is_directional_setup": bool(is_directional_setup),
+            "is_momentum_setup":    bool(is_momentum_setup),
+            "is_reversion_setup":   bool(is_reversion_setup),
+            "directional_stack":    round(float(directional_stack), 1),
+            "trend_pct":            round(float(trend_pct), 4) if trend_pct is not None else None,
+            "trend_3d":             round(float(trend_3d), 4) if trend_3d is not None else None,
+            "rsi14":                round(float(rsi14), 1) if rsi14 is not None else None,
             "action":        action,
             "volume":        int(row["volume"]),
             "open_interest": int(row["openInterest"]),

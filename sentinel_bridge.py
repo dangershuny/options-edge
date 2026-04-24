@@ -429,7 +429,7 @@ def divergence_score_adjustment(divergence: dict | None, vol_signal: str,
     return 0.0
 
 
-def prewarm_universe(tickers: list[str], timeout_total: float = 300.0,
+def prewarm_universe(tickers: list[str], timeout_total: float = 5400.0,
                       per_ticker_timeout: float = SCAN_TIMEOUT) -> dict:
     """
     Bulk-scan the universe at scan start. If the sentinel's pre-market cron
@@ -447,11 +447,16 @@ def prewarm_universe(tickers: list[str], timeout_total: float = 300.0,
                 "elapsed_sec": 0.0, "tickers_with_divergence": [],
                 "sentinel": "offline"}
 
+    # Prioritize: tickers from yesterday's snapshot, then watchlist, then rest.
+    # If a partial timeout hits, we'd rather have data on ones we'll likely
+    # trade than scan alphabetically.
+    priority_tickers = _build_priority_order(tickers)
+
     import time
     t0 = time.time()
     hits = []
     scanned = errors = 0
-    for sym in tickers:
+    for sym in priority_tickers:
         if time.time() - t0 > timeout_total:
             break
         try:
@@ -474,6 +479,50 @@ def prewarm_universe(tickers: list[str], timeout_total: float = 300.0,
         "tickers_with_divergence": hits,
         "sentinel": "connected",
     }
+
+
+def _build_priority_order(tickers: list[str]) -> list[str]:
+    """
+    Reorder the prewarm queue so high-relevance tickers go first:
+      1. Tickers in yesterday's snapshot (recent signal candidates)
+      2. Tickers in user watchlist.json
+      3. Everyone else (alphabetical)
+    Falls back to original order on any error.
+    """
+    try:
+        import json
+        from pathlib import Path
+        from datetime import date, timedelta
+        repo = Path(__file__).resolve().parent
+        priority_set: set[str] = set()
+        # Yesterday's snapshot
+        for back in range(0, 4):
+            d = (date.today() - timedelta(days=back)).isoformat()
+            for f in (repo / "snapshots").glob(f"{d}*.json"):
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                    for t in data.get("trades", []) or []:
+                        sym = (t.get("symbol") or "").upper()
+                        if sym:
+                            priority_set.add(sym)
+                except Exception:
+                    pass
+        # Watchlist
+        try:
+            wl = json.loads((repo / "watchlist.json").read_text(encoding="utf-8"))
+            if isinstance(wl, list):
+                for t in wl:
+                    if t:
+                        priority_set.add(str(t).upper())
+        except Exception:
+            pass
+
+        upper = [t.upper() for t in tickers if t]
+        priority = [t for t in upper if t in priority_set]
+        rest     = [t for t in upper if t not in priority_set]
+        return priority + sorted(rest)
+    except Exception:
+        return [t.upper() for t in tickers if t]
 
 
 def sentinel_status() -> str:

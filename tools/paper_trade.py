@@ -70,18 +70,42 @@ def _expiry_to_date(s: str) -> date:
 DEFAULT_ALLOWED_SIGNALS = ("BUY VOL", "FLOW BUY")
 
 
+def _trade_qualifies(t: dict, allowed_signals: tuple[str, ...]) -> bool:
+    """
+    A trade qualifies for a tier if EITHER:
+      • its primary vol_signal is in allowed_signals, OR
+      • its secondary "experimental" tag matches a virtual signal in
+        allowed_signals (DIRECTIONAL BUY, MOMENTUM BUY, REVERSION BUY).
+
+    This lets BUY-VOL-flagged contracts that ALSO have strong directional
+    or momentum setup show up in the d/x experimental tiers — the primary
+    cheap-vol signal no longer "absorbs" them invisibly.
+    """
+    sig = t.get("vol_signal")
+    if sig in allowed_signals:
+        return True
+    if "DIRECTIONAL BUY" in allowed_signals and t.get("is_directional_setup"):
+        return True
+    if "MOMENTUM BUY" in allowed_signals and t.get("is_momentum_setup"):
+        return True
+    if "REVERSION BUY" in allowed_signals and t.get("is_reversion_setup"):
+        return True
+    return False
+
+
 def _rank_trades(trades: list[dict], min_score: float,
                  allowed_signals: tuple[str, ...] = DEFAULT_ALLOWED_SIGNALS) -> list[dict]:
     """Filter + sort by score descending.
 
     allowed_signals: which vol_signal values qualify. Defaults to the
     cheap-vol primary path. For directional-only tiers pass
-    ("DIRECTIONAL BUY",) to isolate that experiment from BUY VOL data.
+    ("DIRECTIONAL BUY",) — also matches BUY VOL contracts with the
+    is_directional_setup flag.
     """
     filtered = [
         t for t in trades
         if t.get("score", 0) >= min_score
-        and t.get("vol_signal") in allowed_signals
+        and _trade_qualifies(t, allowed_signals)
     ]
     return sorted(filtered, key=lambda x: -x.get("score", 0))
 
@@ -244,7 +268,53 @@ def run(
     # Load snapshot
     snap = _load_snapshot(snapshot_path)
     all_trades = snap.get("trades", [])
-    ranked = _rank_trades(all_trades, min_score, allowed_signals)[:max_trades]
+    ranked = _rank_trades(all_trades, min_score, allowed_signals)
+
+    # Per-ticker concentration cap — counted across ALL tiers run today.
+    # Without this, all 9 tiers can pick the same dominant ticker (today
+    # was 9 NKE call orders across 3 strikes = full session in one name).
+    from datetime import date as _date
+    try:
+        from risk.config import RISK
+        max_per_ticker = int(RISK.get("max_positions_per_ticker", 2) or 2)
+    except Exception:
+        max_per_ticker = 2
+
+    today_iso = _date.today().isoformat()
+    ticker_count_today: dict[str, int] = {}
+    if OUTPUT_PATH.exists():
+        try:
+            with open(OUTPUT_PATH) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if (rec.get("status") == "submitted"
+                            and rec.get("timestamp", "").startswith(today_iso)):
+                        sym = (rec.get("symbol") or "").upper()
+                        if sym:
+                            ticker_count_today[sym] = ticker_count_today.get(sym, 0) + 1
+        except Exception:
+            pass
+
+    # Filter ranked candidates by concentration cap (track in-session adds too)
+    filtered_ranked = []
+    in_session_count = dict(ticker_count_today)
+    for t in ranked:
+        sym = (t.get("symbol") or "").upper()
+        if not sym:
+            continue
+        if in_session_count.get(sym, 0) >= max_per_ticker:
+            continue
+        filtered_ranked.append(t)
+        in_session_count[sym] = in_session_count.get(sym, 0) + 1
+        if len(filtered_ranked) >= max_trades:
+            break
+    ranked = filtered_ranked
 
     if max_per_trade is None:
         max_per_trade = bankroll * 0.15  # 15% of bankroll per trade, default
@@ -263,8 +333,11 @@ def run(
     print(f"Max trades: {max_trades}")
     print(f"Signals:   {'+'.join(allowed_signals)}")
     print(f"Tag: {tag if tag else '(none)'}")
+    print(f"Per-ticker cap: {max_per_ticker} (across all tiers today)")
+    if ticker_count_today:
+        print(f"Already taken today: {dict(ticker_count_today)}")
     print(f"Snapshot: {snapshot_path.name}")
-    print(f"Candidates passing filter: {len(ranked)}")
+    print(f"Candidates passing all filters: {len(ranked)}")
     print()
 
     if not ranked:
