@@ -124,7 +124,8 @@ with st.sidebar:
     st.caption("⚡ STRONG flow — Vol/OI ≥ 1×")
     st.caption("⚠️ BEAR DIV — Market bullish, news/social bearish")
     st.caption("📈 BULL DIV — Market bearish, news/social bullish")
-    st.caption("Score adjusts ±15 pts on divergence alignment")
+    st.caption("Score adjusts ±15 pts on divergence alignment (±20 with 8-K)")
+    st.caption("📊 RSI 14 — ±5 pts at extremes (≤25 oversold / ≥75 overbought)")
     st.caption("⚠️ Earnings-adjacent expiries excluded automatically")
     st.divider()
     st.caption(f"📡 News tool: **{news_tool_status()}**")
@@ -295,7 +296,7 @@ with tab_watchlist:
     col2.metric("Contracts", len(combined))
     col3.metric("Buy Signals", int(combined["vol_signal"].isin(["BUY VOL", "FLOW BUY"]).sum()))
     col4.metric("Strong Flow", int((combined["flow_signal"] == "STRONG").sum()))
-    st.caption("Score = vol mismatch (50) + flow (35) + DTE bonus (10) + IV rank (8) + skew (7) + GEX (±5) ± sentiment (±15). OTM ≤15%. BUY VOL = IV 10%+ below RV. FLOW BUY = unusual activity + explosive GEX.")
+    st.caption("Score = vol mismatch (50) + flow (35) + DTE bonus (10) + IV rank (8) + skew (7) + GEX (±5) ± sentiment (±15/±20) ± RSI extremes (±5). OTM ≤15%. BUY VOL = IV 10%+ below RV. FLOW BUY = unusual activity + explosive GEX.")
 
     st.divider()
 
@@ -348,6 +349,16 @@ with tab_watchlist:
                     st.success(f"{div_flag} — aligns ↑ {sent_dlt:+.0f} pts", icon=None)
                 else:
                     st.warning(f"{div_flag} — contradicts ↓ {sent_dlt:+.0f} pts", icon=None)
+            # RSI entry-timing note — only surface when RSI actually moved the score
+            rsi_dlt = row.get("rsi_delta", 0.0) or 0.0
+            rsi_zn  = row.get("rsi_zone")
+            rsi_vl  = row.get("rsi_14")
+            if rsi_dlt and rsi_zn in ("oversold", "overbought"):
+                rsi_msg = f"RSI {rsi_vl:.1f} ({rsi_zn})"
+                if rsi_dlt > 0:
+                    st.success(f"📊 {rsi_msg} — favors entry {rsi_dlt:+.0f} pts", icon=None)
+                else:
+                    st.warning(f"📊 {rsi_msg} — fights entry {rsi_dlt:+.0f} pts", icon=None)
 
     for symbol in combined["symbol"].unique():
         tkr    = combined[combined["symbol"] == symbol]
@@ -374,8 +385,10 @@ with tab_watchlist:
         gex_summ    = first.get("gex_summary", "—")
         gamma_wall  = first.get("gamma_wall")
         gamma_flip  = first.get("gamma_flip")
+        rsi_val     = first.get("rsi_14")
+        rsi_zn      = first.get("rsi_zone") or "unknown"
 
-        sc1, sc2, sc3 = st.columns(3)
+        sc1, sc2, sc3, sc4 = st.columns(4)
         with sc1:
             ivr_icon = "🔴" if "HIGH" in ivr_label else ("🟢" if "LOW" in ivr_label else "⚪")
             st.caption(f"**IV Rank:** {ivr_icon} {ivr_label}")
@@ -390,6 +403,10 @@ with tab_watchlist:
             if gamma_flip:
                 gex_detail += f"  ·  flip ${gamma_flip:.0f}"
             st.caption(f"**GEX:** {gx_icon} {gex_detail}")
+        with sc4:
+            rsi_icon = "🟢" if rsi_zn == "oversold" else ("🔴" if rsi_zn == "overbought" else "⚪")
+            rsi_txt  = f"{rsi_val:.1f} — {rsi_zn}" if rsi_val is not None else "N/A"
+            st.caption(f"**RSI 14:** {rsi_icon} {rsi_txt}")
 
         # ── Earnings edge banner ──────────────────────────────────────────────
         ee = all_earnings_edge.get(symbol)
