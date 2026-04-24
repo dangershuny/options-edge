@@ -24,6 +24,8 @@ from analysis.gamma import calculate_gex
 from analysis.earnings_vol import analyze_earnings_edge
 from sentinel_bridge import (
     get_divergence, divergence_score_adjustment, sentiment_velocity,
+    get_sentiment, get_catalysts as get_sentinel_catalysts,
+    composite_sentiment_delta, fresh_8k_delta,
 )
 from risk.sizer import size_trade
 from risk.config import RISK
@@ -352,9 +354,17 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
     divergence = get_divergence(symbol, strategy="directional")
     # Sentiment velocity: rate-of-change of news sentiment over last 12h.
     # Positive = accelerating bullish, negative = accelerating bearish.
-    # One fetch per ticker; used for per-contract score tilt.
     try:    sent_velocity = sentiment_velocity(symbol, window_hours=12)
     except Exception: sent_velocity = None
+    # Sentinel composite sentiment (news+social+haiku weighted). Used as a
+    # gentle tilt for contracts with NO divergence event (prevents double-
+    # counting when div_delta is already firing).
+    try:    sent_composite = get_sentiment(symbol, hours=24)
+    except Exception: sent_composite = None
+    # Sentinel fresh 8-K catalyst feed. Independent of our scheduled-event
+    # catalyst pipeline — captures "something just happened" filings.
+    try:    sentinel_cats = get_sentinel_catalysts(symbol, hours_8k=72)
+    except Exception: sentinel_cats = None
 
     # News-drift pre-classification (one pass per ticker, results reused
     # across every contract's per-contract loop below).
@@ -522,8 +532,28 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             else:
                 velocity_delta = round(-abs(v_norm) * 3.0, 1)
 
+        # Composite sentiment — gentle tilt (±4 max) when no divergence event
+        # is firing. Suppresses itself when div_delta is already active to
+        # avoid double-counting the same underlying sentiment data.
+        try:
+            composite_delta = composite_sentiment_delta(
+                sent_composite, vol_signal, opt_type,
+                has_divergence=bool(divergence and divergence.get("direction")),
+            )
+        except Exception:
+            composite_delta = 0.0
+
+        # Fresh 8-K delta — unplanned corporate events (filed within 72h).
+        # Independent of our scheduled-event catalyst pipeline.
+        try:
+            sentinel_catalyst_delta = fresh_8k_delta(
+                sentinel_cats, vol_signal, opt_type)
+        except Exception:
+            sentinel_catalyst_delta = 0.0
+
         sentiment_delta = round(
-            drift_delta + div_delta * div_scale + velocity_delta, 1)
+            drift_delta + div_delta * div_scale + velocity_delta
+            + composite_delta + sentinel_catalyst_delta, 1)
 
         # ── Per-contract enrichments ─────────────────────────────────────────
         try:
@@ -746,6 +776,13 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             "score":         final_score,
             "sentiment_delta": sentiment_delta,
             "news_drift_delta": drift_delta,
+            "sentiment_velocity": sent_velocity,
+            "sentiment_velocity_delta": velocity_delta,
+            "sentiment_composite": (sent_composite or {}).get("composite_score"),
+            "sentiment_composite_delta": composite_delta,
+            "sentinel_catalyst_delta": sentinel_catalyst_delta,
+            "has_recent_8k": bool((sentinel_cats or {}).get("has_recent_8k")),
+            "recent_8k_count": (sentinel_cats or {}).get("recent_8k_count", 0),
             "news_event":    (news_event_summary.get("category") if news_event_summary else None),
             "news_event_headline": (news_event_summary.get("title") if news_event_summary else None),
             "news_event_residual_pct": (

@@ -191,6 +191,85 @@ def get_attention(ticker: str) -> dict | None:
     return _get(f"/attention?ticker={ticker.upper()}")
 
 
+def composite_sentiment_delta(sentiment: dict | None, vol_signal: str,
+                               opt_type: str | None,
+                               has_divergence: bool) -> float:
+    """
+    Small sentiment tilt for contracts with no divergence event.
+
+    When a divergence is present, div_delta already captures the sentiment
+    signal (± up to ~20 points). When absent, this helper provides a gentle
+    tilt (±4 max) from the raw composite score — so even quiet names with
+    mildly bullish or bearish sentiment nudge the score.
+
+    Suppresses itself when has_divergence=True (prevents double-counting).
+    Requires ≥8 news articles in the window for statistical weight.
+    """
+    if has_divergence or not sentiment:
+        return 0.0
+    composite = sentiment.get("composite_score")
+    sample = sentiment.get("sample_sizes", {}) or {}
+    if composite is None:
+        return 0.0
+    if (sample.get("news") or 0) < 8:
+        return 0.0
+
+    ot = (opt_type or "").lower()
+    if ot not in ("call", "put"):
+        return 0.0
+
+    # Normalize composite (-1..+1) to a sign + magnitude, cap at ±4
+    direction_score = float(composite)
+    if abs(direction_score) < 0.10:   # too close to zero — no signal
+        return 0.0
+
+    # Aligned: bullish composite + call, or bearish composite + put
+    aligned = ((direction_score > 0 and ot == "call") or
+               (direction_score < 0 and ot == "put"))
+    magnitude = min(abs(direction_score) * 8.0, 4.0)  # cap at ±4
+    # For BUY VOL / BUY-path signals only — SELL VOL spreads have different logic
+    if vol_signal in ("BUY VOL", "FLOW BUY", "DIRECTIONAL BUY",
+                       "MOMENTUM BUY"):
+        return round(magnitude if aligned else -magnitude, 1)
+    if vol_signal == "REVERSION BUY":
+        # REVERSION trades AGAINST momentum — flip the alignment logic
+        return round(magnitude if not aligned else -magnitude, 1)
+    return 0.0
+
+
+def fresh_8k_delta(catalysts: dict | None, vol_signal: str,
+                    opt_type: str | None) -> float:
+    """
+    Score delta for recent 8-K filings (unplanned catalysts).
+
+    8-Ks represent material corporate events — acquisitions, management
+    changes, guidance revisions, etc. Distinct from scheduled earnings:
+    the existing `catalyst_score_delta` handles earnings proximity; this
+    handles "something just happened that markets may not have absorbed."
+
+    Returns:
+      +6 on any long-option BUY path (call or put) when a fresh 8-K hits —
+         the event creates vol expansion opportunity regardless of direction.
+      0 when no fresh 8-K.
+
+    The scorer's other directional signals (insider, drift, convergence)
+    determine whether the 8-K is bullish or bearish. We just upweight the
+    whole setup because the catalyst is real and recent.
+    """
+    if not catalysts:
+        return 0.0
+    if not catalysts.get("has_recent_8k"):
+        return 0.0
+    count = int(catalysts.get("recent_8k_count") or 0)
+    if count < 1:
+        return 0.0
+    if vol_signal not in ("BUY VOL", "FLOW BUY", "DIRECTIONAL BUY",
+                           "MOMENTUM BUY", "REVERSION BUY"):
+        return 0.0
+    # Multiple 8-Ks in 72h = cluster of news → bigger bump, capped at +9
+    return float(min(count * 3, 9))
+
+
 def sentiment_velocity(ticker: str, window_hours: int = 12) -> float | None:
     """
     Rate-of-change of news sentiment over the last N hours.
