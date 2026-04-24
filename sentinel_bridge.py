@@ -134,14 +134,50 @@ def scan_ticker(ticker: str) -> dict | None:
     return _get(f"/scan?ticker={ticker.upper()}", timeout=SCAN_TIMEOUT)
 
 
+def _freshness_multiplier(divergence: dict | None) -> float:
+    """
+    Fresh signals get higher weight. Pre-market divergences (flagged < 3h ago)
+    are most valuable — they captured overnight news the market hasn't fully
+    priced yet. As events age, their informational edge decays.
+
+    < 3h  (pre-market / first 90m of session) : 1.30x — full freshness bonus
+    < 6h  (late morning same day)              : 1.10x
+    < 12h (same trading day)                   : 1.00x — baseline
+    < 24h (yesterday's signal)                 : 0.80x — mostly priced in
+    ≥ 24h                                      : 0.60x — stale
+    """
+    if not divergence:
+        return 1.0
+    ts = divergence.get("flagged_at")
+    if not ts:
+        return 1.0
+    try:
+        from datetime import datetime, timezone
+        # flagged_at stored as ISO UTC
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+    except Exception:
+        return 1.0
+    if age_hours < 3:   return 1.30
+    if age_hours < 6:   return 1.10
+    if age_hours < 12:  return 1.00
+    if age_hours < 24:  return 0.80
+    return 0.60
+
+
 def divergence_score_adjustment(divergence: dict | None, vol_signal: str,
                                  option_type: str | None = None) -> float:
     """
-    Returns score delta (-15 to +15) based on sentiment/vol/direction alignment.
+    Returns score delta (-20 to +20) based on sentiment/vol/direction alignment.
 
     Direction matters: bearish news on a PUT is aligned (boost), bearish news
-    on a CALL is contradicted (penalty). Previously we only considered
-    vol_signal which stamped puts and calls with identical deltas.
+    on a CALL is contradicted (penalty).
+
+    Freshness matters: divergences flagged during pre-market have the highest
+    weight (1.3x), decaying to 0.6x by 24h. This makes pre-market sentinel
+    signals more impactful — they caught news before the market priced it in.
 
     bullish_divergence (news bullish, stock under-reacted):
         BUY VOL CALL   → aligned: cheap call + bullish thesis     → +boost
@@ -163,7 +199,8 @@ def divergence_score_adjustment(divergence: dict | None, vol_signal: str,
     direction = divergence["direction"]
     div_score = float(divergence.get("divergence_score", 0))
     strength = min(div_score / 1.5, 1.0)
-    max_delta = 15.0
+    freshness = _freshness_multiplier(divergence)
+    max_delta = 15.0 * freshness
     ot = (option_type or "").lower()
 
     # Direction-aware path (preferred)
@@ -196,6 +233,53 @@ def divergence_score_adjustment(divergence: dict | None, vol_signal: str,
         elif vol_signal == "SELL VOL":
             return round(-strength * max_delta, 1)
     return 0.0
+
+
+def prewarm_universe(tickers: list[str], timeout_total: float = 300.0,
+                      per_ticker_timeout: float = SCAN_TIMEOUT) -> dict:
+    """
+    Bulk-scan the universe at scan start. If the sentinel's pre-market cron
+    has already scanned these tickers today, /scan is ~instant (cached). If
+    not, this populates divergence events BEFORE analyze_ticker reads them,
+    avoiding per-ticker blocking on expensive sentinel calls during the main
+    scan.
+
+    Returns {"scanned": N, "skipped": N, "errors": N, "elapsed_sec": float,
+             "tickers_with_divergence": [list]}.
+    Safe on offline sentinel — returns zeros.
+    """
+    if not ensure_sentinel_running():
+        return {"scanned": 0, "skipped": len(tickers), "errors": 0,
+                "elapsed_sec": 0.0, "tickers_with_divergence": [],
+                "sentinel": "offline"}
+
+    import time
+    t0 = time.time()
+    hits = []
+    scanned = errors = 0
+    for sym in tickers:
+        if time.time() - t0 > timeout_total:
+            break
+        try:
+            result = _get(f"/scan?ticker={sym.upper()}", timeout=per_ticker_timeout)
+            if result is None:
+                errors += 1
+                continue
+            scanned += 1
+            # If scan produced a divergence event, note it
+            if result.get("direction") or (result.get("divergence") or {}).get("direction"):
+                hits.append(sym.upper())
+        except Exception:
+            errors += 1
+
+    return {
+        "scanned": scanned,
+        "skipped": max(0, len(tickers) - scanned - errors),
+        "errors": errors,
+        "elapsed_sec": round(time.time() - t0, 1),
+        "tickers_with_divergence": hits,
+        "sentinel": "connected",
+    }
 
 
 def sentinel_status() -> str:

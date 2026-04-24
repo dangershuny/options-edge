@@ -104,6 +104,48 @@ def _latest_snapshot() -> Path | None:
     return candidates[0][1]
 
 
+def step_sentinel_prewarm(universe: list[str] | None = None) -> dict:
+    """
+    Bulk-scan the universe through news_sentinel BEFORE the snapshot runs.
+    If sentinel's pre-market cron already processed these tickers, /scan is
+    cached and instant. Otherwise this pre-populates divergence events so
+    the main scan reads them without blocking per-ticker.
+    """
+    print("\n=== STEP 0: News sentinel prewarm ===")
+    try:
+        import sentinel_bridge as sb
+    except Exception as e:
+        print(f"[SKIP] sentinel_bridge import failed: {e}")
+        return {"ok": False, "error": str(e)[:120]}
+
+    if universe is None:
+        # Default: read the curated universe used by the snapshot tool
+        try:
+            from data.universe import UNIVERSE as _UNIV
+            universe = list(_UNIV)
+        except Exception:
+            universe = []
+
+    if not universe:
+        print("[SKIP] no universe resolved")
+        return {"ok": False, "error": "empty universe"}
+
+    print(f"Scanning {len(universe)} tickers via /scan (cached pre-market "
+          f"hits will return instantly)...")
+    result = sb.prewarm_universe(universe)
+    result["ok"] = result.get("sentinel") == "connected"
+    print(f"[{'OK' if result['ok'] else 'WARN'}] "
+          f"scanned={result['scanned']} "
+          f"errors={result.get('errors', 0)} "
+          f"elapsed={result.get('elapsed_sec', 0)}s "
+          f"divergences={len(result.get('tickers_with_divergence', []))}")
+    hits = result.get("tickers_with_divergence") or []
+    if hits:
+        print(f"  Fresh divergence signals: {', '.join(hits[:12])}"
+              f"{' ...' if len(hits) > 12 else ''}")
+    return result
+
+
 def step_fresh_snapshot() -> dict:
     print("\n=== STEP 1: Fresh snapshot (market open) ===")
     suffix = f"auto-{datetime.now().strftime('%H%M')}"
@@ -320,6 +362,11 @@ def main() -> int:
     }
 
     try:
+        # Step 0: sentinel prewarm (populate fresh pre-market divergences
+        # before the main scan reads them). Safe to skip on failure.
+        s0 = step_sentinel_prewarm()
+        summary["sentinel_prewarm"] = s0
+
         # Step 1: snapshot
         s1 = step_fresh_snapshot()
         summary["snapshot"] = s1
