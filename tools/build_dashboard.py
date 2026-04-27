@@ -788,6 +788,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="tab active" data-tab="overview">Overview</div>
   <div class="tab" data-tab="analysis">Analysis</div>
   <div class="tab" data-tab="lookup">Ticker Lookup</div>
+  <div class="tab" data-tab="override">Manual Buy</div>
   <div class="tab" data-tab="trades">Trades</div>
 </div>
 
@@ -895,6 +896,59 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   </section>
 </div>
 
+<!-- MANUAL OVERRIDE BUY -->
+<div class="tab-content" id="tab-override">
+  <section>
+    <div class="section-title"><span class="dot"></span> Manual override buy</div>
+    <div class="subtitle" style="margin-bottom: 14px;">
+      Saw a setup the scheduled scanner missed? Drop a ticker here and the
+      system will analyze it, pick the most-poised contract, and submit a
+      paper order tagged <code>override-*</code>. Concentration cap (max
+      2/ticker/day) still applies.
+    </div>
+
+    <div id="override-status-banner" class="empty" style="margin-bottom:12px;">
+      Checking server status...
+    </div>
+
+    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:14px;">
+      <input id="override-ticker" type="text" placeholder="Ticker (e.g. GME)"
+             autocomplete="off" maxlength="10"
+             style="background:var(--bg-elev); color:var(--fg); border:1px solid var(--border);
+                    padding:10px 14px; border-radius:6px; font-size:14px; width:140px;
+                    text-transform: uppercase; font-weight: 600;">
+
+      <select id="override-side"
+              style="background:var(--bg-elev); color:var(--fg); border:1px solid var(--border);
+                     padding:10px 8px; border-radius:6px; font-size:13px;">
+        <option value="">Auto (best of call/put)</option>
+        <option value="call">Force CALL</option>
+        <option value="put">Force PUT</option>
+      </select>
+
+      <input id="override-maxcost" type="number" placeholder="Max $/contract" min="10" max="2000"
+             style="background:var(--bg-elev); color:var(--fg); border:1px solid var(--border);
+                    padding:10px 12px; border-radius:6px; font-size:13px; width:140px;">
+
+      <input id="override-tag" type="text" placeholder="Tag (e.g. mine)" maxlength="10"
+             style="background:var(--bg-elev); color:var(--fg); border:1px solid var(--border);
+                    padding:10px 12px; border-radius:6px; font-size:13px; width:130px;">
+
+      <label style="display:flex; gap:6px; align-items:center; font-size:13px; cursor:pointer;">
+        <input type="checkbox" id="override-live" style="cursor:pointer;">
+        <span class="warn-txt">Live submit</span>
+      </label>
+
+      <button class="btn primary" id="override-submit">Analyze + Buy</button>
+    </div>
+
+    <div id="override-result" style="margin-bottom:18px;"></div>
+
+    <div class="section-title"><span class="dot"></span> Recent override attempts</div>
+    <div id="override-recent" class="empty">Loading recent results…</div>
+  </section>
+</div>
+
 <!-- TRADES -->
 <div class="tab-content" id="tab-trades">
   <section>
@@ -956,6 +1010,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (tab.dataset.tab === 'analysis') initAnalysis();
     if (tab.dataset.tab === 'trades') initTrades();
     if (tab.dataset.tab === 'lookup') initLookup();
+    if (tab.dataset.tab === 'override') initOverride();
   });
 });
 
@@ -1703,6 +1758,176 @@ function initTrades() {
   });
   h += '</tbody></table>';
   wrap.innerHTML = h;
+}
+
+// ── MANUAL OVERRIDE BUY ─────────────────────────────────────────────────────
+const OVERRIDE_BASE = 'http://127.0.0.1:8503';
+let _overrideReady = false;
+
+function initOverride() {
+  if (!_overrideReady) {
+    _overrideReady = true;
+    document.getElementById('override-submit').addEventListener('click', submitOverride);
+    document.getElementById('override-ticker').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitOverride();
+    });
+    document.getElementById('override-ticker').addEventListener('input', (e) => {
+      e.target.value = (e.target.value || '').toUpperCase();
+    });
+  }
+  pingOverrideServer();
+  loadRecentOverrides();
+}
+
+async function pingOverrideServer() {
+  const banner = document.getElementById('override-status-banner');
+  try {
+    const r = await fetch(`${OVERRIDE_BASE}/health`, { method: 'GET',
+                                                       cache: 'no-store' });
+    if (r.ok) {
+      const d = await r.json();
+      banner.innerHTML = `<span class="badge ok">ONLINE</span> Override server reachable on port ${d.port}.`;
+      banner.className = '';
+    } else {
+      banner.innerHTML = `<span class="badge err">DOWN</span> Server returned ${r.status}.`;
+      banner.className = '';
+    }
+  } catch (err) {
+    banner.innerHTML = `<span class="badge err">OFFLINE</span> Override server not reachable. Start it: <code>tools\\override_server.bat</code> or via Task Scheduler (OptionsEdge-OverrideServer).`;
+    banner.className = '';
+  }
+}
+
+function _safe(v) {
+  if (v === null || v === undefined) return '—';
+  return String(v);
+}
+
+async function loadRecentOverrides() {
+  const wrap = document.getElementById('override-recent');
+  try {
+    const r = await fetch(`${OVERRIDE_BASE}/recent?limit=10`, {
+        method: 'GET', cache: 'no-store' });
+    if (!r.ok) {
+      wrap.innerHTML = `<div class="empty">Server returned ${r.status}.</div>`;
+      return;
+    }
+    const data = await r.json();
+    const results = data.results || [];
+    if (!results.length) {
+      wrap.innerHTML = `<div class="empty">No override attempts yet.</div>`;
+      return;
+    }
+    let h = '<div class="table-wrap"><table><thead><tr>'
+      + '<th>Time</th><th>Ticker</th><th>Status</th><th>Contract</th>'
+      + '<th>Cost</th><th>Score</th><th>Reason</th></tr></thead><tbody>';
+    for (const r of results) {
+      const c = r.contract || {};
+      const status = r.status || '?';
+      const cls = status === 'submitted' ? 'ok'
+                 : status === 'dry_run' ? 'info'
+                 : status === 'skipped' ? 'warn' : 'err';
+      const ts = (r.timestamp || '').slice(11, 19);
+      const contractDesc = c.symbol
+        ? `${c.symbol} ${(c.type || '').toUpperCase()} $${c.strike} ${c.expiry}`
+        : '—';
+      h += `<tr>
+        <td class="mono">${ts}</td>
+        <td><strong>${_safe(r.ticker)}</strong></td>
+        <td><span class="badge ${cls}">${status}</span></td>
+        <td class="mono">${contractDesc}</td>
+        <td>${r.total_cost ? '$' + Number(r.total_cost).toFixed(2) : '—'}</td>
+        <td>${c.score ? Number(c.score).toFixed(1) : '—'}</td>
+        <td class="small">${_safe(r.reason || r.note || '').slice(0, 80)}</td>
+      </tr>`;
+    }
+    h += '</tbody></table></div>';
+    wrap.innerHTML = h;
+  } catch (err) {
+    wrap.innerHTML = `<div class="empty">Could not reach server: ${err}</div>`;
+  }
+}
+
+async function submitOverride() {
+  const tickerEl = document.getElementById('override-ticker');
+  const sideEl   = document.getElementById('override-side');
+  const maxEl    = document.getElementById('override-maxcost');
+  const tagEl    = document.getElementById('override-tag');
+  const liveEl   = document.getElementById('override-live');
+  const result   = document.getElementById('override-result');
+  const submitBtn = document.getElementById('override-submit');
+
+  const ticker = (tickerEl.value || '').trim().toUpperCase();
+  if (!ticker) {
+    result.innerHTML = '<div class="alert-card warn">Enter a ticker first.</div>';
+    return;
+  }
+  const body = {
+    ticker: ticker,
+    side: sideEl.value || null,
+    tag: tagEl.value || 'manual',
+    live: !!liveEl.checked,
+    max_cost: maxEl.value ? Number(maxEl.value) : null,
+    min_score: 40.0,
+  };
+
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Analyzing…';
+  result.innerHTML = `<div class="alert-card info">Running analyze_ticker(${ticker}). This takes 30-90s on first run.</div>`;
+
+  try {
+    const r = await fetch(`${OVERRIDE_BASE}/override`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    renderOverrideResult(data);
+    loadRecentOverrides();
+  } catch (err) {
+    result.innerHTML = `<div class="alert-card err">Server call failed: ${err}</div>`;
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Analyze + Buy';
+  }
+}
+
+function renderOverrideResult(d) {
+  const result = document.getElementById('override-result');
+  const status = d.status || '?';
+  const cls = status === 'submitted' ? 'ok'
+             : status === 'dry_run' ? 'info'
+             : status === 'skipped' ? 'warn' : 'err';
+  const c = d.contract || {};
+
+  let html = `<div class="card" style="border-left:3px solid var(--${cls === 'ok' ? 'ok' : cls === 'info' ? 'info' : cls === 'warn' ? 'warn' : 'err'});">
+    <div style="display:flex; justify-content:space-between; align-items:baseline;">
+      <div><strong>${d.ticker}</strong> &nbsp; <span class="badge ${cls}">${status}</span></div>
+      <div class="small">${(d.timestamp || '').slice(11, 19)}</div>
+    </div>`;
+
+  if (d.reason || d.note) {
+    html += `<div style="margin-top:8px; font-size:13px;">${d.reason || d.note}</div>`;
+  }
+  if (c.symbol) {
+    html += `<div style="margin-top:10px; font-size:13px;">
+      <strong>${c.symbol} ${(c.type || '').toUpperCase()} $${c.strike} exp ${c.expiry}</strong>
+      <span class="small mono">(${c.dte}d, ${c.vol_signal}, score ${c.score?.toFixed(1)})</span>
+    </div>`;
+  }
+  if (d.total_cost) {
+    html += `<div style="margin-top:6px; font-size:13px;">
+      Cost: <strong>$${Number(d.total_cost).toFixed(2)}</strong>
+      &nbsp; Limit: $${Number(d.limit_price).toFixed(2)}
+      &nbsp; Mid: $${Number(d.mid).toFixed(2)}
+      &nbsp; Bid/Ask: $${Number(d.bid).toFixed(2)} / $${Number(d.ask).toFixed(2)}
+    </div>`;
+  }
+  if (d.client_order_id) {
+    html += `<div class="small mono" style="margin-top:6px;">COID: ${d.client_order_id}</div>`;
+  }
+  html += '</div>';
+  result.innerHTML = html;
 }
 
 renderOverview();
