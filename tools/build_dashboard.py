@@ -1608,13 +1608,51 @@ function renderWatchlistButtons() {
   });
 }
 
-function selectLookup(sym) {
+// API base — set to a string like "http://127.0.0.1:8503" to enable on-demand
+// bar fetch for tickers outside the prefetched universe. Empty/null → static-only.
+const _API_BASE = "http://127.0.0.1:8503";
+const _api_bar_cache = {};   // sym -> bars dict (in-session memo)
+
+async function _fetchBarsViaAPI(sym) {
+  if (_api_bar_cache[sym]) return _api_bar_cache[sym];
+  if (!_API_BASE) return null;
+  try {
+    const r = await fetch(`${_API_BASE}/api/bars?sym=${encodeURIComponent(sym)}`,
+                          { method: 'GET', signal: AbortSignal.timeout(20000) });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (j && j.bars) {
+      _api_bar_cache[sym] = j.bars;
+      // Mirror into DATA.ticker_bars so existing render code finds it
+      DATA.ticker_bars = DATA.ticker_bars || {};
+      DATA.ticker_bars[sym] = j.bars;
+      return j.bars;
+    }
+  } catch (e) {
+    console.warn(`API bar fetch failed for ${sym}:`, e);
+  }
+  return null;
+}
+
+async function selectLookup(sym) {
   _lookupState.sym = sym;
   document.getElementById('lookup-sym').textContent = sym;
   document.getElementById('lookup-chart-section').style.display = '';
   document.getElementById('lookup-news-section').style.display = '';
 
-  const bars = (DATA.ticker_bars || {})[sym] || {};
+  // Existing chart-card may have a stale "no-data" notice from a prior failed
+  // lookup — remove it so chart is visible if this one succeeds.
+  const oldNoData = document.getElementById('no-data');
+  if (oldNoData) oldNoData.remove();
+
+  let bars = (DATA.ticker_bars || {})[sym];
+  if (!bars || (!bars.intraday?.length && !bars.daily?.length)) {
+    // Show "loading" state and fetch from local API
+    document.getElementById('lookup-last').textContent = '…';
+    document.getElementById('lookup-change').textContent = '';
+    bars = await _fetchBarsViaAPI(sym);
+  }
+  bars = bars || (DATA.ticker_bars || {})[sym] || {};
   const last = bars.last;
   document.getElementById('lookup-last').textContent = last != null ? `$${last.toFixed(2)}` : '—';
 
