@@ -415,9 +415,19 @@ def main() -> int:
                              "tiers use 'DIRECTIONAL BUY'.")
     args = parser.parse_args()
 
-    snapshot_path = Path(args.snapshot) if args.snapshot else _latest_snapshot()
-    if not snapshot_path or not snapshot_path.exists():
-        print(f"Snapshot not found: {snapshot_path}")
+    # Resolve and STRICTLY validate. str(Path("")) == "." is the classic
+    # Windows trap — Path(".").exists() is True (it's the cwd), but opening
+    # it crashes with PermissionError. Require a real file.
+    raw = (args.snapshot or "").strip()
+    if raw and raw not in (".", "./", "/", "\\"):
+        snapshot_path = Path(raw)
+    else:
+        snapshot_path = _latest_snapshot()
+    if (snapshot_path is None
+            or not snapshot_path.exists()
+            or not snapshot_path.is_file()):
+        print(f"Snapshot not found or not a file: {snapshot_path}",
+              file=sys.stderr)
         return 1
 
     allowed_signals = tuple(s.strip() for s in args.signals.split(",") if s.strip())

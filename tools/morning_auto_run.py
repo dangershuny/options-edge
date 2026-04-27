@@ -151,7 +151,7 @@ def step_fresh_snapshot() -> dict:
     suffix = f"auto-{datetime.now().strftime('%H%M')}"
     code, out, err = _run_subprocess(
         [_python_exe(), "-m", "tools.snapshot", "--suffix", suffix],
-        timeout=600,
+        timeout=1800,   # 30 min — accommodates 124-ticker universe with sentinel calls
     )
     if code != 0:
         print(f"[FAIL] snapshot returned {code}")
@@ -370,7 +370,27 @@ def main() -> int:
         # Step 1: snapshot
         s1 = step_fresh_snapshot()
         summary["snapshot"] = s1
-        snap_path = Path(s1.get("snapshot_path") or "")
+
+        # Resolve snapshot path. Critical: do NOT fall through to Path("")
+        # because str(Path("")) is "." which paper_trade would later try to
+        # open as a file → PermissionError on Windows. If the snapshot step
+        # didn't produce a valid file, fall back to today's most-recent
+        # snapshot (or skip entirely if none exists).
+        snap_path: Path | None = None
+        raw_path = s1.get("snapshot_path") if s1.get("ok") else None
+        if raw_path:
+            candidate = Path(raw_path)
+            if candidate.is_file():
+                snap_path = candidate
+        if snap_path is None:
+            # Fallback: most recent file in snapshots/ from today
+            fb = _latest_snapshot()
+            if fb and fb.is_file():
+                today_iso = date.today().isoformat()
+                if fb.name.startswith(today_iso):
+                    snap_path = fb
+                    print(f"[FALLBACK] step_fresh_snapshot failed; "
+                          f"using most-recent today snapshot: {fb.name}")
 
         # Step 2: flow + news (don't block on failure)
         s2 = step_flow_news()
@@ -382,14 +402,18 @@ def main() -> int:
 
         # Step 4: paper trade — one pass per tier
         if s3.get("ok") or args.dry_run:
-            if snap_path.exists():
+            if snap_path is not None and snap_path.is_file():
                 tier_results = step_paper_trade_all_tiers(
                     snap_path, args.dry_run, tiers,
                 )
                 summary["paper_trades_by_tier"] = tier_results
             else:
-                summary["paper_trades_by_tier"] = [{"ok": False, "error": "no snapshot"}]
-                print("\n[SKIP] No snapshot available for paper trading.")
+                summary["paper_trades_by_tier"] = [{
+                    "ok": False,
+                    "error": (f"no usable snapshot — step_fresh_snapshot "
+                              f"failed: {s1.get('error', 'unknown')[:120]}"),
+                }]
+                print("\n[SKIP] No usable snapshot for paper trading.")
         else:
             summary["paper_trades_by_tier"] = [{"ok": False, "error": "broker not ready"}]
             print(f"\n[SKIP] Skipping all tiers because broker check failed.")
