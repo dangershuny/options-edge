@@ -780,6 +780,10 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         <option value="300">5m</option>
       </select>
     </label>
+    <a class="btn" id="sentinel-link"
+       href="file:///C:/Users/dange/OneDrive/Documents/Claude%20Projects/news_sentinel/dashboard.html"
+       target="_blank" rel="noopener" title="Opens the news_sentinel dashboard in a new tab"
+       style="text-decoration: none;">📰 Sentinel</a>
     <button class="btn" onclick="location.reload()">Refresh now</button>
   </div>
 </header>
