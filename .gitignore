@@ -11,3 +11,4 @@ engine_state.db
 *.db-journal
 benchmarks/
 dashboard.html
+logs/
