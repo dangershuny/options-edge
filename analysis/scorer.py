@@ -44,6 +44,7 @@ from analysis.confluence import evaluate_confluence
 from analysis.delta_edge import contract_delta, delta_score_delta
 from data.macro import get_vix_context, macro_score_delta
 from analysis.weights import w as _w
+from analysis.sector_regime import sector_dampener_delta
 
 
 # ── Filters ────────────────────────────────────────────────────────────────────
@@ -627,10 +628,23 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             conf = None
             conf_delta = 0.0
 
+        # ── Sector regime dampener ──────────────────────────────────────────
+        # If a ticker belongs to a correlated sector (crypto miners, EVs)
+        # and the leader (BTC, TSLA) is trending against this trade's
+        # direction, dampen the score. Today (2026-04-27): MARA/APLD/GLXY
+        # all flagged BUY VOL CALL while BTC dropped 4-5% — three correlated
+        # bullish bets in a bearish sector regime.
+        try:
+            sector_delta, sector_info = sector_dampener_delta(
+                symbol, opt_type, vol_signal)
+        except Exception:
+            sector_delta, sector_info = 0.0, None
+
         extras_delta = (insider_delta + short_delta + blocks_delta
                         + catalyst_delta + pin_delta
                         + vol_deltas["volume_delta_total"] + trend_delta
-                        + delta_delta + macro_delta + conf_delta)
+                        + delta_delta + macro_delta + conf_delta
+                        + sector_delta)
 
         # ── DIRECTIONAL BUY upgrade ──────────────────────────────────────────
         # If IV isn't cheap (NEUTRAL or SELL VOL) but directional signals stack
@@ -656,6 +670,9 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
         # have strong directional backing show up in the d/x experiment
         # tracks instead of disappearing because the primary signal absorbed
         # them.
+        # Note: prelim_score isn't computed yet at this point in the loop —
+        # is_directional_setup uses the standard threshold. The high-score
+        # override only kicks in for the actual upgrade decision below.
         is_directional_setup = (
             directional_stack >= DIR_BUY_MIN_STACK
             and (iv_rank_val is None or iv_rank_val < DIR_BUY_MAX_IV_RANK)
@@ -677,8 +694,18 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
                 is_reversion_setup = True
             elif trend_3d < 0 and rsi14 <= REVERSION_MAX_RSI_BUY and opt_type == "call":
                 is_reversion_setup = True
+        # High-score override: when raw preliminary score is already ≥ 85,
+        # lower the directional-stack bar from 8 → 5. Catches setups like
+        # NVDA (2026-04-27): SELL VOL CALL at score 90.4 with directional
+        # stack +6 (below 8 threshold) — strong base + alignment hint that
+        # we're missing because the stack was just shy. The IV rank check
+        # is preserved so we don't open the floodgates.
+        prelim_score = base_score + sentiment_delta + extras_delta
+        eff_stack_threshold = (5.0 if prelim_score >= 85.0
+                                else DIR_BUY_MIN_STACK)
+
         if (vol_signal in ("NEUTRAL", "SELL VOL")
-                and directional_stack >= DIR_BUY_MIN_STACK
+                and directional_stack >= eff_stack_threshold
                 and (iv_rank_val is None or iv_rank_val < DIR_BUY_MAX_IV_RANK)):
             # Upgrade — rebuild as a long-premium buy like BUY VOL
             vol_signal = "DIRECTIONAL BUY"
@@ -842,6 +869,10 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
             "delta_delta":   delta_delta,
             "macro_delta":   macro_delta,
             "confluence_delta": conf_delta,
+            "sector_delta":  sector_delta,
+            "sector":        (sector_info or {}).get("sector"),
+            "sector_regime": (sector_info or {}).get("regime"),
+            "sector_leader_5d_pct": (sector_info or {}).get("leader_return_5d"),
             "delta":         delta_val,
             "confluence_label": (conf.label if conf else None),
             "confluence_agree":  (conf.agree if conf else None),
