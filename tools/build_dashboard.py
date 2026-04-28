@@ -1803,7 +1803,7 @@ function initTrades() {
 }
 
 // ── MANUAL OVERRIDE BUY ─────────────────────────────────────────────────────
-const OVERRIDE_BASE = 'http://127.0.0.1:8503';
+const OVERRIDE_BASE = 'http://127.0.0.1:8504';
 let _overrideReady = false;
 
 function initOverride() {

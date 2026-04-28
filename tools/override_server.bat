@@ -1,5 +1,5 @@
 @echo off
-REM Launch the override HTTP server (port 8503) for dashboard "manual buy"
+REM Launch the override HTTP server (port 8504) for dashboard "manual buy"
 REM button. Designed to run continuously alongside the existing scheduled
 REM tasks. Safe to start/stop at any time — does not modify any other
 REM process or shared file beyond its own logs/override_results dir.
@@ -8,5 +8,12 @@ setlocal
 set PYTHONIOENCODING=utf-8
 cd /d "C:\Users\dange\Personal_Projects\options-edge-new"
 
-python -m tools.override_server
+REM Skip if already running on 8504 — prevents port conflict on restart
+netstat -an -p tcp | findstr ":8504" | findstr LISTENING >nul
+if not errorlevel 1 (
+    echo Already running on port 8504.
+    exit /b 0
+)
+
+pythonw -m tools.override_server
 exit /b %ERRORLEVEL%

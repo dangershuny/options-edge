@@ -1,7 +1,8 @@
 """
 Lightweight HTTP server for the dashboard's manual-override buy button.
 
-Listens on localhost:8503 (separate from news_sentinel:8502 to avoid
+Listens on localhost:8504 (separate from news_sentinel:8502 and the
+ticker-lookup dashboard_server:8503 to avoid
 any conflict). Designed to be safe alongside the existing scheduled
 tasks — single-threaded, no shared state mutation.
 
@@ -47,7 +48,7 @@ import config_loader  # noqa: F401  (loads .env)
 
 from tools.override_buy import execute_override, OVERRIDE_RESULTS_DIR
 
-PORT = 8503
+PORT = 8504
 
 
 def _json_bytes(d) -> bytes:
