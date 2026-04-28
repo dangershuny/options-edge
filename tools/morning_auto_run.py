@@ -87,6 +87,40 @@ def _run_subprocess(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
         return 99, "", f"SUBPROCESS FAILED: {e}"
 
 
+def _count_submitted_today() -> int:
+    """
+    Count today's 'submitted' paper-trade entries across all tiers.
+
+    Used by --only-if-empty to gate the intraday rescan tasks: if any
+    actual orders made it through this morning, don't waste a 30-min
+    retry — just wait for the existing positions to play out.
+
+    Counts ANY submitted order today regardless of tag. So if the user
+    manually placed override trades, intraday rescans also stand down.
+    """
+    log = REPO_ROOT / "logs" / "paper_trades.jsonl"
+    if not log.exists():
+        return 0
+    today_iso = date.today().isoformat()
+    n = 0
+    try:
+        with open(log, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if (rec.get("status") == "submitted"
+                        and rec.get("timestamp", "").startswith(today_iso)):
+                    n += 1
+    except Exception:
+        pass
+    return n
+
+
 def _latest_snapshot() -> Path | None:
     snap_dir = REPO_ROOT / "snapshots"
     candidates = []
@@ -331,12 +365,36 @@ def main() -> int:
     parser.add_argument("--single-tier", type=str, default=None,
                         help="Override: only run one tier "
                              "(sim500/sim1000/sim2000 or sim500d/sim1000d/sim2000d)")
+    parser.add_argument("--only-if-empty", action="store_true",
+                        help="Skip the run if any 'submitted' paper orders "
+                             "already exist for today. Used by the intraday "
+                             "rescan tasks (11:00/12:30/14:00) so they only "
+                             "fire when the morning didn't produce trades.")
+    parser.add_argument("--label", type=str, default=None,
+                        help="Optional label appended to the log filename "
+                             "(e.g. 'intraday-1100') to keep retry logs "
+                             "distinct from the morning run.")
     args = parser.parse_args()
 
     today = date.today().isoformat()
-    log_path = LOG_DIR / f"morning_auto_run_{today}.log"
+    suffix = f"_{args.label}" if args.label else ""
+    log_path = LOG_DIR / f"morning_auto_run_{today}{suffix}.log"
     tee = _Tee(log_path)
     sys.stdout = tee
+
+    # Gate: bail early if today already produced submitted orders.
+    if args.only_if_empty:
+        try:
+            existing = _count_submitted_today()
+        except Exception:
+            existing = 0
+        if existing > 0:
+            print(f"\n[SKIP] {existing} submitted order(s) already today — "
+                  f"intraday rescan not needed.")
+            sys.stdout = tee._stdout
+            tee.close()
+            return 0
+        print(f"\n[GATE] No submitted orders today; running rescan.")
 
     tiers = default_tiers(args.min_score, args.max_trades)
     if args.single_tier:
