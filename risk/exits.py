@@ -78,7 +78,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, time
+from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 # ── Calibration file (auto-refreshed by tools/recalibrate_exits.py) ──────────
