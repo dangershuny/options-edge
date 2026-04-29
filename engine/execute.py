@@ -29,6 +29,16 @@ import os
 import sys
 import time as _time
 from datetime import date, datetime, time
+from pathlib import Path
+
+# Make sure we can import siblings (config_loader, broker, etc.) when invoked
+# as `python -m engine.execute` from a scheduled task.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# Load .env before importing any broker code below.
+import config_loader  # noqa: F401
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -363,6 +373,9 @@ def main():
     ap.add_argument("--news-only", action="store_true",
                     help="run a single news check over open positions and exit "
                          "(for cron / manual spot-check)")
+    ap.add_argument("--monitor-once", action="store_true",
+                    help="run a single monitor_tick (SL/trailing/theta scan) and exit "
+                         "(intended for cron-style scheduling every N minutes)")
     args = ap.parse_args()
 
     init_db()
@@ -373,6 +386,10 @@ def main():
 
     if args.news_only:
         news_tick()
+        return
+
+    if args.monitor_once:
+        monitor_tick()
         return
 
     morning_session(dry_run=args.dry_run)

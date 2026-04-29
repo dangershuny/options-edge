@@ -23,7 +23,6 @@ from pathlib import Path
 
 _CANDIDATE_PATHS = [
     Path(__file__).resolve().parent / ".env",
-    Path(r"C:\Users\dange\OneDrive\Documents\Claude Projects\options-edge\.env"),
 ]
 
 _LOADED = False

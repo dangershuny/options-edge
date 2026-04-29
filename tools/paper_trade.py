@@ -223,6 +223,39 @@ def _execute_trade(
         result["status"] = "submitted"
         result["order_id"] = getattr(order, "order_id", None) or getattr(order, "id", None)
         result["order_status"] = getattr(order, "status", "submitted")
+        # Record into engine_state.db so monitor_tick() can manage exits.
+        # Without this the buyer (paper_trade) and the exit-watcher
+        # (engine.execute.monitor_tick) talk to two different stores —
+        # exits never fire on positions opened here. Failure here must
+        # never block submission, so it's wrapped + logged silently.
+        try:
+            from risk.exits import apply_safety_floors
+            from engine.state import record_open, OpenPositionRecord
+            sl_pct, tp_pct = apply_safety_floors(
+                score=float(trade.get("score") or 0),
+                dte=(expiry - date.today()).days,
+                has_catalyst_in_window=bool(trade.get("catalyst_summary")),
+                held_overnight=True,
+            )
+            record_open(OpenPositionRecord(
+                occ_symbol=occ,
+                underlying=symbol,
+                option_type=opt_type,
+                strike=strike,
+                expiry=expiry.isoformat(),
+                qty=qty,
+                entry_price=float(limit_price),
+                entry_date=date.today().isoformat(),
+                entry_order_id=str(result["order_id"]) if result.get("order_id") else None,
+                score=float(trade.get("score") or 0),
+                dte_at_entry=(expiry - date.today()).days,
+                vol_signal=str(trade.get("vol_signal") or ""),
+                sl_pct=sl_pct,
+                tp_pct=tp_pct,
+            ))
+        except Exception as e:
+            # state failure must not break submission
+            result["state_record_warning"] = f"record_open failed: {e}"
     except Exception as e:
         result["status"] = "failed"
         result["error"] = f"order submit failed: {e}"
