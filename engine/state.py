@@ -148,8 +148,21 @@ class OpenPositionRecord:
 
 
 def record_open(p: OpenPositionRecord) -> int:
+    """
+    Idempotent insert. If a row already exists with the same occ_symbol in
+    status 'open' or 'closing', returns its id WITHOUT inserting a duplicate.
+    The multi-tier paper_trade loop submits the same OCC across bankroll
+    tiers; without dedupe we'd write a fresh row per tier and pollute the
+    monitor's position list.
+    """
     init_db()
     with _db() as c:
+        existing = c.execute(
+            "SELECT id FROM positions WHERE occ_symbol = ? AND status IN ('open','closing') LIMIT 1",
+            (p.occ_symbol,),
+        ).fetchone()
+        if existing:
+            return int(existing["id"])
         cur = c.execute(
             """
             INSERT INTO positions (
@@ -165,6 +178,49 @@ def record_open(p: OpenPositionRecord) -> int:
             ),
         )
         return int(cur.lastrowid)
+
+
+def mark_closing(position_id: int, exit_order_id: str, reason: str) -> None:
+    """
+    Submitted a SELL but it hasn't filled yet — flag the row so monitor_tick
+    knows not to fire another exit and reconcile_with_broker knows to
+    finalize once Alpaca confirms the fill.
+    """
+    with _db() as c:
+        c.execute(
+            "UPDATE positions SET exit_order_id = ?, exit_reason = ?, "
+            "status = 'closing', exit_queued = 0 WHERE id = ?",
+            (exit_order_id, reason, position_id),
+        )
+
+
+def revert_to_open(position_id: int) -> None:
+    """Close order expired/canceled — re-arm so next trigger can re-fire."""
+    with _db() as c:
+        c.execute(
+            "UPDATE positions SET exit_order_id = NULL, exit_queued = 0, "
+            "status = 'open' WHERE id = ?",
+            (position_id,),
+        )
+
+
+def mark_phantom(position_id: int) -> None:
+    """Engine has the row but Alpaca has no position — record never landed.
+    Soft-delete: keep the row for audit but stop monitor_tick processing it."""
+    with _db() as c:
+        c.execute(
+            "UPDATE positions SET status = 'phantom', exit_queued = 0 WHERE id = ?",
+            (position_id,),
+        )
+
+
+def list_closing() -> list[dict]:
+    """Rows that have submitted a SELL and are awaiting fill confirmation."""
+    init_db()
+    with _db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM positions WHERE status = 'closing' AND exit_order_id IS NOT NULL"
+        )]
 
 
 def list_open() -> list[dict]:

@@ -57,6 +57,7 @@ from engine.state import (
     init_db, record_open, list_open, queue_exit, list_queued_exits,
     record_close, mark_settlements_settled, unsettled_cash,
     available_cash_for_new_trade, update_peak, OpenPositionRecord,
+    mark_closing, revert_to_open, mark_phantom, list_closing,
 )
 from engine.news_monitor import (
     check_position_news, describe_signal, news_check_due,
@@ -228,17 +229,105 @@ def morning_session(dry_run: bool = False) -> None:
     _log(f"Morning session done. Placed {placed} entries. Remaining cash ${avail:.2f}.")
 
 
+# ── Reconcile engine state with Alpaca truth ─────────────────────────────────
+
+def reconcile_with_broker() -> None:
+    """
+    Pull engine_state.db into agreement with the Alpaca account.
+
+    Three failure modes this fixes:
+      1. PHANTOM open rows — paper_trade.py records on 'submitted' but the
+         limit BUY can EXPIRE without filling. Result: row exists, no
+         broker position. Mark phantom so monitor_tick stops processing it.
+      2. UNCONFIRMED close orders — _execute_exit submits a SELL but the
+         limit might not fill. Old code optimistically flipped status to
+         'closed'; new code marks 'closing' and we finalize here once
+         Alpaca confirms FILLED, or revert to 'open' on EXPIRED/CANCELED.
+      3. UNTRACKED broker positions — a position exists on Alpaca but has
+         no engine_state row. (Caused by past code paths that submitted
+         without recording, or a manual buy from override_buy.) Logged so
+         tools/backfill_positions can pick it up.
+    """
+    try:
+        live_positions = {p.symbol: p for p in alpaca.get_positions()}
+    except Exception as e:
+        _log(f"  reconcile: skip — alpaca.get_positions failed: {e}")
+        return
+
+    # 1. Phantom check on 'open' rows
+    open_rows = [r for r in list_open() if r["status"] == "open"]
+    for r in open_rows:
+        if r["occ_symbol"] not in live_positions:
+            mark_phantom(r["id"])
+            _log(f"  reconcile: phantom {r['occ_symbol']} (id={r['id']}) — "
+                 f"engine has it open but Alpaca doesn't")
+
+    # 2. Confirm-or-revert 'closing' rows
+    closing = list_closing()
+    if closing:
+        try:
+            tc = alpaca._trading_client()
+        except Exception as e:
+            _log(f"  reconcile: trading client unavailable: {e}")
+            tc = None
+        for r in closing:
+            oid = r.get("exit_order_id")
+            if not oid or tc is None:
+                continue
+            try:
+                o = tc.get_order_by_id(oid)
+            except Exception as e:
+                _log(f"  reconcile: order lookup err {r['occ_symbol']}: {e}")
+                continue
+            status = str(o.status)
+            if "FILLED" in status:
+                fill_px = float(o.filled_avg_price or o.limit_price or 0)
+                fill_date = (o.filled_at.date().isoformat()
+                             if o.filled_at else date.today().isoformat())
+                record_close(r["id"], fill_px, fill_date, oid,
+                             r.get("exit_reason") or "exit filled")
+                _log(f"  reconcile: ✅ closed {r['occ_symbol']} @ ${fill_px:.2f}")
+            elif any(t in status for t in ("EXPIRED", "CANCELED", "REJECTED")):
+                revert_to_open(r["id"])
+                _log(f"  reconcile: ↩ {r['occ_symbol']} close order {status} — "
+                     f"reverting to open (next trigger will re-fire)")
+            # else: still PENDING/ACCEPTED/PARTIAL — leave alone
+
+    # 3. Untracked positions
+    tracked = {r["occ_symbol"] for r in list_open()}
+    for sym, p in live_positions.items():
+        if sym not in tracked:
+            _log(f"  reconcile: untracked broker position {sym} qty={p.qty} "
+                 f"— run `python -m tools.backfill_positions` to manage")
+
+
 # ── Intraday monitor ─────────────────────────────────────────────────────────
 
 def monitor_tick() -> None:
     """
-    Run once per N seconds during market hours. For each open position:
-      - Refresh quote
-      - Update trailing peak
-      - Check SL / trailing / theta guard
-      - If triggered: queue_exit (cash account rule forces next-session fill)
+    Run once per N seconds during market hours. Steps:
+      0. reconcile_with_broker — sync engine_state with Alpaca truth
+      1. Flush queued exits whose entry_date is past T+1 (fire at next-session
+         open, not at tomorrow's 15:45 EOD — saves a full session of bleed)
+      2. For each remaining 'open' position:
+         - Refresh quote, update trailing peak
+         - Check SL / trailing / theta guard
+         - If triggered: queue_exit or _execute_exit per cash-account rule
     """
-    open_positions = list_open()
+    reconcile_with_broker()
+
+    # Step 1: flush queued exits eligible to fire (entry_date < today)
+    today = date.today()
+    for p in list_queued_exits():
+        try:
+            entry_date = datetime.strptime(p["entry_date"], "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if entry_date < today:
+            _log(f"  flushing queued exit: {p['occ_symbol']} ({p['exit_reason']})")
+            _execute_exit(p, p["exit_reason"] or "queued exit", urgent=False)
+
+    open_positions = [p for p in list_open() if p["status"] == "open"]
     if not open_positions:
         return
 
@@ -323,7 +412,11 @@ def _handle_exit_trigger(position: dict, reason: str) -> None:
 
 
 def _execute_exit(position: dict, reason: str, urgent: bool = False) -> None:
-    """Place the closing sell order."""
+    """
+    Submit the closing SELL. Marks the row 'closing' (not 'closed') and
+    stores exit_order_id so reconcile_with_broker can finalize once Alpaca
+    confirms the fill, or revert to 'open' if the limit order expires.
+    """
     try:
         q = alpaca.get_quote(position["occ_symbol"])
     except BrokerError as e:
@@ -339,8 +432,8 @@ def _execute_exit(position: dict, reason: str, urgent: bool = False) -> None:
     except BrokerError as e:
         _log(f"  SELL REJECT {position['occ_symbol']}: {e}")
         return
-    record_close(position["id"], px, date.today().isoformat(), o.id, reason)
-    _log(f"  SELL submitted {o.id} @ ${px:.2f} — {reason}")
+    mark_closing(position["id"], o.id, reason)
+    _log(f"  SELL submitted {o.id} @ ${px:.2f} — {reason} (awaiting fill)")
 
 
 # ── End-of-day ───────────────────────────────────────────────────────────────
@@ -348,6 +441,7 @@ def _execute_exit(position: dict, reason: str, urgent: bool = False) -> None:
 def eod_session() -> None:
     """At ~15:45 ET: fire any queued exits whose entry_date is before today."""
     _log("=== EOD SESSION ===")
+    reconcile_with_broker()
     today = date.today()
     queued = list_queued_exits()
     for p in queued:
