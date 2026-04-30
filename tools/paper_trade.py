@@ -82,6 +82,63 @@ def _occ_for(t: dict, broker_mod) -> str:
         return ""
 
 
+_TREND_CACHE: dict[str, float] = {}
+
+
+def _underlying_5d_return(symbol: str, lookback_days: int = 5) -> float | None:
+    """Cached 5-day total return on the underlying. None if data unavailable.
+    Used by the directional gate to refuse BUY CALLs into a downtrend (and
+    PUTs into an uptrend). Cached per-process so tier loops don't re-fetch."""
+    if symbol in _TREND_CACHE:
+        return _TREND_CACHE[symbol]
+    try:
+        import yfinance as yf
+        # Ticker.history returns a flat DataFrame (no MultiIndex like yf.download)
+        hist = yf.Ticker(symbol).history(period=f"{lookback_days + 7}d", auto_adjust=True)
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            _TREND_CACHE[symbol] = float("nan")
+            return None
+        closes = hist["Close"].dropna().tolist()
+        if len(closes) < 2:
+            _TREND_CACHE[symbol] = float("nan")
+            return None
+        last = float(closes[-1])
+        ref_idx = max(0, len(closes) - 1 - lookback_days)
+        ref = float(closes[ref_idx])
+        ret = (last / ref) - 1 if ref else None
+        if ret is not None:
+            _TREND_CACHE[symbol] = ret
+        return ret
+    except Exception:
+        _TREND_CACHE[symbol] = float("nan")
+        return None
+
+
+def _passes_pretrade_filters(t: dict) -> tuple[bool, str]:
+    """Apply min_underlying_price + directional-trend gates from RISK config.
+    Returns (allowed, reason)."""
+    from risk.config import RISK
+    sym = (t.get("symbol") or "").upper()
+    px = float(t.get("stock_price_at_snap") or 0)
+    min_px = float(RISK.get("min_underlying_price") or 0)
+    if px and min_px and px < min_px:
+        return False, f"underlying ${px:.2f} < min_underlying_price ${min_px:.2f}"
+
+    opt_type = (t.get("option_type") or "").lower()
+    threshold = float(RISK.get("max_adverse_trend_pct") or 0)  # negative number
+    lookback = int(RISK.get("trend_lookback_days") or 5)
+    if opt_type in ("call", "put") and threshold:
+        ret = _underlying_5d_return(sym, lookback) if sym else None
+        if ret is None or (isinstance(ret, float) and (ret != ret)):
+            # No data — allow through; rare ticker, don't artificially drop
+            return True, ""
+        if opt_type == "call" and ret < threshold:
+            return False, f"5d return {ret*100:+.1f}% below threshold {threshold*100:+.1f}% (CALL into downtrend)"
+        if opt_type == "put" and ret > -threshold:
+            return False, f"5d return {ret*100:+.1f}% above threshold {-threshold*100:+.1f}% (PUT into uptrend)"
+    return True, ""
+
+
 def _trade_qualifies(t: dict, allowed_signals: tuple[str, ...]) -> bool:
     """
     A trade qualifies for a tier if EITHER:
@@ -114,11 +171,23 @@ def _rank_trades(trades: list[dict], min_score: float,
     ("DIRECTIONAL BUY",) — also matches BUY VOL contracts with the
     is_directional_setup flag.
     """
-    filtered = [
-        t for t in trades
-        if t.get("score", 0) >= min_score
-        and _trade_qualifies(t, allowed_signals)
-    ]
+    filtered = []
+    rejected_filter: list[tuple[str, str]] = []
+    for t in trades:
+        if t.get("score", 0) < min_score:
+            continue
+        if not _trade_qualifies(t, allowed_signals):
+            continue
+        ok, reason = _passes_pretrade_filters(t)
+        if not ok:
+            rejected_filter.append((t.get("symbol", "?"), reason))
+            continue
+        filtered.append(t)
+    if rejected_filter:
+        for sym, why in rejected_filter[:8]:
+            print(f"  filter-skip {sym}: {why}")
+        if len(rejected_filter) > 8:
+            print(f"  ... and {len(rejected_filter) - 8} more")
     return sorted(filtered, key=lambda x: -x.get("score", 0))
 
 

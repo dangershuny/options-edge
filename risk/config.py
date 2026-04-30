@@ -206,6 +206,17 @@ RISK: dict = {
     # proceeds on the next entry.
     "min_settled_cash_fraction": 0.20,
 
+    # ── Pre-trade filters (added 2026-04-29 after backtest finding) ───────────
+    # Backtest over 9 snapshots: Spearman rho = -0.32 between score and 5-day
+    # directional return. High-score picks lose MORE often. Until the signal
+    # is rebuilt, these filters cap the worst behaviors that drove today's loss:
+    #   - penny names: $0.05 stock tick → option halves; bid/ask spreads chew us
+    #   - directional: every BUY CALL placed into a -3%+ 5-day downtrend lost
+    "min_underlying_price":     5.00,   # skip trades where stock < $5
+    "max_adverse_trend_pct":   -0.03,   # skip BUY CALL if 5-day return < this;
+                                        # symmetrically skip BUY PUT if > +abs(this)
+    "trend_lookback_days":         5,
+
     # ── Live news-monitor exit (intraday) ─────────────────────────────────────
     # Every N seconds during the session, pull fresh headlines for every open
     # underlying. If a material article's sentiment runs *against* the

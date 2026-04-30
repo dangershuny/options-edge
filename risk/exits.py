@@ -183,13 +183,15 @@ def entry_roi_haircut(now: time | None = None) -> float:
 # Thresholds are inclusive on the upper bound of each bucket.
 _DEFAULT_EXIT_TIERS: list[tuple[int, int, float | None, float | None]] = [
     # (score_min, score_max, sl_pct, tp_pct)
-    # Grid-search optimum was (80-100, None, None) but that only measures
-    # INTRADAY behavior. Overnight gap risk and theta bleed force a hard
-    # safety floor even on top-tier signals — see HARD_STOP_FLOOR below
-    # and apply_safety_floors() which overrides these values.
-    (80, 100, -0.35, None),   # top — grid said None; safety floor forces -35%
-    (60,  79, -0.20, None),   # mid — loose stop, grid-optimal
-    ( 0,  59, -0.10, None),   # low — tight stop, grid-optimal
+    # Tightened 2026-04-29 after the scorer backtest showed Spearman rho=-0.32
+    # between score and 5-day directional return. Higher-score picks lose
+    # more often than lower-score ones — so the old "looser stop on better
+    # signals" logic is inverted by the data. We now use the same TIGHT
+    # stop across all score bands until either (a) the signal is rebuilt
+    # and re-tested or (b) we have enough new data to bucket honestly.
+    (80, 100, -0.12, None),
+    (60,  79, -0.12, None),
+    ( 0,  59, -0.10, None),
 ]
 
 # ── HARD SAFETY FLOORS — always enforced regardless of tier/calibration ──────
@@ -209,9 +211,12 @@ _DEFAULT_EXIT_TIERS: list[tuple[int, int, float | None, float | None]] = [
 # apply_safety_floors() enforces these on TOP of whatever the tiered
 # rule returned — it only ever TIGHTENS a stop, never loosens it.
 
-HARD_STOP_FLOOR = -0.40     # no position, regardless of score, is allowed past -40% intraday
-OVERNIGHT_STOP_FLOOR = -0.25  # tighter stop must be in place for any position held overnight
-CATALYST_STOP_FLOOR = -0.15   # tighter still if earnings/FOMC/PDUFA within CATALYST_WINDOW_DAYS
+HARD_STOP_FLOOR = -0.25     # tightened 2026-04-29: was -40%; backtest showed scorer anti-correlated, so
+                            # capping per-trade pain is the strongest available defense
+OVERNIGHT_STOP_FLOOR = -0.15  # tightened 2026-04-29: was -25%; with cash-account guard queueing exits
+                              # for next-day open, positions bleed past trigger by ~10pp on average,
+                              # so trigger early to bound the next-day gap
+CATALYST_STOP_FLOOR = -0.12   # tightened 2026-04-29: was -15%
 CATALYST_WINDOW_DAYS = 3      # any catalyst within this many days triggers catalyst floor
 
 # Profit-protection: once a position reaches this gain, activate a trailing
