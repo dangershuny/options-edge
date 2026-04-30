@@ -100,7 +100,7 @@ def run_one_pass(dry_run: bool = False) -> dict:
 
 
 def write_eod_summary() -> None:
-    """16:35 daily summary — counts the day's actions + open proposals."""
+    """16:35 daily summary — counts the day's actions, P&L, and open proposals."""
     from tools.notify import send
     md = _summary_path()
     rem_log = LOG_DIR / f"remediations-{date.today().isoformat()}.jsonl"
@@ -117,10 +117,53 @@ def write_eod_summary() -> None:
         except Exception:
             n_open_proposals = 0
 
+    # Day's P&L: count today's submitted entries + filled exits from logs
+    n_entries = 0
+    n_exits = 0
+    realized_pl = 0.0
+    today_iso = date.today().isoformat()
+    pt_log = LOG_DIR / "paper_trades.jsonl"
+    if pt_log.exists():
+        try:
+            for line in pt_log.read_text(encoding="utf-8").splitlines():
+                rec = json.loads(line)
+                if not rec.get("timestamp", "").startswith(today_iso):
+                    continue
+                if rec.get("status") == "submitted":
+                    n_entries += 1
+        except Exception:
+            pass
+    # Realized P&L from engine_state.db closed-today rows
+    try:
+        import sqlite3
+        with sqlite3.connect(REPO_ROOT / "engine_state.db") as c:
+            for r in c.execute(
+                "SELECT realized_pl FROM positions "
+                "WHERE status='closed' AND exit_date=? AND realized_pl IS NOT NULL",
+                (today_iso,),
+            ):
+                n_exits += 1
+                realized_pl += float(r[0] or 0)
+    except Exception:
+        pass
+
+    # Account snapshot for the EOD line
+    try:
+        from broker import alpaca
+        acct = alpaca.get_account()
+        equity = acct.equity
+    except Exception:
+        equity = None
+
+    eq_str = f"${equity:,.2f}" if equity is not None else "n/a"
     summary = (
-        f"\n## EOD summary {date.today().isoformat()}\n"
-        f"- Remediations fired today: {n_remediations}\n"
-        f"- Open proposals at close: {n_open_proposals}\n"
+        f"\n## EOD summary {today_iso}\n"
+        f"- Equity at close: {eq_str}\n"
+        f"- Entries submitted: {n_entries}\n"
+        f"- Exits filled: {n_exits}\n"
+        f"- Realized P&L (closed today): ${realized_pl:+,.2f}\n"
+        f"- Remediations fired: {n_remediations}\n"
+        f"- Open proposals: {n_open_proposals}\n"
     )
     if md.exists():
         with md.open("a", encoding="utf-8") as f:
@@ -128,8 +171,12 @@ def write_eod_summary() -> None:
     else:
         md.write_text("# Daily health log\n" + summary, encoding="utf-8")
 
-    body = f"Remediations: {n_remediations}\nOpen proposals: {n_open_proposals}\nLog: {md.name}"
-    send("INFO", f"Health EOD {date.today().isoformat()}", body)
+    body = (
+        f"equity={eq_str}\n"
+        f"entries={n_entries} exits={n_exits} pl=${realized_pl:+,.0f}\n"
+        f"remediations={n_remediations} open_proposals={n_open_proposals}"
+    )
+    send("INFO", f"EOD {today_iso}", body)
 
 
 def main() -> int:

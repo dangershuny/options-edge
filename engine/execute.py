@@ -287,6 +287,19 @@ def reconcile_with_broker() -> None:
                 record_close(r["id"], fill_px, fill_date, oid,
                              r.get("exit_reason") or "exit filled")
                 _log(f"  reconcile: ✅ closed {r['occ_symbol']} @ ${fill_px:.2f}")
+                try:
+                    from tools.notify import send
+                    entry = float(r["entry_price"])
+                    pnl_dollars = (fill_px - entry) * 100 * int(r["qty"])
+                    pnl_pct = (fill_px / entry - 1) * 100 if entry else 0
+                    send(
+                        "EXIT",
+                        f"{r['occ_symbol']} filled @ ${fill_px:.2f}",
+                        f"entry=${entry:.2f} pl=${pnl_dollars:+.0f} ({pnl_pct:+.1f}%) "
+                        f"reason={r.get('exit_reason','')}",
+                    )
+                except Exception:
+                    pass
             elif any(t in status for t in ("EXPIRED", "CANCELED", "REJECTED")):
                 revert_to_open(r["id"])
                 _log(f"  reconcile: ↩ {r['occ_symbol']} close order {status} — "
@@ -434,6 +447,15 @@ def _execute_exit(position: dict, reason: str, urgent: bool = False) -> None:
         return
     mark_closing(position["id"], o.id, reason)
     _log(f"  SELL submitted {o.id} @ ${px:.2f} — {reason} (awaiting fill)")
+    try:
+        from tools.notify import send
+        send(
+            "INFO",
+            f"close submitted {position['occ_symbol']} @ ${px:.2f}",
+            f"qty={position['qty']} reason={reason}",
+        )
+    except Exception:
+        pass
 
 
 # ── End-of-day ───────────────────────────────────────────────────────────────

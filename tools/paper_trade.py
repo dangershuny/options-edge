@@ -235,6 +235,18 @@ def _execute_trade(
         result["status"] = "submitted"
         result["order_id"] = getattr(order, "order_id", None) or getattr(order, "id", None)
         result["order_status"] = getattr(order, "status", "submitted")
+        # Telegram update for the operator (silent — non-loud severity)
+        try:
+            from tools.notify import send
+            send(
+                "ENTRY",
+                f"{qty}x {occ} @ ${limit_price:.2f}",
+                f"score={float(trade.get('score') or 0):.0f} "
+                f"sig={trade.get('vol_signal','-')} cost=${total_cost:.0f} "
+                f"tag={tag or '-'}",
+            )
+        except Exception:
+            pass
         # Record into engine_state.db so monitor_tick() can manage exits.
         # Without this the buyer (paper_trade) and the exit-watcher
         # (engine.execute.monitor_tick) talk to two different stores —

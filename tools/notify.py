@@ -88,18 +88,36 @@ def send(severity: str, title: str, body: str = "",
     return ok
 
 
+# Severities that ring the phone; everything else gets disable_notification=true.
+# OCC symbols contain digits/letters only so we don't need Markdown escaping.
+_LOUD = {"CRIT", "WARN", "EXIT", "PROPOSAL"}
+_PREFIX = {
+    "INFO": "",
+    "ENTRY": "BUY  ",
+    "EXIT": "SELL ",
+    "WARN": "WARN ",
+    "CRIT": "CRIT ",
+    "PROPOSAL": "PROP ",
+}
+
+
 def _send_telegram(record: dict) -> None:
-    """Placeholder — implement once we have the bot token format from the
-    momentum-edge Telegram setup. Either polling or webhook is fine; the
-    minimum interface is bot.send_message(chat_id, text)."""
     import urllib.request
     import urllib.parse
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat = os.environ["TELEGRAM_CHAT_ID"]
-    text = f"*[{record['severity']}] {record['title']}*\n{record['body']}"
+    sev = record["severity"].upper()
+    prefix = _PREFIX.get(sev, f"[{sev}] ")
+    text = f"{prefix}{record['title']}"
+    if record.get("body"):
+        text += "\n" + record["body"]
+    text = text[:3900]  # Telegram caps at 4096
+    silent = sev not in _LOUD
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = urllib.parse.urlencode({
-        "chat_id": chat, "text": text, "parse_mode": "Markdown",
+        "chat_id": chat,
+        "text": text,
+        "disable_notification": "true" if silent else "false",
     }).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     with urllib.request.urlopen(req, timeout=8) as r:
