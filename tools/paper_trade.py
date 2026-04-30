@@ -70,6 +70,18 @@ def _expiry_to_date(s: str) -> date:
 DEFAULT_ALLOWED_SIGNALS = ("BUY VOL", "FLOW BUY")
 
 
+def _occ_for(t: dict, broker_mod) -> str:
+    """Best-effort OCC computation for a snapshot trade row, used by the
+    blacklist filter. Returns '' if any field is missing."""
+    try:
+        return broker_mod.occ_symbol(
+            t["symbol"], _expiry_to_date(t["expiry"]),
+            t["option_type"].lower(), float(t["strike"]),
+        )
+    except Exception:
+        return ""
+
+
 def _trade_qualifies(t: dict, allowed_signals: tuple[str, ...]) -> bool:
     """
     A trade qualifies for a tier if EITHER:
@@ -298,10 +310,35 @@ def run(
             "orders": [],
         }
 
+    # Health-runner halt flag — auto_remediate writes this when daily-loss
+    # cap is hit. Refuse new buys for the rest of the session.
+    halt_flag = REPO_ROOT / "logs" / f"halt_buys_{date.today().isoformat()}.flag"
+    if halt_flag.exists() and not dry_run:
+        return {
+            "error": f"halt_buys flag set ({halt_flag.name}); skipping all entries",
+            "orders": [],
+        }
+
+    # Health-runner contract blacklist — OCCs that had N+ EXPIRED BUYs today.
+    # Skip them on subsequent intraday runs to stop wasting bankroll on
+    # contracts whose limit price won't fill.
+    blacklist_path = REPO_ROOT / "logs" / f"contract_blacklist_{date.today().isoformat()}.json"
+    blacklist: set[str] = set()
+    if blacklist_path.exists():
+        try:
+            blacklist = set(json.loads(blacklist_path.read_text(encoding="utf-8")))
+        except Exception:
+            blacklist = set()
+
     # Load snapshot
     snap = _load_snapshot(snapshot_path)
     all_trades = snap.get("trades", [])
     ranked = _rank_trades(all_trades, min_score, allowed_signals)
+    if blacklist:
+        before = len(ranked)
+        ranked = [t for t in ranked if _occ_for(t, broker_mod) not in blacklist]
+        if before != len(ranked):
+            print(f"Blacklist: dropped {before - len(ranked)} trades whose OCC is blacklisted today")
 
     # Per-ticker concentration cap — counted across ALL tiers run today.
     # Without this, all 9 tiers can pick the same dominant ticker (today
