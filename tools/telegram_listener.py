@@ -89,7 +89,8 @@ def cmd_help(args: list[str]) -> str:
         "  /restart override    restart override server\n"
         "  /diagnose            last lines of each runner log\n"
         "  /report [YYYY-MM-DD] today's EOD analysis (or a past day)\n"
-        "  /proposals [date]    proposals from EOD analysis"
+        "  /proposals [date]    proposals from EOD analysis\n"
+        "  /debug <issue>       spawn Claude (plan mode) to investigate"
     )
 
 
@@ -300,6 +301,77 @@ def cmd_proposals(args: list[str]) -> str:
     return "\n".join(lines)[:3800]
 
 
+def cmd_debug(args: list[str]) -> str:
+    """Spawn the Claude CLI in --print --permission-mode plan against the
+    options-edge repo. Plan mode means Claude can read/grep/run-bash but
+    cannot edit files or submit broker orders — output is a diagnosis +
+    proposed fix, never an applied change.
+
+    Auth: uses the user's local Claude Code subscription via the CLI's
+    OAuth token cache. No API charges.
+
+    Long output (>3500 chars) is saved to logs/debug-{ts}.log and the
+    last chunk is sent in-line.
+    """
+    if not args:
+        return ("usage: /debug <describe issue>\n"
+                "example: /debug why is BBAI 5-22 still in 'closing' status "
+                "with no exit fill?")
+    issue = " ".join(args).strip()
+    cli = os.environ.get("CLAUDE_CLI_PATH")
+    if not cli:
+        return ("CLAUDE_CLI_PATH not set in .env. Add the path to claude.exe "
+                "(forward slashes — dotenv eats backslashes).")
+    if not os.path.exists(cli):
+        return f"claude CLI not found at {cli} (env says exists=False)"
+
+    prompt = (
+        "You are debugging the options-edge trading repo (the directory "
+        "you are currently in is the project root). Diagnose this issue "
+        "using read-only tools (Read, Grep, Glob, Bash for queries — DO "
+        "NOT edit files, do not submit broker orders, do not run "
+        "destructive commands). Be concise.\n\n"
+        f"Issue: {issue}\n\n"
+        "Respond with: (1) what you found, (2) the most likely root cause, "
+        "(3) a specific proposed fix with file paths and the exact change. "
+        "Keep total output under 3000 characters."
+    )
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    log_path = LOG_DIR / f"debug-{ts}.log"
+    try:
+        # shell=False, full path: matches momentum-edge's working invocation
+        r = subprocess.run(
+            [cli, "--print", "--permission-mode", "plan", prompt],
+            cwd=str(REPO_ROOT),
+            capture_output=True, text=True, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return "claude timed out after 5 minutes — try a more specific issue"
+    except FileNotFoundError as e:
+        return f"could not invoke claude: {e}"
+    except Exception as e:
+        return f"unexpected error: {type(e).__name__}: {e}"
+
+    out = (r.stdout or "").strip()
+    err = (r.stderr or "").strip()
+    log_path.write_text(
+        f"prompt:\n{prompt}\n\n--- stdout ---\n{out}\n\n--- stderr ---\n{err}\n",
+        encoding="utf-8",
+    )
+
+    if r.returncode != 0 and not out:
+        return f"claude failed rc={r.returncode}\nstderr: {err[:1500]}"
+
+    if not out:
+        return f"claude returned empty output (rc={r.returncode}). Check {log_path.name}"
+
+    if len(out) > 3500:
+        return (f"[truncated — full output in {log_path.name}]\n\n"
+                + out[-3300:])
+    return out
+
+
 def cmd_diagnose(args: list[str]) -> str:
     """Tail the most relevant runner logs."""
     today = date.today().isoformat()
@@ -338,6 +410,7 @@ HANDLERS: dict[str, callable] = {
     "/diagnose": cmd_diagnose,
     "/report": cmd_report,
     "/proposals": cmd_proposals,
+    "/debug": cmd_debug,
 }
 
 
