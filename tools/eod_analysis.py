@@ -1,0 +1,665 @@
+"""
+End-of-day analysis + proposals — runs at 16:45 ET, after EODSession,
+SurfaceSnapshot, and HealthSummary have all written their data.
+
+Produces:
+  logs/eod-analysis-{date}.md         — human-readable report
+  logs/eod-proposals-{date}.json      — structured proposals (LOW/MED/HIGH risk)
+  Telegram top-line summary           — top 3 proposals + headline P&L
+
+The user reviews the report when they get home. Each proposal is tagged with
+a risk tier so they can quickly approve LOW changes (log/text/threshold tweaks),
+deliberate on MED (config or filter changes), and pause on HIGH (code structure
+or trade-mechanism changes).
+
+Until the Tier-3 Claude-in-loop agent is built, proposals are text-only.
+The user manually applies approved ones in the next session.
+
+Usage:
+    python -m tools.eod_analysis
+    python -m tools.eod_analysis --date 2026-04-30   # analyze a past day
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sqlite3
+import statistics
+import subprocess
+import sys
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import config_loader  # noqa: F401
+
+LOG_DIR = REPO_ROOT / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _isnum(x: Any) -> bool:
+    try:
+        v = float(x)
+        return v == v and v not in (float("inf"), float("-inf"))
+    except Exception:
+        return False
+
+
+# ── Today's trade results ───────────────────────────────────────────────────
+
+def collect_today_results(today: date) -> dict:
+    iso = today.isoformat()
+    out = {
+        "today": iso,
+        "entries": [],
+        "exits_filled": [],
+        "still_open": [],
+        "queued_exits": [],
+        "realized_pl": 0.0,
+        "unrealized_pl": 0.0,
+        "equity": None,
+        "cash": None,
+    }
+
+    # Entries from paper_trades.jsonl
+    pt = LOG_DIR / "paper_trades.jsonl"
+    if pt.exists():
+        try:
+            for line in pt.read_text(encoding="utf-8").splitlines():
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if not rec.get("timestamp", "").startswith(iso):
+                    continue
+                if rec.get("status") != "submitted":
+                    continue
+                out["entries"].append({
+                    "ts": rec["timestamp"][11:19],
+                    "occ": rec.get("occ"),
+                    "score": rec.get("score"),
+                    "signal": rec.get("signal"),
+                    "qty": rec.get("qty"),
+                    "cost": rec.get("total_cost"),
+                    "tag": rec.get("tag", ""),
+                })
+        except Exception:
+            pass
+
+    # Exits filled today + still-open from engine_state.db
+    db = REPO_ROOT / "engine_state.db"
+    if db.exists():
+        try:
+            with sqlite3.connect(db) as c:
+                for r in c.execute(
+                    "SELECT occ_symbol,entry_date,entry_price,exit_price,"
+                    "realized_pl,exit_reason,score,vol_signal,qty "
+                    "FROM positions WHERE status='closed' AND exit_date=?",
+                    (iso,),
+                ):
+                    occ, ed, ep, xp, pl, rs, sc, sg, qty = r
+                    out["exits_filled"].append({
+                        "occ": occ, "entry_date": ed, "entry": ep, "exit": xp,
+                        "pl": pl, "reason": rs, "score": sc, "qty": qty,
+                    })
+                    if _isnum(pl):
+                        out["realized_pl"] += float(pl)
+                for r in c.execute(
+                    "SELECT occ_symbol,entry_date,entry_price,score,qty,status "
+                    "FROM positions WHERE status IN ('open','closing')",
+                ):
+                    occ, ed, ep, sc, qty, st = r
+                    out["still_open"].append({
+                        "occ": occ, "entry_date": ed, "entry": ep,
+                        "score": sc, "qty": qty, "status": st,
+                    })
+        except Exception:
+            pass
+
+    # Queued exits awaiting tomorrow's flush
+    try:
+        from engine.state import init_db, list_queued_exits
+        init_db()
+        for q in list_queued_exits():
+            out["queued_exits"].append({
+                "occ": q["occ_symbol"], "entry_date": q["entry_date"],
+                "reason": q.get("exit_reason"),
+            })
+    except Exception:
+        pass
+
+    # Live broker snapshot (most recent unrealized)
+    try:
+        from broker import alpaca
+        positions = alpaca.get_positions()
+        out["unrealized_pl"] = sum(p.unrealized_pl for p in positions)
+        acct = alpaca.get_account()
+        out["equity"] = acct.equity
+        out["cash"] = acct.cash
+    except Exception:
+        pass
+
+    return out
+
+
+def split_by_pipeline(entries: list[dict], exits: list[dict]) -> dict:
+    """Bucket trades by tag prefix — divergence_picker uses 'divergence-{date}'
+    while paper_trade uses tier tags like 'sim500', 'sim1000', etc."""
+    div_entries = [e for e in entries if (e.get("tag") or "").startswith("divergence")]
+    scorer_entries = [e for e in entries if not (e.get("tag") or "").startswith("divergence")]
+
+    # Map exits back to their entry's pipeline by OCC
+    div_occs = {e["occ"] for e in div_entries}
+    div_exits = [x for x in exits if x.get("occ") in div_occs]
+    scorer_exits = [x for x in exits if x.get("occ") not in div_occs]
+
+    return {
+        "divergence": {
+            "entries": len(div_entries), "exits": len(div_exits),
+            "realized_pl": sum(float(x["pl"]) for x in div_exits if _isnum(x.get("pl"))),
+        },
+        "scorer": {
+            "entries": len(scorer_entries), "exits": len(scorer_exits),
+            "realized_pl": sum(float(x["pl"]) for x in scorer_exits if _isnum(x.get("pl"))),
+        },
+    }
+
+
+# ── Filter effectiveness ────────────────────────────────────────────────────
+
+def filter_effectiveness(today: date) -> dict:
+    """Read morning_auto_run log + intraday logs for filter-skip events."""
+    iso = today.isoformat()
+    skips: list[dict] = []
+    for log_name in [f"morning_auto_run_{iso}.log",
+                     f"morning_auto_run_{iso}_intraday-1100.log",
+                     f"morning_auto_run_{iso}_intraday-1230.log",
+                     f"morning_auto_run_{iso}_intraday-1400.log"]:
+        p = LOG_DIR / log_name
+        if not p.exists():
+            continue
+        try:
+            for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+                m = re.search(r"filter-skip\s+(\S+):\s+(.+)", line)
+                if m:
+                    skips.append({"sym": m.group(1), "reason": m.group(2).strip()})
+        except Exception:
+            continue
+
+    # Categorize
+    by_reason = {"underlying_price": 0, "trend_call": 0, "trend_put": 0, "other": 0}
+    for s in skips:
+        r = s["reason"]
+        if "min_underlying_price" in r:
+            by_reason["underlying_price"] += 1
+        elif "CALL into downtrend" in r:
+            by_reason["trend_call"] += 1
+        elif "PUT into uptrend" in r:
+            by_reason["trend_put"] += 1
+        else:
+            by_reason["other"] += 1
+
+    # Per-symbol counts (so we can see if same name is being repeatedly blocked)
+    sym_counts: dict[str, int] = {}
+    for s in skips:
+        sym_counts[s["sym"]] = sym_counts.get(s["sym"], 0) + 1
+
+    return {
+        "total_skips": len(skips),
+        "by_reason": by_reason,
+        "by_symbol": dict(sorted(sym_counts.items(), key=lambda x: -x[1])[:10]),
+    }
+
+
+# ── Cumulative backtest refresh ─────────────────────────────────────────────
+
+def refresh_backtests() -> dict:
+    """Re-run the two backtests against current snapshot/sentinel data, capture
+    headline metrics so we can see if they're trending."""
+    out = {"scorer": {}, "sentinel_events": {}}
+
+    try:
+        py = sys.executable
+        r = subprocess.run(
+            [py, "-m", "tools.scorer_backtest", "--hold-days", "5"],
+            capture_output=True, text=True, timeout=180, cwd=str(REPO_ROOT),
+        )
+        # Find the most recent backtest-*.json
+        bt_files = sorted(LOG_DIR.glob("backtest-*.json"))
+        if bt_files:
+            data = json.loads(bt_files[-1].read_text(encoding="utf-8"))
+            out["scorer"] = {
+                "n_trades": data.get("n_trades"),
+                "win_rate": data.get("win_rate"),
+                "mean_dir_return_pct": data.get("mean_dir_return_pct"),
+                "spearman_score_vs_return": data.get("spearman_score_vs_return"),
+            }
+    except Exception as e:
+        out["scorer"]["error"] = str(e)
+
+    try:
+        py = sys.executable
+        subprocess.run(
+            [py, "-m", "tools.sentinel_event_backtest",
+             "--since-days", "90", "--hold-days", "5"],
+            capture_output=True, text=True, timeout=300, cwd=str(REPO_ROOT),
+        )
+        sb_files = sorted(LOG_DIR.glob("sentinel-event-backtest-*.json"))
+        if sb_files:
+            data = json.loads(sb_files[-1].read_text(encoding="utf-8"))
+            divs = data.get("divergence_events", [])
+            news = data.get("news_events", [])
+            soc = data.get("social_events", [])
+            def _stats(items):
+                if not items:
+                    return {"n": 0}
+                wins = sum(1 for x in items if x.get("won"))
+                rets = [x.get("directional_return_pct", 0) for x in items]
+                return {
+                    "n": len(items),
+                    "win_rate": wins / len(items),
+                    "mean": statistics.fmean(rets) if rets else 0,
+                }
+            out["sentinel_events"] = {
+                "divergence": _stats(divs),
+                "news": _stats(news),
+                "social": _stats(soc),
+            }
+    except Exception as e:
+        out["sentinel_events"]["error"] = str(e)
+
+    return out
+
+
+# ── Health monitor activity summary ─────────────────────────────────────────
+
+def health_activity(today: date) -> dict:
+    iso = today.isoformat()
+    rem_log = LOG_DIR / f"remediations-{iso}.jsonl"
+    n_remediations = 0
+    by_action: dict[str, int] = {}
+    if rem_log.exists():
+        for line in rem_log.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+                action = rec.get("action", "?")
+                by_action[action] = by_action.get(action, 0) + 1
+                n_remediations += 1
+            except Exception:
+                continue
+    # Open proposals (from anomaly_classifier)
+    pp = LOG_DIR / "proposals-current.json"
+    open_props = 0
+    if pp.exists():
+        try:
+            open_props = len(json.loads(pp.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return {"remediations": n_remediations, "by_action": by_action,
+            "open_proposals": open_props}
+
+
+# ── Proposal generator ──────────────────────────────────────────────────────
+
+def generate_proposals(report: dict) -> list[dict]:
+    """Synthesize observed-vs-expected gaps into actionable proposals.
+    Each proposal is risk-tiered:
+      LOW  — tweak a constant in risk/config.py, change a threshold
+      MED  — change a code path (e.g., adjust filter logic, add a guard)
+      HIGH — change a strategy or trade mechanism
+    """
+    proposals: list[dict] = []
+    today = report["today"]
+
+    # 1. Daily P&L vs cap — has the daily-loss cap been approached?
+    pl = report.get("realized_pl", 0) + report.get("unrealized_pl", 0)
+    # Don't propose halt on small days — only flag if approaching the actual cap
+    if pl < -300:
+        proposals.append({
+            "id": f"daily_loss_warn_{today}",
+            "risk": "MED",
+            "title": "Daily loss approaching cap",
+            "rationale": f"Combined realized + unrealized = ${pl:+.0f}",
+            "suggested_action": "Consider /halt for tomorrow morning until the "
+                                "loss source is identified, OR tighten SL further.",
+        })
+
+    # 2. Filter effectiveness — was the universe filter doing real work?
+    fe = report.get("filter_effectiveness", {})
+    skips = fe.get("total_skips", 0)
+    if skips > 0:
+        top = list(fe.get("by_symbol", {}).items())[:3]
+        sym_summary = ", ".join(f"{s}({n})" for s, n in top)
+        proposals.append({
+            "id": f"filter_skips_summary_{today}",
+            "risk": "LOW",
+            "title": f"Filters blocked {skips} trades today",
+            "rationale": f"Top-blocked: {sym_summary}",
+            "suggested_action": "If any of these names recently outperformed "
+                                "after a >5d delay, consider extending the "
+                                "trend lookback. Otherwise no change.",
+        })
+
+    # 3. Pipeline P&L comparison
+    pipe = report.get("pipelines", {})
+    div_pl = pipe.get("divergence", {}).get("realized_pl", 0)
+    sc_pl = pipe.get("scorer", {}).get("realized_pl", 0)
+    div_n = pipe.get("divergence", {}).get("entries", 0)
+    sc_n = pipe.get("scorer", {}).get("entries", 0)
+    if div_n + sc_n > 0:
+        comparison = (
+            f"divergence: {div_n} entries, ${div_pl:+.0f} realized | "
+            f"scorer: {sc_n} entries, ${sc_pl:+.0f} realized"
+        )
+        proposals.append({
+            "id": f"pipeline_pl_{today}",
+            "risk": "LOW",
+            "title": "Per-pipeline P&L breakdown",
+            "rationale": comparison,
+            "suggested_action": (
+                "If divergence pipeline outperforms scorer by >2x cumulatively "
+                "over 5 trading days, propose disabling the scorer-driven "
+                "MorningAutoRun and IntradayScan tasks (HIGH-risk change)."
+                if div_pl > 0 and div_pl > 2 * sc_pl
+                else "Wait for more data."
+            ),
+        })
+
+    # 4. Backtest trends
+    bt = report.get("backtests", {})
+    sc = bt.get("scorer", {})
+    if sc.get("spearman_score_vs_return") is not None:
+        rho = sc["spearman_score_vs_return"]
+        if rho < -0.2:
+            proposals.append({
+                "id": f"scorer_rho_negative_{today}",
+                "risk": "HIGH",
+                "title": f"Scorer correlation still negative (rho={rho:+.2f})",
+                "rationale": f"n={sc.get('n_trades')} trades. "
+                             f"Score is anti-correlated with outcome.",
+                "suggested_action": (
+                    "Disable scorer-driven entries (set --min-score 200 in "
+                    "morning_auto_run.bat to effectively pause). Continue with "
+                    "divergence-only path until scorer is rebuilt."
+                ),
+            })
+        elif rho > 0.2:
+            proposals.append({
+                "id": f"scorer_rho_positive_{today}",
+                "risk": "MED",
+                "title": f"Scorer correlation turned POSITIVE (rho={rho:+.2f})",
+                "rationale": f"n={sc.get('n_trades')} trades. Was negative; "
+                             f"now positive. Could be regime change or larger sample.",
+                "suggested_action": "Consider raising min_score_to_trade from "
+                                    "65 toward 75 to filter out weak signal end.",
+            })
+    se = bt.get("sentinel_events", {})
+    div_stats = se.get("divergence", {})
+    if div_stats.get("n", 0) >= 10:
+        wr = div_stats.get("win_rate", 0)
+        if wr >= 0.7:
+            proposals.append({
+                "id": f"divergence_win_rate_{today}",
+                "risk": "MED",
+                "title": f"Divergence win rate at {wr:.0%} (n={div_stats['n']})",
+                "rationale": f"Sample now sufficient (n>=10). Mean dir return "
+                             f"{div_stats.get('mean', 0):+.2f}%.",
+                "suggested_action": "Consider raising divergence_picker --qty "
+                                    "from 1 to 2, or increasing --max-picks.",
+            })
+        elif wr < 0.5:
+            proposals.append({
+                "id": f"divergence_win_rate_drop_{today}",
+                "risk": "HIGH",
+                "title": f"Divergence win rate dropped to {wr:.0%}",
+                "rationale": f"n={div_stats['n']} — early 100% rate may have "
+                             f"been small-sample bias.",
+                "suggested_action": "Disable OptionsEdge-DivergencePicker until "
+                                    "the regime / signal is re-examined.",
+            })
+
+    # 5. Health monitor noise
+    hm = report.get("health", {})
+    if hm.get("by_action", {}).get("rerun_failed_tasks", 0) >= 50:
+        proposals.append({
+            "id": f"override_server_noise_{today}",
+            "risk": "LOW",
+            "title": "OptionsEdge-OverrideServer keeps re-failing",
+            "rationale": f"rerun_failed_tasks fired "
+                         f"{hm['by_action']['rerun_failed_tasks']} times today.",
+            "suggested_action": "Either fix the OverrideServer crash root "
+                                "cause or remove it from health_check's "
+                                "scheduled_tasks watch list.",
+        })
+
+    # 6. Universe staleness — are we capturing universe data yet?
+    snap_today = list((REPO_ROOT / "snapshots").glob(f"{today}*.json"))
+    if snap_today:
+        try:
+            last_snap = json.loads(snap_today[-1].read_text(encoding="utf-8"))
+            uni_n = len(last_snap.get("universe", []))
+            tr_n = len(last_snap.get("trades", []))
+            if uni_n == 0 and tr_n > 0:
+                proposals.append({
+                    "id": f"universe_capture_missing_{today}",
+                    "risk": "LOW",
+                    "title": "Today's snapshot has no `universe` field",
+                    "rationale": "snapshot.py was patched 2026-04-30 but today's "
+                                 "snapshot was generated before the deploy.",
+                    "suggested_action": "Verify the deployed snapshot.py and confirm "
+                                        "tomorrow's snapshot includes universe.",
+                })
+        except Exception:
+            pass
+
+    return proposals
+
+
+# ── Markdown rendering ──────────────────────────────────────────────────────
+
+def render_markdown(report: dict, proposals: list[dict]) -> str:
+    today = report["today"]
+    lines = [f"# Options Edge — EOD analysis {today}", ""]
+    eq = report.get("equity")
+    rl = report.get("realized_pl", 0)
+    ur = report.get("unrealized_pl", 0)
+    lines.append(f"## P&L")
+    lines.append(f"- Equity at close: **${eq:,.2f}**" if eq else "- Equity: n/a")
+    lines.append(f"- Realized today: **${rl:+,.2f}**")
+    lines.append(f"- Unrealized open: **${ur:+,.2f}**")
+    lines.append(f"- Combined: **${rl + ur:+,.2f}**")
+    lines.append("")
+
+    # Pipelines
+    pp = report.get("pipelines", {})
+    if pp:
+        lines.append("## Per-pipeline")
+        lines.append("| Pipeline | Entries | Exits | Realized P&L |")
+        lines.append("|---|---|---|---|")
+        for k in ("divergence", "scorer"):
+            d = pp.get(k, {})
+            lines.append(f"| {k} | {d.get('entries', 0)} | {d.get('exits', 0)} | "
+                         f"${d.get('realized_pl', 0):+.0f} |")
+        lines.append("")
+
+    # Today's entries / exits
+    if report.get("entries"):
+        lines.append("## Entries today")
+        lines.append("| Time | OCC | Score | Sig | Qty | Cost | Tier |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for e in report["entries"]:
+            lines.append(f"| {e['ts']} | `{e['occ']}` | {e.get('score','?')} | "
+                         f"{e.get('signal','-')} | {e.get('qty','?')} | "
+                         f"${e.get('cost', 0):.0f} | {e.get('tag', '-')} |")
+        lines.append("")
+
+    if report.get("exits_filled"):
+        lines.append("## Exits filled today")
+        lines.append("| OCC | Entered | Entry | Exit | P&L | Reason |")
+        lines.append("|---|---|---|---|---|---|")
+        for x in report["exits_filled"]:
+            ep = x.get("entry"); xp = x.get("exit"); pl = x.get("pl")
+            ep_s = f"${ep:.2f}" if _isnum(ep) else "-"
+            xp_s = f"${xp:.2f}" if _isnum(xp) else "-"
+            pl_s = f"${pl:+.0f}" if _isnum(pl) else "-"
+            reason = (x.get('reason') or '')[:50]
+            lines.append(f"| `{x['occ']}` | {x['entry_date']} | {ep_s} | "
+                         f"{xp_s} | {pl_s} | {reason} |")
+        lines.append("")
+
+    if report.get("queued_exits"):
+        lines.append("## Queued exits (will fire next session open)")
+        for q in report["queued_exits"]:
+            lines.append(f"- `{q['occ']}` — entry {q['entry_date']}, "
+                         f"reason: {q.get('reason','-')}")
+        lines.append("")
+
+    if report.get("still_open"):
+        lines.append("## Still-open positions")
+        lines.append("| OCC | Entered | Entry | Score | Qty | Status |")
+        lines.append("|---|---|---|---|---|---|")
+        for o in report["still_open"]:
+            lines.append(f"| `{o['occ']}` | {o['entry_date']} | "
+                         f"${o.get('entry', 0):.2f} | {o.get('score','?')} | "
+                         f"{o.get('qty','?')} | {o.get('status')} |")
+        lines.append("")
+
+    # Filter activity
+    fe = report.get("filter_effectiveness", {})
+    if fe.get("total_skips", 0):
+        lines.append("## Filter activity")
+        lines.append(f"- Total skips: **{fe['total_skips']}**")
+        for r, n in fe.get("by_reason", {}).items():
+            if n > 0:
+                lines.append(f"  - {r}: {n}")
+        if fe.get("by_symbol"):
+            top = list(fe["by_symbol"].items())[:5]
+            lines.append(f"- Most-blocked: " +
+                         ", ".join(f"`{s}` ({n})" for s, n in top))
+        lines.append("")
+
+    # Backtests
+    bt = report.get("backtests", {})
+    if bt.get("scorer") or bt.get("sentinel_events"):
+        lines.append("## Cumulative backtests")
+        sc = bt.get("scorer", {})
+        if sc.get("n_trades") is not None:
+            lines.append(f"- Scorer (5d hold): n={sc['n_trades']} "
+                         f"win={sc.get('win_rate',0):.1%} "
+                         f"mean={sc.get('mean_dir_return_pct',0):+.2f}% "
+                         f"rho={sc.get('spearman_score_vs_return') or '?'}")
+        se = bt.get("sentinel_events", {})
+        for k in ("divergence", "news", "social"):
+            d = se.get(k, {})
+            if d.get("n", 0):
+                lines.append(f"- {k}: n={d['n']} win={d.get('win_rate',0):.1%} "
+                             f"mean={d.get('mean',0):+.2f}%")
+        lines.append("")
+
+    # Health
+    hm = report.get("health", {})
+    if hm:
+        lines.append("## Health monitor activity")
+        lines.append(f"- Remediations fired: {hm.get('remediations', 0)}")
+        for action, n in (hm.get("by_action") or {}).items():
+            lines.append(f"  - {action}: {n}")
+        if hm.get("open_proposals"):
+            lines.append(f"- Open anomaly_classifier proposals: "
+                         f"{hm['open_proposals']}")
+        lines.append("")
+
+    # PROPOSALS — the part the user actually wants when they get home
+    lines.append("## Proposals for review")
+    if not proposals:
+        lines.append("_No proposals today._")
+    else:
+        for p in proposals:
+            lines.append(f"### [{p['risk']}] {p['title']}")
+            lines.append(f"- Rationale: {p['rationale']}")
+            lines.append(f"- Suggested action: {p['suggested_action']}")
+            lines.append(f"- Proposal id: `{p['id']}`")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_telegram_summary(report: dict, proposals: list[dict]) -> str:
+    rl = report.get("realized_pl", 0)
+    ur = report.get("unrealized_pl", 0)
+    eq = report.get("equity")
+    eq_str = f"${eq:,.0f}" if eq else "n/a"
+    head = (
+        f"EOD {report['today']}\n"
+        f"Equity {eq_str}  realized ${rl:+.0f}  unrealized ${ur:+.0f}\n"
+        f"Entries: {len(report.get('entries', []))}  "
+        f"Exits filled: {len(report.get('exits_filled', []))}\n"
+        f"Queued exits: {len(report.get('queued_exits', []))}\n"
+    )
+    if not proposals:
+        return head + "\nNo proposals — quiet day."
+    n_high = sum(1 for p in proposals if p["risk"] == "HIGH")
+    n_med = sum(1 for p in proposals if p["risk"] == "MED")
+    n_low = sum(1 for p in proposals if p["risk"] == "LOW")
+    head += f"\nProposals: {len(proposals)} ({n_high} HIGH, {n_med} MED, {n_low} LOW)\n"
+    head += "Top:\n"
+    for p in proposals[:3]:
+        head += f"- [{p['risk']}] {p['title']}\n"
+    head += "\nReply /report for full markdown."
+    return head[:3900]
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def run(target_date: date | None = None) -> dict:
+    today = target_date or date.today()
+    print(f"EOD analysis for {today}")
+
+    report = collect_today_results(today)
+    report["pipelines"] = split_by_pipeline(report.get("entries", []),
+                                             report.get("exits_filled", []))
+    report["filter_effectiveness"] = filter_effectiveness(today)
+    print("  refreshing backtests (~30s)...")
+    report["backtests"] = refresh_backtests()
+    report["health"] = health_activity(today)
+
+    proposals = generate_proposals(report)
+
+    md = render_markdown(report, proposals)
+    md_path = LOG_DIR / f"eod-analysis-{today.isoformat()}.md"
+    md_path.write_text(md, encoding="utf-8")
+
+    prop_path = LOG_DIR / f"eod-proposals-{today.isoformat()}.json"
+    prop_path.write_text(json.dumps(proposals, indent=2, default=str),
+                         encoding="utf-8")
+
+    print(f"  wrote {md_path}")
+    print(f"  wrote {prop_path}")
+    print(f"  {len(proposals)} proposals generated")
+
+    # Telegram summary
+    try:
+        from tools.notify import send
+        summary = render_telegram_summary(report, proposals)
+        send("INFO", f"EOD analysis {today.isoformat()}", summary)
+    except Exception as e:
+        print(f"  notify failed: {e}")
+
+    return {"report": report, "proposals": proposals, "md_path": str(md_path)}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--date", help="YYYY-MM-DD (default today)")
+    args = ap.parse_args()
+    d = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else None
+    run(d)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

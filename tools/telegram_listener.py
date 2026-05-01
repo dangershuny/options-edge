@@ -87,7 +87,9 @@ def cmd_help(args: list[str]) -> str:
         "  /close <OCC>         submit close order\n"
         "  /restart sentinel    restart news server\n"
         "  /restart override    restart override server\n"
-        "  /diagnose            last lines of each runner log"
+        "  /diagnose            last lines of each runner log\n"
+        "  /report [YYYY-MM-DD] today's EOD analysis (or a past day)\n"
+        "  /proposals [date]    proposals from EOD analysis"
     )
 
 
@@ -256,6 +258,48 @@ def cmd_restart(args: list[str]) -> str:
     return f"unknown service: {target} (use sentinel|override)"
 
 
+def cmd_report(args: list[str]) -> str:
+    """Send today's EOD analysis markdown. If a date arg is provided, fetch
+    that day's report instead."""
+    iso = args[0] if args else date.today().isoformat()
+    md = LOG_DIR / f"eod-analysis-{iso}.md"
+    if not md.exists():
+        return (f"no report for {iso} yet. "
+                f"EOD analysis runs at 16:45 ET — "
+                f"or invoke `python -m tools.eod_analysis` directly.")
+    text = md.read_text(encoding="utf-8", errors="replace")
+    # 4096-char telegram cap; prioritize the proposals section
+    if len(text) > 3800:
+        prop_idx = text.find("## Proposals for review")
+        if prop_idx > 0:
+            head = text[:1500]
+            tail = text[prop_idx:prop_idx + 2200]
+            text = head + "\n\n[...]\n\n" + tail
+        else:
+            text = text[:3800]
+    return text
+
+
+def cmd_proposals(args: list[str]) -> str:
+    """List today's structured proposals, one per line."""
+    iso = args[0] if args else date.today().isoformat()
+    pp = LOG_DIR / f"eod-proposals-{iso}.json"
+    if not pp.exists():
+        return f"no proposals for {iso} (eod_analysis hasn't run yet)"
+    try:
+        items = json.loads(pp.read_text(encoding="utf-8"))
+    except Exception as e:
+        return f"could not read proposals: {e}"
+    if not items:
+        return f"no proposals for {iso} — quiet day"
+    lines = [f"{len(items)} proposals for {iso}:"]
+    for p in items:
+        lines.append(f"\n[{p['risk']}] {p['title']}")
+        lines.append(f"  why: {p['rationale']}")
+        lines.append(f"  suggest: {p['suggested_action']}")
+    return "\n".join(lines)[:3800]
+
+
 def cmd_diagnose(args: list[str]) -> str:
     """Tail the most relevant runner logs."""
     today = date.today().isoformat()
@@ -292,6 +336,8 @@ HANDLERS: dict[str, callable] = {
     "/close": cmd_close,
     "/restart": cmd_restart,
     "/diagnose": cmd_diagnose,
+    "/report": cmd_report,
+    "/proposals": cmd_proposals,
 }
 
 
