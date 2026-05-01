@@ -1,35 +1,32 @@
 @echo off
-REM Telegram listener watchdog — invoked every 5 min by scheduler.
-REM If a listener is already running (PID file + tasklist check), exit
-REM cleanly. Otherwise launch a new background instance.
+REM Telegram listener — runs from Startup folder shortcut at login.
+REM Auto-restart loop: if pythonw exits (crash, /restart_listener, /apply
+REM that wants to pick up its own code edits), this bat relaunches it
+REM after a 10s pause. Cap at 50 retries to prevent runaway loops on
+REM misconfigured env.
 
-setlocal enabledelayedexpansion
+setlocal
 set PYTHONIOENCODING=utf-8
 cd /d "C:\Users\dange\Personal_Projects\options-edge-new"
 if not exist logs mkdir logs
 
 set PYTHON=C:\Users\dange\AppData\Local\Programs\Python\Python313\pythonw.exe
-set PIDFILE=logs\telegram_listener.pid
+set RETRIES=0
+set MAX_RETRIES=50
 
-REM Check if previous instance is still alive
-if exist "%PIDFILE%" (
-    set /p OLDPID=<"%PIDFILE%"
-    tasklist /FI "PID eq !OLDPID!" 2>nul | find /I "python" >nul
-    if not errorlevel 1 (
-        echo Already running PID=!OLDPID!, exiting watchdog cleanly. >> logs\telegram-listener.log
-        exit /b 0
-    )
-    REM stale PID file — clear it
-    del "%PIDFILE%" 2>nul
+:retry
+set /a RETRIES=%RETRIES%+1
+echo === telegram listener launched at %DATE% %TIME% (run %RETRIES%/%MAX_RETRIES%) >> logs\telegram-listener.log
+
+"%PYTHON%" -m tools.telegram_listener >> logs\telegram-listener.log 2>&1
+set EXITCODE=%ERRORLEVEL%
+
+echo === listener exited code=%EXITCODE% at %DATE% %TIME%, restart in 10s >> logs\telegram-listener.log
+
+if %RETRIES% GEQ %MAX_RETRIES% (
+    echo === MAX RETRIES, giving up >> logs\telegram-listener.log
+    exit /b 1
 )
 
-REM Launch in the background and capture PID
-echo === watchdog launching listener at %DATE% %TIME% >> logs\telegram-listener.log
-start "" /B "%PYTHON%" -m tools.telegram_listener >> logs\telegram-listener.log 2>&1
-
-REM Get the new pythonw PID — match by command line (best-effort)
-for /f "tokens=2" %%P in ('tasklist /FI "IMAGENAME eq pythonw.exe" /FO TABLE /NH 2^>nul') do (
-    echo %%P > "%PIDFILE%"
-)
-
-exit /b 0
+timeout /t 10 /nobreak > nul
+goto retry

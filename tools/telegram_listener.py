@@ -90,7 +90,9 @@ def cmd_help(args: list[str]) -> str:
         "  /diagnose            last lines of each runner log\n"
         "  /report [YYYY-MM-DD] today's EOD analysis (or a past day)\n"
         "  /proposals [date]    proposals from EOD analysis\n"
-        "  /debug <issue>       spawn Claude (plan mode) to investigate"
+        "  /debug <issue>       spawn Claude (plan mode) to investigate\n"
+        "  /apply [debug-id]    apply the proposal from a /debug (defaults to latest)\n"
+        "  /restart_listener    relaunch the listener to pick up code edits"
     )
 
 
@@ -337,8 +339,8 @@ def cmd_debug(args: list[str]) -> str:
         "Keep total output under 3000 characters."
     )
 
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    log_path = LOG_DIR / f"debug-{ts}.log"
+    debug_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    log_path = LOG_DIR / f"debug-{debug_id}.log"
     try:
         # shell=False, full path: matches momentum-edge's working invocation
         r = subprocess.run(
@@ -359,6 +361,8 @@ def cmd_debug(args: list[str]) -> str:
         f"prompt:\n{prompt}\n\n--- stdout ---\n{out}\n\n--- stderr ---\n{err}\n",
         encoding="utf-8",
     )
+    # Latest pointer so /apply with no args works
+    (LOG_DIR / "debug-latest.txt").write_text(debug_id, encoding="utf-8")
 
     if r.returncode != 0 and not out:
         return f"claude failed rc={r.returncode}\nstderr: {err[:1500]}"
@@ -366,10 +370,126 @@ def cmd_debug(args: list[str]) -> str:
     if not out:
         return f"claude returned empty output (rc={r.returncode}). Check {log_path.name}"
 
-    if len(out) > 3500:
-        return (f"[truncated — full output in {log_path.name}]\n\n"
-                + out[-3300:])
-    return out
+    header = f"debug-id: {debug_id}\nReply /apply to action, /apply {debug_id} to action a specific one.\n\n"
+    body = out
+    if len(out) > 3300:
+        body = "[truncated — full output in " + log_path.name + "]\n\n" + out[-3000:]
+    return header + body
+
+
+def cmd_apply(args: list[str]) -> str:
+    """Apply a previous /debug proposal. Spawns Claude in --permission-mode
+    acceptEdits so it can Edit/Write — but the prompt explicitly forbids
+    Bash side effects (no commits, no test runs). Auth is the same
+    subscription path as /debug.
+
+    Usage:
+      /apply              — apply the most recent /debug
+      /apply <debug-id>   — apply a specific proposal
+    """
+    if args:
+        debug_id = args[0]
+    else:
+        latest = LOG_DIR / "debug-latest.txt"
+        if not latest.exists():
+            return "no previous /debug to apply (run /debug <issue> first)"
+        debug_id = latest.read_text(encoding="utf-8").strip()
+
+    plan_path = LOG_DIR / f"debug-{debug_id}.log"
+    if not plan_path.exists():
+        return f"proposal not found: logs/debug-{debug_id}.log"
+
+    try:
+        plan_text = plan_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"could not read proposal: {e}"
+
+    # Plan mode writes to ~/.claude/plans/ rather than stdout, so the
+    # debug.log only contains the original ISSUE in the prompt section.
+    # /apply re-uses that issue and spawns Claude in acceptEdits mode —
+    # Claude reads, plans, applies in one pass.
+    issue = ""
+    for line in plan_text.splitlines():
+        if line.startswith("Issue:"):
+            issue = line[len("Issue:"):].strip()
+            break
+    if not issue:
+        return f"could not find original issue in {plan_path.name}"
+
+    cli = os.environ.get("CLAUDE_CLI_PATH")
+    if not cli or not os.path.exists(cli):
+        return "CLAUDE_CLI_PATH unset or invalid"
+
+    apply_prompt = (
+        "You previously planned this fix in plan mode. Now APPLY it: read "
+        "the relevant files, make the necessary edits using Edit/Write. "
+        "Do NOT run Bash for anything (no tests, no git commit, no shell "
+        "side effects). Do NOT modify broker/, risk/exits.py, "
+        "risk/config.py, or engine/execute.py without explicitly calling "
+        "that out in your response. After editing, list the files you "
+        "changed and a one-sentence summary of what changed in each.\n\n"
+        f"Original issue (debug-id {debug_id}): {issue}"
+    )
+
+    apply_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    apply_log = LOG_DIR / f"apply-{apply_id}.log"
+
+    try:
+        r = subprocess.run(
+            [cli, "--print", "--permission-mode", "acceptEdits", apply_prompt],
+            cwd=str(REPO_ROOT),
+            capture_output=True, text=True, timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        return f"apply timed out (10 min). Check {apply_log.name}"
+    except Exception as e:
+        return f"apply failed: {type(e).__name__}: {e}"
+
+    out = (r.stdout or "").strip()
+    err = (r.stderr or "").strip()
+    apply_log.write_text(
+        f"prompt:\n{apply_prompt}\n\n--- stdout ---\n{out}\n\n"
+        f"--- stderr ---\n{err}\n",
+        encoding="utf-8",
+    )
+
+    if r.returncode != 0 and not out:
+        return f"apply failed rc={r.returncode}\nstderr: {err[:1500]}"
+
+    # Also surface git diff stat so the user sees what files changed
+    try:
+        diff = subprocess.run(
+            ["git", "diff", "--stat"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=15,
+        )
+        diff_out = (diff.stdout or "").strip()[:1000]
+    except Exception:
+        diff_out = "(git diff unavailable)"
+
+    header = (
+        f"applied debug-id {debug_id}  (apply-id {apply_id})\n"
+        f"Files changed (git diff --stat):\n{diff_out or '(no changes detected)'}\n\n"
+        f"Claude's report:\n"
+    )
+    body = out
+    if len(header) + len(body) > 3500:
+        body = body[-(3500 - len(header) - 50):]
+        body = "[truncated — full in " + apply_log.name + "]\n\n" + body
+    return header + body
+
+
+def cmd_restart_listener(args: list[str]) -> str:
+    """Trigger the listener to exit cleanly. The .bat retry loop relaunches
+    a fresh process within ~10s, picking up any code edits to the listener
+    itself."""
+    import threading
+    def _exit():
+        import time as _time
+        _time.sleep(1)
+        # 0 means "clean exit" — bat retry loop will relaunch
+        os._exit(0)
+    threading.Thread(target=_exit, daemon=True).start()
+    return "listener exiting in 1s; bat will relaunch within ~10s with fresh code"
 
 
 def cmd_diagnose(args: list[str]) -> str:
@@ -411,6 +531,8 @@ HANDLERS: dict[str, callable] = {
     "/report": cmd_report,
     "/proposals": cmd_proposals,
     "/debug": cmd_debug,
+    "/apply": cmd_apply,
+    "/restart_listener": cmd_restart_listener,
 }
 
 
