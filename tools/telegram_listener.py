@@ -303,78 +303,110 @@ def cmd_proposals(args: list[str]) -> str:
     return "\n".join(lines)[:3800]
 
 
+def _send_async_telegram(text: str) -> None:
+    """Send a Telegram message NOT in response to a poll (used by background
+    workers). Same auth as the main reply path."""
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not chat_id or not token:
+        return
+    text = (text or "")[:3900]
+    api = f"https://api.telegram.org/bot{token}"
+    try:
+        from urllib.parse import urlencode as _ue
+        from urllib.request import Request as _Req, urlopen as _uo
+        data = _ue({"chat_id": chat_id, "text": text}).encode("utf-8")
+        _uo(_Req(f"{api}/sendMessage", data=data, method="POST"), timeout=8).read()
+    except Exception as e:
+        _log(f"async send failed: {e}")
+
+
+def _claude_invoke(prompt: str, permission_mode: str, timeout_sec: int) -> tuple[int, str, str]:
+    """Run the claude CLI with stdin-fed prompt + shell=True (matches
+    momentum-edge's pattern that works across scheduled-task / interactive /
+    Startup-folder contexts). Returns (rc, stdout, stderr)."""
+    cli = os.environ.get("CLAUDE_CLI_PATH")
+    if not cli:
+        return -1, "", "CLAUDE_CLI_PATH not set"
+    if not os.path.exists(cli):
+        return -1, "", f"claude CLI not found at {cli}"
+    cli_args = [cli, "--permission-mode", permission_mode,
+                "--add-dir", str(REPO_ROOT), "--print"]
+    try:
+        r = subprocess.run(
+            cli_args,
+            input=prompt,
+            cwd=str(REPO_ROOT),
+            capture_output=True, text=True, timeout=timeout_sec,
+            encoding="utf-8", errors="replace",
+            shell=True,
+        )
+        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return -2, "", f"claude timed out after {timeout_sec}s"
+    except Exception as e:
+        return -3, "", f"{type(e).__name__}: {e}"
+
+
+def _debug_worker(debug_id: str, issue: str) -> None:
+    """Background thread — runs claude (plan mode), sends result via
+    async Telegram message so the main poll loop never blocks."""
+    prompt = (
+        "You are debugging the options-edge trading repo (project root is "
+        "the directory you are in). Diagnose this issue using read-only "
+        "tools (Read, Grep, Glob, Bash for queries — DO NOT edit files, "
+        "do not submit broker orders, do not run destructive commands). "
+        "Be concise.\n\n"
+        f"Issue: {issue}\n\n"
+        "Respond with: (1) what you found, (2) most likely root cause, "
+        "(3) a specific proposed fix with file paths and exact change. "
+        "Keep total output under 3000 characters."
+    )
+    rc, out, err = _claude_invoke(prompt, "plan", 300)
+    log_path = LOG_DIR / f"debug-{debug_id}.log"
+    log_path.write_text(
+        f"prompt:\n{prompt}\n\n--- stdout ---\n{out}\n\n--- stderr ---\n{err}\n",
+        encoding="utf-8",
+    )
+    (LOG_DIR / "debug-latest.txt").write_text(debug_id, encoding="utf-8")
+
+    if rc != 0 and not out:
+        _send_async_telegram(f"debug-{debug_id} failed (rc={rc}):\n{err[:1500]}")
+        return
+    if not out:
+        _send_async_telegram(f"debug-{debug_id} empty output (rc={rc})")
+        return
+
+    header = (f"debug-{debug_id} done.\n"
+              f"Reply /apply or /apply {debug_id} to action.\n\n")
+    body = out if len(out) <= 3300 else (
+        f"[truncated — full output in {log_path.name}]\n\n" + out[-3000:]
+    )
+    _send_async_telegram(header + body)
+
+
 def cmd_debug(args: list[str]) -> str:
-    """Spawn the Claude CLI in --print --permission-mode plan against the
-    options-edge repo. Plan mode means Claude can read/grep/run-bash but
-    cannot edit files or submit broker orders — output is a diagnosis +
-    proposed fix, never an applied change.
-
-    Auth: uses the user's local Claude Code subscription via the CLI's
-    OAuth token cache. No API charges.
-
-    Long output (>3500 chars) is saved to logs/debug-{ts}.log and the
-    last chunk is sent in-line.
-    """
+    """Spawn Claude (plan mode, read-only) on a background thread so the
+    listener keeps polling Telegram during the 30-60s claude takes. Result
+    is delivered as a follow-up message when ready."""
     if not args:
         return ("usage: /debug <describe issue>\n"
                 "example: /debug why is BBAI 5-22 still in 'closing' status "
                 "with no exit fill?")
     issue = " ".join(args).strip()
     cli = os.environ.get("CLAUDE_CLI_PATH")
-    if not cli:
-        return ("CLAUDE_CLI_PATH not set in .env. Add the path to claude.exe "
-                "(forward slashes — dotenv eats backslashes).")
-    if not os.path.exists(cli):
-        return f"claude CLI not found at {cli} (env says exists=False)"
-
-    prompt = (
-        "You are debugging the options-edge trading repo (the directory "
-        "you are currently in is the project root). Diagnose this issue "
-        "using read-only tools (Read, Grep, Glob, Bash for queries — DO "
-        "NOT edit files, do not submit broker orders, do not run "
-        "destructive commands). Be concise.\n\n"
-        f"Issue: {issue}\n\n"
-        "Respond with: (1) what you found, (2) the most likely root cause, "
-        "(3) a specific proposed fix with file paths and the exact change. "
-        "Keep total output under 3000 characters."
-    )
+    if not cli or not os.path.exists(cli):
+        return f"CLAUDE_CLI_PATH unset or invalid"
 
     debug_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    log_path = LOG_DIR / f"debug-{debug_id}.log"
-    try:
-        # shell=False, full path: matches momentum-edge's working invocation
-        r = subprocess.run(
-            [cli, "--print", "--permission-mode", "plan", prompt],
-            cwd=str(REPO_ROOT),
-            capture_output=True, text=True, timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        return "claude timed out after 5 minutes — try a more specific issue"
-    except FileNotFoundError as e:
-        return f"could not invoke claude: {e}"
-    except Exception as e:
-        return f"unexpected error: {type(e).__name__}: {e}"
-
-    out = (r.stdout or "").strip()
-    err = (r.stderr or "").strip()
-    log_path.write_text(
-        f"prompt:\n{prompt}\n\n--- stdout ---\n{out}\n\n--- stderr ---\n{err}\n",
-        encoding="utf-8",
-    )
-    # Latest pointer so /apply with no args works
-    (LOG_DIR / "debug-latest.txt").write_text(debug_id, encoding="utf-8")
-
-    if r.returncode != 0 and not out:
-        return f"claude failed rc={r.returncode}\nstderr: {err[:1500]}"
-
-    if not out:
-        return f"claude returned empty output (rc={r.returncode}). Check {log_path.name}"
-
-    header = f"debug-id: {debug_id}\nReply /apply to action, /apply {debug_id} to action a specific one.\n\n"
-    body = out
-    if len(out) > 3300:
-        body = "[truncated — full output in " + log_path.name + "]\n\n" + out[-3000:]
-    return header + body
+    import threading
+    threading.Thread(
+        target=_debug_worker, args=(debug_id, issue),
+        daemon=True, name=f"debug-{debug_id}",
+    ).start()
+    return (f"debug-{debug_id} started (Claude plan mode, ~30-60s).\n"
+            f"You'll get a follow-up message with the diagnosis. The listener "
+            f"stays responsive — other commands still work in the meantime.")
 
 
 def cmd_apply(args: list[str]) -> str:
@@ -416,10 +448,6 @@ def cmd_apply(args: list[str]) -> str:
     if not issue:
         return f"could not find original issue in {plan_path.name}"
 
-    cli = os.environ.get("CLAUDE_CLI_PATH")
-    if not cli or not os.path.exists(cli):
-        return "CLAUDE_CLI_PATH unset or invalid"
-
     apply_prompt = (
         "You previously planned this fix in plan mode. Now APPLY it: read "
         "the relevant files, make the necessary edits using Edit/Write. "
@@ -430,33 +458,30 @@ def cmd_apply(args: list[str]) -> str:
         "changed and a one-sentence summary of what changed in each.\n\n"
         f"Original issue (debug-id {debug_id}): {issue}"
     )
-
     apply_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+    import threading
+    threading.Thread(
+        target=_apply_worker,
+        args=(debug_id, apply_id, apply_prompt),
+        daemon=True, name=f"apply-{apply_id}",
+    ).start()
+    return (f"apply-{apply_id} started (Claude acceptEdits mode, ~30-60s).\n"
+            f"You'll get a follow-up message with the diff and Claude's report.")
+
+
+def _apply_worker(debug_id: str, apply_id: str, apply_prompt: str) -> None:
+    rc, out, err = _claude_invoke(apply_prompt, "acceptEdits", 600)
     apply_log = LOG_DIR / f"apply-{apply_id}.log"
-
-    try:
-        r = subprocess.run(
-            [cli, "--print", "--permission-mode", "acceptEdits", apply_prompt],
-            cwd=str(REPO_ROOT),
-            capture_output=True, text=True, timeout=600,
-        )
-    except subprocess.TimeoutExpired:
-        return f"apply timed out (10 min). Check {apply_log.name}"
-    except Exception as e:
-        return f"apply failed: {type(e).__name__}: {e}"
-
-    out = (r.stdout or "").strip()
-    err = (r.stderr or "").strip()
     apply_log.write_text(
         f"prompt:\n{apply_prompt}\n\n--- stdout ---\n{out}\n\n"
         f"--- stderr ---\n{err}\n",
         encoding="utf-8",
     )
+    if rc != 0 and not out:
+        _send_async_telegram(f"apply-{apply_id} failed (rc={rc}):\n{err[:1500]}")
+        return
 
-    if r.returncode != 0 and not out:
-        return f"apply failed rc={r.returncode}\nstderr: {err[:1500]}"
-
-    # Also surface git diff stat so the user sees what files changed
     try:
         diff = subprocess.run(
             ["git", "diff", "--stat"],
@@ -467,15 +492,15 @@ def cmd_apply(args: list[str]) -> str:
         diff_out = "(git diff unavailable)"
 
     header = (
-        f"applied debug-id {debug_id}  (apply-id {apply_id})\n"
-        f"Files changed (git diff --stat):\n{diff_out or '(no changes detected)'}\n\n"
+        f"apply-{apply_id} done (debug-id {debug_id})\n"
+        f"git diff --stat:\n{diff_out or '(no changes)'}\n\n"
         f"Claude's report:\n"
     )
     body = out
     if len(header) + len(body) > 3500:
         body = body[-(3500 - len(header) - 50):]
-        body = "[truncated — full in " + apply_log.name + "]\n\n" + body
-    return header + body
+        body = f"[truncated — full in {apply_log.name}]\n\n" + body
+    _send_async_telegram(header + body)
 
 
 def cmd_restart_listener(args: list[str]) -> str:
@@ -554,8 +579,57 @@ def _save_offset(offset: int) -> None:
         pass
 
 
+# Aliases for phone-autocorrect mangled inputs (no slash, capitalized,
+# truncated). Maps the FIRST WORD lowercased (without slash) to the
+# canonical command. Today's listener log showed user typed "Restart",
+# "Sentinel", "Po", "Refresh", "Fix" — all autocorrect failures.
+_ALIASES = {
+    "restart": "/restart",
+    "halt": "/halt",
+    "resume": "/resume",
+    "positions": "/positions",
+    "po": "/positions",
+    "pos": "/positions",
+    "refresh": "/health",
+    "health": "/health",
+    "fix": "/debug",
+    "debug": "/debug",
+    "apply": "/apply",
+    "report": "/report",
+    "proposals": "/proposals",
+    "diagnose": "/diagnose",
+    "help": "/help",
+    "close": "/close",
+    "cancel": "/cancel",
+    "blacklist": "/blacklist",
+    "sentinel": "/restart sentinel",
+}
+
+
+def _normalize(text: str) -> str:
+    """Map phone-mangled inputs to canonical commands.
+    - 'Restart' -> '/restart' (capitalization + missing slash)
+    - 'po' -> '/positions' (autocorrect-truncated)
+    - leaves valid '/foo' commands untouched
+    """
+    if not text:
+        return text
+    if text.startswith("/"):
+        return text  # already a command
+    first = text.split(maxsplit=1)[0].lower()
+    if first in _ALIASES:
+        rest = text.split(maxsplit=1)[1] if " " in text else ""
+        canonical = _ALIASES[first]
+        return canonical + ((" " + rest) if rest else "")
+    return text
+
+
 def _dispatch(text: str) -> str:
-    parts = shlex.split(text)
+    text = _normalize(text)
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        parts = text.split()
     if not parts:
         return "(empty)"
     cmd = parts[0].lower()
@@ -569,11 +643,43 @@ def _dispatch(text: str) -> str:
         return f"handler error in {cmd}:\n{traceback.format_exc()[-1500:]}"
 
 
+def _register_bot_commands() -> None:
+    """Telegram setMyCommands — populates the / menu in the chat client so
+    the user can tap commands instead of typing (avoids autocorrect mangling
+    underscores/case). Idempotent; safe to call on every listener start."""
+    cmds = [
+        {"command": "help", "description": "list all commands"},
+        {"command": "positions", "description": "open positions + P&L"},
+        {"command": "health", "description": "12-check audit"},
+        {"command": "halt", "description": "stop new entries today"},
+        {"command": "resume", "description": "clear halt"},
+        {"command": "blacklist", "description": "skip OCC today: /blacklist NKE..."},
+        {"command": "cancel", "description": "cancel order: /cancel OCC|all"},
+        {"command": "close", "description": "submit close: /close OCC"},
+        {"command": "restart", "description": "/restart sentinel | override"},
+        {"command": "diagnose", "description": "tail of runner logs"},
+        {"command": "report", "description": "EOD analysis markdown"},
+        {"command": "proposals", "description": "EOD proposals list"},
+        {"command": "debug", "description": "Claude plan-mode investigation"},
+        {"command": "apply", "description": "Claude applies the latest /debug"},
+        {"command": "restart_listener", "description": "reload listener code"},
+    ]
+    try:
+        from urllib.parse import urlencode as _ue
+        from urllib.request import Request as _Req, urlopen as _uo
+        data = _ue({"commands": json.dumps(cmds)}).encode("utf-8")
+        _uo(_Req(f"{API}/setMyCommands", data=data, method="POST"), timeout=8).read()
+        _log(f"registered {len(cmds)} bot commands with Telegram")
+    except Exception as e:
+        _log(f"setMyCommands failed (non-fatal): {e}")
+
+
 def main() -> int:
     if not TOKEN or not CHAT_ID:
         _log("missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
         return 2
 
+    _register_bot_commands()
     _log(f"listener starting; chat_id={CHAT_ID}")
     offset = _load_offset()
     backoff = 1

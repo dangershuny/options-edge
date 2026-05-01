@@ -153,25 +153,38 @@ def pick_contract_for_ticker(ticker: str, target_type: str,
 
 def submit_picks(picks: list[dict], dry_run: bool = True) -> list[dict]:
     """Send picks through paper_trade-style submission. Each pick must include
-    `occ_ready` keyed on the contract we want to buy."""
+    `occ_ready` keyed on the contract we want to buy.
+
+    IMPORTANT: also appends each result to logs/paper_trades.jsonl so the
+    EOD analysis (which reads that file for per-pipeline P&L) sees
+    divergence-driven entries. tools/paper_trade.py only writes to that
+    file from its run() wrapper, which we bypass here."""
     from broker import alpaca
     from tools.paper_trade import _execute_trade
+    paper_log = REPO_ROOT / "logs" / "paper_trades.jsonl"
+    paper_log.parent.mkdir(parents=True, exist_ok=True)
     submitted = []
     for p in picks:
         if "occ_ready" not in p:
             continue
         trade = dict(p["occ_ready"])
-        # paper_trade._execute_trade expects 'option_type' at top level + score
         trade.setdefault("option_type", trade.get("option_type"))
         try:
             res = _execute_trade(
                 broker=alpaca,
                 trade=trade,
-                bankroll_remaining=300.0,        # per-pick cap
+                bankroll_remaining=300.0,
                 dry_run=dry_run,
                 max_per_trade=300.0,
                 tag=f"divergence-{date.today().isoformat()}",
             )
+            # Append to paper_trades.jsonl in the same shape paper_trade.run()
+            # writes — so EOD analysis sees divergence entries
+            try:
+                with paper_log.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(res, default=str) + "\n")
+            except Exception as e:
+                res["jsonl_warning"] = f"paper_trades.jsonl append failed: {e}"
             submitted.append({"ticker": p["ticker"], **res})
         except Exception as e:
             submitted.append({"ticker": p["ticker"], "status": "failed", "error": str(e)})
