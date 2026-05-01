@@ -140,6 +140,29 @@ def run_and_save(tickers: list[str] | None = None,
         "trades": [],
     }
 
+    # ── Universe-wide capture for unbiased backtesting ────────────────────────
+    # `trades` below is the SCORER-PASSED subset (BUY VOL / FLOW BUY).
+    # `universe` captures every analyzed contract regardless of vol_signal so
+    # downstream backtests can compare scorer-picks against ones we passed on.
+    # Without this, backtest stats are conditional on the scorer's choice and
+    # we can't measure "what's the win rate of trades the scorer rejected?".
+    universe_rows: list[dict] = []
+    _UNIVERSE_FIELDS = (
+        "symbol", "type", "strike", "expiry", "dte", "action", "vol_signal",
+        "stock_price", "bid", "ask", "entry_price", "iv_pct", "rv_pct",
+        "iv_rv_spread", "score", "flow_signal", "gex_signal", "skew_signal",
+        "iv_rank_label", "sentiment_delta", "news_drift_delta", "news_event",
+        "news_event_headline", "news_event_residual_pct", "news_event_hours_elapsed",
+        "insider_delta", "short_delta", "blocks_delta", "catalyst_delta", "pin_delta",
+        "insider_signal", "short_signal", "blocks_signal", "catalyst_summary",
+        "pin_risk", "rsi_14", "rsi_zone", "rsi_delta", "max_loss_per_contract",
+        "is_directional_setup", "is_momentum_setup", "is_reversion_setup",
+    )
+    for _, row in df_all.iterrows():
+        u = {f: row.get(f) for f in _UNIVERSE_FIELDS if f in row.index}
+        universe_rows.append(u)
+    snapshot["universe"] = universe_rows
+
     # Log BUY VOL and FLOW BUY — no naked/spread selling
     for _, row in df_all[df_all["vol_signal"].isin(["BUY VOL", "FLOW BUY"])].iterrows():
         trade = {
