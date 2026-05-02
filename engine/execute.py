@@ -579,6 +579,10 @@ def main():
     ap.add_argument("--monitor-once", action="store_true",
                     help="run a single monitor_tick (SL/trailing/theta scan) and exit "
                          "(intended for cron-style scheduling every N minutes)")
+    ap.add_argument("--monitor-only", action="store_true",
+                    help="skip morning_session — go straight to the monitor loop "
+                         "using --monitor-seconds N. Used by the daemon launcher "
+                         "since MorningAutoRun handles entries on its own schedule.")
     args = ap.parse_args()
 
     init_db()
@@ -595,10 +599,17 @@ def main():
         monitor_tick()
         return
 
-    morning_session(dry_run=args.dry_run)
-
-    if args.morning_only or args.dry_run:
-        return
+    # --monitor-only: skip morning_session entirely. Lets the daemon launch
+    # ahead of MorningAutoRun without re-doing the morning's entry work.
+    if args.monitor_only:
+        if args.monitor_seconds <= 0:
+            print("--monitor-only requires --monitor-seconds N (e.g., 15)")
+            return 2
+        # fall through to the monitor loop below
+    else:
+        morning_session(dry_run=args.dry_run)
+        if args.morning_only or args.dry_run:
+            return
 
     if args.monitor_seconds > 0:
         news_interval = int(RISK.get("news_check_interval_seconds", 600))
