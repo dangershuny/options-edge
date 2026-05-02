@@ -606,22 +606,126 @@ _ALIASES = {
 }
 
 
+# Stripped-alphanumeric index of canonical commands. Lets us match
+# "/restartlistener" or "Restart Listener" or "RESTARTLISTENER" against
+# the canonical "/restart_listener" by collapsing both sides to letters
+# and digits only.
+import re as _re_mod
+
+def _strip_alnum(s: str) -> str:
+    return _re_mod.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def _build_handlers_stripped() -> dict[str, str]:
+    return {_strip_alnum(k): k for k in HANDLERS}
+
+
+# Some compound commands also need single-token alias entries. Pre-computed
+# at import; rebuilt by _resolve_command on first call to ensure HANDLERS
+# is populated.
+_HANDLERS_STRIPPED: dict[str, str] = {}
+
+
+def _resolve_command(raw_first_token: str) -> str | None:
+    """Try to resolve a user-typed first token to a canonical command in
+    HANDLERS. Returns the canonical key (e.g., '/restart_listener') or None.
+
+    Resolution order:
+      1. Exact match on HANDLERS (with or without leading slash)
+      2. Lowercased exact match
+      3. Stripped-alphanumeric fuzzy match (handles autocorrect-stripped
+         underscores, lost case, missing slash, double slashes, etc.)
+      4. Alias map for short forms ('po' -> '/positions')
+    """
+    global _HANDLERS_STRIPPED
+    if not _HANDLERS_STRIPPED:
+        _HANDLERS_STRIPPED = _build_handlers_stripped()
+
+    if not raw_first_token:
+        return None
+
+    t = raw_first_token.lower()
+
+    # 1. Exact match
+    if t in HANDLERS:
+        return t
+
+    # 2. Add leading slash if missing
+    if not t.startswith("/"):
+        if "/" + t in HANDLERS:
+            return "/" + t
+
+    # 3. Stripped-alphanumeric fuzzy match — kills underscores, slashes,
+    # punctuation, case differences, hyphens. So 'restartlistener',
+    # '/Restart-Listener', 'RESTART_LISTENER', 'restart listener'-without-space
+    # all resolve.
+    stripped = _strip_alnum(t)
+    if stripped:
+        canonical = _HANDLERS_STRIPPED.get(stripped)
+        if canonical:
+            return canonical
+
+    # 4. Alias map (short forms)
+    if t in _ALIASES:
+        return _ALIASES[t]
+    bare = t.lstrip("/")
+    if bare in _ALIASES:
+        return _ALIASES[bare]
+
+    return None
+
+
 def _normalize(text: str) -> str:
-    """Map phone-mangled inputs to canonical commands.
-    - 'Restart' -> '/restart' (capitalization + missing slash)
-    - 'po' -> '/positions' (autocorrect-truncated)
-    - leaves valid '/foo' commands untouched
+    """Map phone-mangled inputs to canonical commands. Handles every form of
+    phone autocorrect mangling we've seen:
+      'Restart'            -> '/restart'
+      'Restart Listener'   -> '/restart_listener'  (space ate underscore)
+      'restart_listener'   -> '/restart_listener'
+      'restartlistener'    -> '/restart_listener'
+      'RESTART LISTENER'   -> '/restart_listener'
+      '/po'                -> '/positions'        (alias map)
+      '/restart sentinel'  -> '/restart sentinel' (preserves valid sub-args)
+
+    Strategy: longest-prefix match first. If 'restart sentinel' has a
+    canonical, use it. Otherwise fall back to 'restart' as command +
+    'sentinel' as arg. Also tries alias map for short forms.
     """
     if not text:
         return text
-    if text.startswith("/"):
-        return text  # already a command
-    first = text.split(maxsplit=1)[0].lower()
+    text = text.strip()
+
+    global _HANDLERS_STRIPPED
+    if not _HANDLERS_STRIPPED:
+        _HANDLERS_STRIPPED = _build_handlers_stripped()
+
+    parts = text.split()
+    if not parts:
+        return text
+
+    # Try matching prefixes from LONGEST to SHORTEST against the
+    # stripped-alphanumeric index of canonical commands. This way:
+    #   'Restart Listener'  -> tries 'RestartListener' first  -> matches
+    #                                                           '/restart_listener'
+    #   '/restart sentinel' -> tries 'restartsentinel' first  -> miss
+    #                       -> falls back to '/restart' + 'sentinel'
+    for n in range(len(parts), 0, -1):
+        prefix = " ".join(parts[:n])
+        ps = _strip_alnum(prefix)
+        if not ps:
+            continue
+        canonical = _HANDLERS_STRIPPED.get(ps)
+        if canonical:
+            rest = " ".join(parts[n:])
+            return canonical + ((" " + rest) if rest else "")
+
+    # Alias map for short forms ('po', 'pos', etc.)
+    first = parts[0].lower().lstrip("/")
     if first in _ALIASES:
-        rest = text.split(maxsplit=1)[1] if " " in text else ""
+        rest = " ".join(parts[1:])
         canonical = _ALIASES[first]
         return canonical + ((" " + rest) if rest else "")
-    return text
+
+    return text  # let _dispatch surface "unknown command"
 
 
 def _dispatch(text: str) -> str:
@@ -632,9 +736,19 @@ def _dispatch(text: str) -> str:
         parts = text.split()
     if not parts:
         return "(empty)"
+
     cmd = parts[0].lower()
     args = parts[1:]
     handler = HANDLERS.get(cmd)
+
+    # Last-ditch fuzzy retry — catches cases where _normalize didn't fire
+    # (e.g., new HANDLERS added without alias updates).
+    if handler is None:
+        canonical = _resolve_command(cmd)
+        if canonical:
+            handler = HANDLERS.get(canonical)
+            cmd = canonical
+
     if handler is None:
         return f"unknown command: {cmd}\n\n" + cmd_help([])
     try:
