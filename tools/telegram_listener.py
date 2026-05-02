@@ -339,6 +339,8 @@ def _claude_invoke(prompt: str, permission_mode: str, timeout_sec: int) -> tuple
         return -1, "", "CLAUDE_CLI_PATH not set in .env"
     cli_args = [cli, "--permission-mode", permission_mode,
                 "--add-dir", str(REPO_ROOT), "--print"]
+    _log(f"  _claude_invoke cli_args={cli_args!r}")
+    _log(f"  _claude_invoke cwd={REPO_ROOT!r}")
     try:
         r = subprocess.run(
             cli_args,
@@ -348,10 +350,13 @@ def _claude_invoke(prompt: str, permission_mode: str, timeout_sec: int) -> tuple
             encoding="utf-8", errors="replace",
             shell=True,
         )
+        _log(f"  _claude_invoke rc={r.returncode} stdout_len={len(r.stdout or '')} stderr={(r.stderr or '')[:300]!r}")
         return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
     except subprocess.TimeoutExpired:
+        _log(f"  _claude_invoke TIMEOUT after {timeout_sec}s")
         return -2, "", f"claude timed out after {timeout_sec}s"
     except Exception as e:
+        _log(f"  _claude_invoke EXCEPTION {type(e).__name__}: {e}")
         return -3, "", f"{type(e).__name__}: {e}"
 
 
@@ -808,6 +813,28 @@ def main() -> int:
     _ccp = os.environ.get("CLAUDE_CLI_PATH") or ""
     _log(f"listener starting; chat_id={CHAT_ID}  "
          f"claude_cli={'set (' + str(len(_ccp)) + ' chars)' if _ccp else 'UNSET'}")
+
+    # Self-test multiple claude path variants AT STARTUP so we know which
+    # the listener's process context can actually reach. Helps diagnose
+    # the recurring "system cannot find the path specified" issue.
+    _test_paths = [
+        ("env CLAUDE_CLI_PATH (exe)", _ccp),
+        ("claude.cmd shim",            r"C:\Users\dange\AppData\Roaming\npm\claude.cmd"),
+        ("claude (no ext)",            r"C:\Users\dange\AppData\Roaming\npm\claude"),
+        ("PATH lookup 'claude'",       "claude"),
+    ]
+    for label, path in _test_paths:
+        if not path:
+            continue
+        try:
+            _r = subprocess.run([path, "--version"],
+                                 capture_output=True, text=True, timeout=10,
+                                 shell=True, encoding="utf-8", errors="replace")
+            _log(f"  selftest [{label}]: rc={_r.returncode} "
+                 f"out={(_r.stdout or '').strip()[:60]!r} "
+                 f"err={(_r.stderr or '').strip()[:120]!r}")
+        except Exception as _e:
+            _log(f"  selftest [{label}]: EXCEPTION {type(_e).__name__}: {_e}")
     offset = _load_offset()
     backoff = 1
 
