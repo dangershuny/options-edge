@@ -229,7 +229,12 @@ RISK: dict = {
     # exit trigger. Falls through the same same_day_exit_allowed gate as
     # SL/trailing/theta so cash accounts queue for next session.
     "news_exit_enabled":               True,
-    "news_check_interval_seconds":     600,     # 10 minutes
+    # Tightened 2026-05-02: was 600 (10 min). Daemon now runs at 15s monitor
+    # cadence; news_tick at 5 min keeps the same monitor-to-news ratio momentum-
+    # edge has and shaves 5 min off our reaction time to breaking 8-K / press
+    # releases. Sentinel's finance-aware classifier (Riot-bug fix) keeps
+    # false-positive risk bounded.
+    "news_check_interval_seconds":     300,     # 5 minutes
     "news_sentiment_adverse_cutoff":   -0.45,   # for a long call, treat
                                                 # sentiment ≤ −0.45 as adverse;
                                                 # for a long put, ≥ +0.45.

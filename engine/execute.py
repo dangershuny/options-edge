@@ -477,7 +477,10 @@ def news_tick() -> None:
     """
     if not RISK.get("news_exit_enabled", True):
         return
-    open_positions = list_open()
+    # Filter to status='open' only — positions already in 'closing' have a
+    # SELL submitted (or queued); a duplicate _execute_exit would create a
+    # second SELL order. monitor_tick filters the same way.
+    open_positions = [p for p in list_open() if p["status"] == "open"]
     if not open_positions:
         return
 
