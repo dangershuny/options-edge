@@ -199,7 +199,12 @@ RISK: dict = {
     # Flip to False once the account has margin and PDT tracking is safe,
     # or once cash balance is large enough that unsettled-proceeds timing
     # never matters in practice.
-    "cash_account_no_same_day_exit": True,
+    # Flipped 2026-05-01: SOUN ran +137% intraday and we couldn't capture
+    # any of it because the guard queued every trigger for next session.
+    # Paper account = no GFV consequence; even on live cash, 3 GFVs/year
+    # at <$5k = 90-day cash-only, manageable. Flipping False lets trailing
+    # stops + SLs fire same-day so we can lock in intraday peaks.
+    "cash_account_no_same_day_exit": False,
 
     # Minimum settled cash buffer (as fraction of portfolio) that must
     # remain after each new buy. Prevents accidentally spending unsettled
