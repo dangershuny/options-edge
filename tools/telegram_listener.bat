@@ -1,16 +1,23 @@
 @echo off
 REM Telegram listener — runs from Startup folder shortcut at login.
-REM Auto-restart loop: if pythonw exits (crash, /restart_listener, /apply
-REM that wants to pick up its own code edits), this bat relaunches it
-REM after a 10s pause. Cap at 50 retries to prevent runaway loops on
-REM misconfigured env.
+REM Auto-restart loop: if python exits, wait 10s and relaunch.
+REM
+REM IMPORTANT: uses python.exe (NOT pythonw.exe). pythonw.exe spawns
+REM subprocesses without a console attached, which makes shell=True
+REM subprocess invocations of claude.exe (under %APPDATA%\Roaming\npm)
+REM fail with "the system cannot find the path specified" — even though
+REM the same path is reachable via cmd, bash, and python.exe directly.
+REM This matches momentum-edge's working configuration. The cosmetic
+REM tradeoff is that python.exe attaches a console to the bat process;
+REM the Startup folder shortcut launches with WindowStyle=Hidden so no
+REM console is visible to the user.
 
 setlocal
 set PYTHONIOENCODING=utf-8
 cd /d "C:\Users\dange\Personal_Projects\options-edge-new"
 if not exist logs mkdir logs
 
-set PYTHON=C:\Users\dange\AppData\Local\Programs\Python\Python313\pythonw.exe
+set PYTHON=C:\Users\dange\AppData\Local\Programs\Python\Python313\python.exe
 set RETRIES=0
 set MAX_RETRIES=50
 
