@@ -232,6 +232,61 @@ THETA_DECAY_PCT_TRIGGER = 0.15   # down 15%+
 THETA_DECAY_DTE_TRIGGER = 10     # with <10 DTE remaining
 
 
+# ── Ratchet ladder for profitable options (added 2026-05-01) ─────────────────
+# Trail-stop-only protection at peak * 0.85 was leaving too much on the table
+# at the +50% peak band — would lock in only +27.5% on a +50% move. The ladder
+# below is TIGHTER at modest profit bands (where we want to defend gains
+# aggressively) and looser at outsized winners (where the trail's % distance
+# better matches an option's vol). Effective stop = max of (ladder, trail,
+# entry-time SL) — tightest wins, never loosens.
+#
+# At each tier, when the position's PEAK unrealized profit reaches the trigger,
+# the floor stop ratchets up to the locked level and stays there.
+RATCHET_TIERS_OPTIONS: list[tuple[float, float]] = [
+    # (peak_unrealized_pct, locked_stop_pct)
+    (0.25, -0.05),   # peak +25% → lock at -5%   (was -12% SL)
+    (0.50, +0.30),   # peak +50% → lock at +30%  (USER REQUEST: defend +50%)
+    (0.75, +0.55),   # peak +75% → lock at +55%
+    (1.00, +0.80),   # peak +100% → lock at +80%
+    (1.50, +1.20),   # peak +150% → lock at +120%
+    (2.00, +1.65),   # peak +200% → lock at +165%
+    (3.00, +2.50),   # peak +300% → lock at +250%
+]
+
+
+def ratchet_stop_pct(peak_unrealized_pct: float) -> float | None:
+    """
+    Return the locked stop-pct given the peak unrealized profit. The stop
+    is the floor a position must stay ABOVE to keep holding. Returns None
+    if peak hasn't reached the lowest tier (no ratchet contribution).
+    """
+    locked: float | None = None
+    for trigger, stop in RATCHET_TIERS_OPTIONS:
+        if peak_unrealized_pct >= trigger:
+            locked = stop  # walk up tiers; highest tier hit determines lock
+    return locked
+
+
+# ── EOD profit-lock window (added 2026-05-01) ────────────────────────────────
+# At this many minutes before market close, force-flatten any position
+# currently in profit. Captures intraday gains rather than holding overnight
+# where theta + gap risk can erase the profit. Losers ride to the next
+# session under existing rules.
+EOD_PROFIT_LOCK_MINUTES_BEFORE_CLOSE = 5
+
+
+# ── Overnight gap SL reset (added 2026-05-01) ────────────────────────────────
+# If a position gaps DOWN through its SL on the next session's open, the SL
+# becomes irrelevant — we'd panic-sell at the bottom of the spike for max
+# loss. Detection: first monitor tick after a session boundary where pnl_pct
+# is more than GAP_THRESHOLD past the existing SL. On detection, reset SL
+# to (current_pnl_pct - GAP_RESET_BUFFER) so the position has room to settle.
+# Hard floor: never loosen below GAP_HARD_FLOOR.
+GAP_THRESHOLD_PAST_SL = -0.05    # 5% past existing SL = clear gap-down event
+GAP_RESET_BUFFER = -0.05         # new SL = current_pnl - 5%
+GAP_HARD_FLOOR = -0.50           # never reset SL below this; force exit instead
+
+
 def apply_safety_floors(
     score: float,
     dte: int,

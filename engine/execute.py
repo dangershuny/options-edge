@@ -28,7 +28,7 @@ import argparse
 import os
 import sys
 import time as _time
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 
 # Make sure we can import siblings (config_loader, broker, etc.) when invoked
@@ -51,6 +51,8 @@ from risk.checker import check_trade
 from risk.exits import (
     entry_allowed_now, apply_safety_floors, trailing_stop_state,
     should_force_close_theta, same_day_exit_allowed, describe_exit_rule,
+    ratchet_stop_pct, EOD_PROFIT_LOCK_MINUTES_BEFORE_CLOSE,
+    GAP_THRESHOLD_PAST_SL, GAP_RESET_BUFFER, GAP_HARD_FLOOR,
 )
 from risk.sizer import size_trade
 from engine.state import (
@@ -58,6 +60,7 @@ from engine.state import (
     record_close, mark_settlements_settled, unsettled_cash,
     available_cash_for_new_trade, update_peak, OpenPositionRecord,
     mark_closing, revert_to_open, mark_phantom, list_closing,
+    update_sl, record_monitor_check, increment_sl_reset,
 )
 from engine.news_monitor import (
     check_position_news, describe_signal, news_check_due,
@@ -229,6 +232,38 @@ def morning_session(dry_run: bool = False) -> None:
     _log(f"Morning session done. Placed {placed} entries. Remaining cash ${avail:.2f}.")
 
 
+# ── Time-window helpers (added 2026-05-01) ──────────────────────────────────
+
+def _in_eod_profit_lock_window() -> bool:
+    """True if it's a weekday in ET and we're within the EOD profit-lock
+    window (15:55-16:00 ET by default — see EOD_PROFIT_LOCK_MINUTES_BEFORE_CLOSE)."""
+    from zoneinfo import ZoneInfo
+    now = datetime.now(tz=ZoneInfo("America/New_York"))
+    if now.weekday() >= 5:
+        return False
+    close_t = time(16, 0)
+    cutoff_t = time(16 - 0, 0 - 0)  # placeholder, computed below
+    # Compute cutoff: close - N minutes
+    minutes_before = EOD_PROFIT_LOCK_MINUTES_BEFORE_CLOSE
+    cutoff_minutes = (close_t.hour * 60 + close_t.minute) - minutes_before
+    cutoff_t = time(cutoff_minutes // 60, cutoff_minutes % 60)
+    return cutoff_t <= now.time() < close_t
+
+
+def _is_first_check_after_session_break(position: dict) -> bool:
+    """True if last_monitor_check was more than 6 hours ago (covers
+    overnight + weekend gaps). Used by the gap-reset detector."""
+    last = position.get("last_monitor_check")
+    if not last:
+        return False  # no prior check on record — can't tell, don't fire reset
+    try:
+        last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+    except Exception:
+        return False
+    delta = datetime.now(tz=timezone.utc) - last_dt
+    return delta.total_seconds() > 6 * 3600
+
+
 # ── Reconcile engine state with Alpaca truth ─────────────────────────────────
 
 def reconcile_with_broker() -> None:
@@ -344,6 +379,10 @@ def monitor_tick() -> None:
     if not open_positions:
         return
 
+    # Determine if we're inside the EOD profit-lock window (15:55-16:00 ET)
+    eod_lock_active = _in_eod_profit_lock_window()
+    today_iso = date.today().isoformat()
+
     for p in open_positions:
         try:
             q = alpaca.get_quote(p["occ_symbol"])
@@ -359,22 +398,70 @@ def monitor_tick() -> None:
         # Update trailing peak
         update_peak(p["id"], mark)
         peak = max(float(p["trailing_peak"] or mark), mark)
+        peak_pnl_pct = (peak / entry) - 1
+
+        # ── Ratchet ladder: tightens SL upward as peak crosses tiers.
+        # Never loosens (update_sl with only_tighter=True).
+        ratchet = ratchet_stop_pct(peak_pnl_pct)
+        if ratchet is not None:
+            current_sl = float(p["sl_pct"]) if p["sl_pct"] is not None else -1.0
+            if ratchet > current_sl:
+                if update_sl(p["id"], ratchet, only_tighter=True):
+                    _log(f"  {p['occ_symbol']}: ratchet promoted SL "
+                         f"{current_sl*100:+.1f}% -> {ratchet*100:+.1f}% "
+                         f"(peak {peak_pnl_pct*100:+.1f}%)")
+                    p["sl_pct"] = ratchet  # use new SL in checks below
+
+        # ── Overnight-gap detector: if pnl is significantly past SL AND the
+        # last monitor check was on a previous session, reset SL once rather
+        # than panic-sell at the gap-down spike. Hard floor at GAP_HARD_FLOOR.
+        sl_pct = float(p["sl_pct"]) if p["sl_pct"] is not None else -0.25
+        breach = pnl_pct <= sl_pct + GAP_THRESHOLD_PAST_SL  # both negative
+        gap_eligible = breach and _is_first_check_after_session_break(p)
+        if gap_eligible and pnl_pct > GAP_HARD_FLOOR:
+            already_reset_today = (p.get("sl_reset_date") == today_iso
+                                    and (p.get("sl_resets_today") or 0) >= 1)
+            if not already_reset_today:
+                new_sl = max(pnl_pct + GAP_RESET_BUFFER, GAP_HARD_FLOOR)
+                update_sl(p["id"], new_sl, only_tighter=False)
+                increment_sl_reset(p["id"], today_iso)
+                _log(f"  {p['occ_symbol']}: GAP-RESET SL {sl_pct*100:+.1f}% "
+                     f"-> {new_sl*100:+.1f}% (gap-open at pnl {pnl_pct*100:+.1f}%, "
+                     f"giving {abs(GAP_RESET_BUFFER)*100:.0f}% buffer)")
+                record_monitor_check(p["id"], datetime.now(tz=timezone.utc).isoformat())
+                continue  # let it settle this tick; normal rules resume next tick
+
+        # ── EOD profit-lock: 5 min before close, force-flatten any winner.
+        # Captures intraday gains rather than holding overnight where theta
+        # + gap risk can erase the profit. Losers ride to next session
+        # under existing rules (gap-reset will protect against bad opens).
+        if eod_lock_active and pnl_pct > 0:
+            _handle_exit_trigger(p, f"EOD profit-lock at {pnl_pct*100:+.1f}% "
+                                    f"({EOD_PROFIT_LOCK_MINUTES_BEFORE_CLOSE}min before close)")
+            record_monitor_check(p["id"], datetime.now(tz=timezone.utc).isoformat())
+            continue
 
         # SL check
         if p["sl_pct"] is not None and pnl_pct <= float(p["sl_pct"]):
             _handle_exit_trigger(p, f"SL {p['sl_pct']*100:+.0f}% hit at {pnl_pct*100:+.1f}%")
+            record_monitor_check(p["id"], datetime.now(tz=timezone.utc).isoformat())
             continue
 
-        # Trailing stop
+        # Trailing stop (kept as a safety net; ratchet usually fires first)
         tr = trailing_stop_state(entry, peak, mark)
         if tr["armed"] and tr["triggered"]:
             _handle_exit_trigger(p, f"trailing stop fired at {pnl_pct*100:+.1f}% "
                                     f"(locked +{tr['locked_in_pct']*100:.1f}%)")
+            record_monitor_check(p["id"], datetime.now(tz=timezone.utc).isoformat())
             continue
 
         # Theta guard (only at close, but cheap to check)
         if should_force_close_theta(pnl_pct, int(p["dte_at_entry"])):
             _handle_exit_trigger(p, f"theta guard: {pnl_pct*100:.1f}% at low DTE")
+            record_monitor_check(p["id"], datetime.now(tz=timezone.utc).isoformat())
+            continue
+
+        record_monitor_check(p["id"], datetime.now(tz=timezone.utc).isoformat())
 
 
 def news_tick() -> None:

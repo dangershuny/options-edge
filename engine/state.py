@@ -125,6 +125,15 @@ def _db() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     with _db() as c:
         c.executescript(_SCHEMA)
+        # Lightweight migrations — add columns added after initial schema.
+        # Idempotent (PRAGMA table_info check).
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(positions)")}
+        if "last_monitor_check" not in cols:
+            c.execute("ALTER TABLE positions ADD COLUMN last_monitor_check TEXT")
+        if "sl_resets_today" not in cols:
+            c.execute("ALTER TABLE positions ADD COLUMN sl_resets_today INTEGER DEFAULT 0")
+        if "sl_reset_date" not in cols:
+            c.execute("ALTER TABLE positions ADD COLUMN sl_reset_date TEXT")
 
 
 # ── Position lifecycle ───────────────────────────────────────────────────────
@@ -237,6 +246,56 @@ def update_peak(position_id: int, new_peak: float) -> None:
             "UPDATE positions SET trailing_peak = ? WHERE id = ? "
             "AND (trailing_peak IS NULL OR trailing_peak < ?)",
             (new_peak, position_id, new_peak),
+        )
+
+
+def update_sl(position_id: int, new_sl: float, *, only_tighter: bool = True) -> bool:
+    """
+    Update sl_pct for a position. By default ratchets — only TIGHTENS
+    (raises sl_pct toward 0). Pass only_tighter=False to allow loosening
+    (used by overnight-gap reset which intentionally widens the SL to
+    avoid panic-selling at the gap-down spike).
+    Returns True if the row was updated.
+    """
+    with _db() as c:
+        if only_tighter:
+            cur = c.execute(
+                "UPDATE positions SET sl_pct = ? WHERE id = ? "
+                "AND (sl_pct IS NULL OR sl_pct < ?)",
+                (new_sl, position_id, new_sl),
+            )
+        else:
+            cur = c.execute(
+                "UPDATE positions SET sl_pct = ? WHERE id = ?",
+                (new_sl, position_id),
+            )
+        return cur.rowcount > 0
+
+
+def record_monitor_check(position_id: int, ts_iso: str) -> None:
+    """Stamp last_monitor_check so the gap detector can see how long since
+    the last successful tick on this position."""
+    with _db() as c:
+        c.execute(
+            "UPDATE positions SET last_monitor_check = ? WHERE id = ?",
+            (ts_iso, position_id),
+        )
+
+
+def increment_sl_reset(position_id: int, today_iso: str) -> None:
+    """Bump sl_resets_today counter (zeroed if last reset was a previous day)."""
+    with _db() as c:
+        row = c.execute(
+            "SELECT sl_reset_date, sl_resets_today FROM positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+        if row is None:
+            return
+        prev_date = row["sl_reset_date"]
+        n = (row["sl_resets_today"] or 0) if prev_date == today_iso else 0
+        c.execute(
+            "UPDATE positions SET sl_reset_date = ?, sl_resets_today = ? WHERE id = ?",
+            (today_iso, n + 1, position_id),
         )
 
 
