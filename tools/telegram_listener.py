@@ -324,12 +324,19 @@ def _send_async_telegram(text: str) -> None:
 def _claude_invoke(prompt: str, permission_mode: str, timeout_sec: int) -> tuple[int, str, str]:
     """Run the claude CLI with stdin-fed prompt + shell=True (matches
     momentum-edge's pattern that works across scheduled-task / interactive /
-    Startup-folder contexts). Returns (rc, stdout, stderr)."""
+    Startup-folder contexts). Returns (rc, stdout, stderr).
+
+    Note: we do NOT pre-check os.path.exists(cli). On certain Windows
+    process contexts (the listener's specific token-inheritance chain),
+    direct os.path.exists on files in %APPDATA%\\Roaming\\npm returns
+    False even when the file exists and other process contexts can read
+    it. The subprocess invocation via shell=True routes through cmd.exe
+    which resolves the path correctly regardless. If the path is truly
+    invalid, subprocess will fail with FileNotFoundError or a non-zero
+    rc, surfaced cleanly to the caller."""
     cli = os.environ.get("CLAUDE_CLI_PATH")
     if not cli:
-        return -1, "", "CLAUDE_CLI_PATH not set"
-    if not os.path.exists(cli):
-        return -1, "", f"claude CLI not found at {cli}"
+        return -1, "", "CLAUDE_CLI_PATH not set in .env"
     cli_args = [cli, "--permission-mode", permission_mode,
                 "--add-dir", str(REPO_ROOT), "--print"]
     try:
@@ -395,8 +402,12 @@ def cmd_debug(args: list[str]) -> str:
                 "with no exit fill?")
     issue = " ".join(args).strip()
     cli = os.environ.get("CLAUDE_CLI_PATH")
-    if not cli or not os.path.exists(cli):
-        return f"CLAUDE_CLI_PATH unset or invalid"
+    if not cli:
+        return ("CLAUDE_CLI_PATH not set in .env. Add the path to claude.exe "
+                "(forward slashes — dotenv eats backslashes).")
+    # NOTE: do NOT pre-check os.path.exists(cli). The listener process can
+    # have spurious False here even when the file is reachable via subprocess
+    # shell=True. _claude_invoke handles real failures.
 
     debug_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     import threading
@@ -794,7 +805,9 @@ def main() -> int:
         return 2
 
     _register_bot_commands()
-    _log(f"listener starting; chat_id={CHAT_ID}")
+    _ccp = os.environ.get("CLAUDE_CLI_PATH") or ""
+    _log(f"listener starting; chat_id={CHAT_ID}  "
+         f"claude_cli={'set (' + str(len(_ccp)) + ' chars)' if _ccp else 'UNSET'}")
     offset = _load_offset()
     backoff = 1
 
