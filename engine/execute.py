@@ -627,16 +627,47 @@ def main():
         except Exception as e:
             _log(f"initial news tick error (non-fatal): {e}")
 
+        # ── Clock-check loop with transient-tolerance ─────────────────────────
+        # Bug observed 2026-05-04: daemon launched at 09:30:01 ET, hit
+        # is_open=False at 09:30:26 (transient during opening-bell second),
+        # broke loop, ran eod_session, exited. Monitor never ran the rest
+        # of the session — RIOT queued exit submitted at one stale price
+        # then expired unfilled, SOUN ratchet never promoted from -12%.
+        #
+        # Fix: only break if (a) it's past the explicit close time we know
+        # AND (b) is_open=False persists across multiple consecutive checks.
+        # Transient pre-open / opening-bell / mid-day data hiccups don't
+        # kill the daemon.
+        from zoneinfo import ZoneInfo as _ZoneInfo
+        _NY = _ZoneInfo("America/New_York")
+        consecutive_closed_ticks = 0
+        CLOSED_CONFIRM_TICKS = 4  # must see is_open=False 4 ticks in a row
+        EARLIEST_CLOSE_HOUR_ET = 16  # don't trust closed reports before 16:00 ET
+
         while True:
             try:
                 clock = alpaca.get_clock()
+                now_et = datetime.now(tz=_NY)
+                is_after_close = (now_et.hour >= EARLIEST_CLOSE_HOUR_ET
+                                  or now_et.weekday() >= 5)
                 if not clock.is_open:
-                    _log("Market closed; leaving monitor loop.")
-                    break
-                monitor_tick()
-                if news_check_due(last_news_run):
-                    news_tick()
-                    last_news_run = datetime.now()
+                    consecutive_closed_ticks += 1
+                    if is_after_close and consecutive_closed_ticks >= CLOSED_CONFIRM_TICKS:
+                        _log(f"Market closed (confirmed across "
+                             f"{consecutive_closed_ticks} ticks, ET={now_et.strftime('%H:%M')}); "
+                             f"leaving monitor loop.")
+                        break
+                    # Transient false (pre-open, opening-bell second, mid-day
+                    # data glitch) — keep monitoring.
+                    if consecutive_closed_ticks == 1:
+                        _log(f"clock reports closed at ET={now_et.strftime('%H:%M:%S')}; "
+                             f"continuing (transient or pre-open)")
+                else:
+                    consecutive_closed_ticks = 0  # reset on any open report
+                    monitor_tick()
+                    if news_check_due(last_news_run):
+                        news_tick()
+                        last_news_run = datetime.now()
             except Exception as e:
                 _log(f"monitor error (non-fatal): {e}")
             _time.sleep(args.monitor_seconds)
