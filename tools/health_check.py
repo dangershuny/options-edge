@@ -364,6 +364,65 @@ def check_engine_state_db() -> dict:
 
 # ── Quote staleness on open positions ────────────────────────────────────────
 
+def check_monitor_freshness(stale_threshold_sec: int = 120) -> dict:
+    """
+    CRIT if any 'open' position has last_monitor_check older than
+    stale_threshold_sec during RTH. This catches the 2026-05-04 failure
+    mode where the daemon exited at 09:30:26 and no monitor_tick ran for
+    the rest of the session — positions sat unmonitored for 6.5 hours.
+
+    Triggers the `relaunch_exit_monitor_daemon` remediation if CRIT.
+    """
+    now_et = datetime.now(tz=NY)
+    rth = (now_et.weekday() < 5
+           and datetime.strptime("09:30", "%H:%M").time() <= now_et.time()
+           <= datetime.strptime("16:00", "%H:%M").time())
+    if not rth:
+        return _check("monitor_freshness", OK, detail="outside RTH")
+
+    try:
+        from engine.state import init_db, list_open
+        init_db()
+        opens = [r for r in list_open() if r["status"] == "open"]
+    except Exception as e:
+        return _check("monitor_freshness", WARN, detail=str(e))
+
+    if not opens:
+        return _check("monitor_freshness", OK, count=0)
+
+    now_utc = datetime.now(tz=timezone.utc)
+    stale_positions: list[dict] = []
+    for r in opens:
+        last_str = r.get("last_monitor_check")
+        if not last_str:
+            stale_positions.append({"occ": r["occ_symbol"], "age_sec": -1,
+                                     "reason": "never monitored"})
+            continue
+        try:
+            last_dt = datetime.fromisoformat(str(last_str).replace("Z", "+00:00"))
+        except Exception:
+            stale_positions.append({"occ": r["occ_symbol"], "age_sec": -1,
+                                     "reason": "unparseable timestamp"})
+            continue
+        age_sec = (now_utc - last_dt).total_seconds()
+        if age_sec > stale_threshold_sec:
+            stale_positions.append({
+                "occ": r["occ_symbol"],
+                "age_sec": int(age_sec),
+                "last": last_str,
+            })
+
+    if stale_positions:
+        return _check(
+            "monitor_freshness", CRIT,
+            stale=stale_positions,
+            threshold_sec=stale_threshold_sec,
+            remediation_hint="relaunch_exit_monitor_daemon",
+        )
+    return _check("monitor_freshness", OK, count=len(opens),
+                  oldest_age_sec=max((now_utc - datetime.fromisoformat(str(r["last_monitor_check"]).replace("Z", "+00:00"))).total_seconds() for r in opens if r.get("last_monitor_check")))
+
+
 def check_quote_staleness(threshold_min: float = 5.0) -> dict:
     """Any 'open' position whose last quote is >threshold_min minutes old.
     Only enforced during RTH — quote age is naturally large after-hours."""
@@ -416,6 +475,7 @@ ALL_CHECKS = [
     check_quote_staleness,
     check_scheduled_tasks,
     check_daily_loss_proximity,
+    check_monitor_freshness,   # CRIT if open position unmonitored >120s during RTH
 ]
 
 

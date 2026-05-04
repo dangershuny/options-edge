@@ -48,6 +48,7 @@ COOLDOWNS = {
     "blacklist_contracts_for_today": 3,
     "cancel_and_repost_close": 6,
     "halt_new_buys_for_day": 1,
+    "relaunch_exit_monitor_daemon": 4,  # max 4/hr; daemon should rarely die
 }
 
 
@@ -259,6 +260,28 @@ def cancel_and_repost_close(check: dict, dry_run: bool) -> dict:
     return {"ok": True, "canceled": canceled}
 
 
+def relaunch_exit_monitor_daemon(check: dict, dry_run: bool) -> dict:
+    """Relaunch the ExitMonitor daemon via schtasks /Run. Triggered when
+    monitor_freshness check shows an open position not monitored in 120s+
+    during RTH. This is the safety net for the 2026-05-04 failure where
+    the daemon exited at 09:30:26 and nothing else watched positions for
+    the rest of the session."""
+    if not _cooldown_ok("relaunch_exit_monitor_daemon"):
+        return {"ok": False, "skipped": "cooldown_exhausted"}
+    if dry_run:
+        return {"ok": True, "would": "schtasks /Run OptionsEdge-ExitMonitor"}
+    try:
+        r = subprocess.run(
+            ["schtasks", "/Run", "/TN", "OptionsEdge-ExitMonitor"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return {"ok": r.returncode == 0, "stdout": r.stdout.strip(),
+                "stderr": r.stderr.strip(),
+                "stale_positions": [s.get("occ") for s in check.get("stale", [])]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def halt_new_buys_for_day(check: dict, dry_run: bool) -> dict:
     """Daily-loss cap exceeded — write a halt flag so paper_trade skips."""
     if not _cooldown_ok("halt_new_buys_for_day"):
@@ -286,6 +309,7 @@ REMEDIATIONS: dict[str, Callable[[dict, bool], dict]] = {
     "blacklist_contracts_for_today": blacklist_contracts_for_today,
     "cancel_and_repost_close": cancel_and_repost_close,
     "halt_new_buys_for_day": halt_new_buys_for_day,
+    "relaunch_exit_monitor_daemon": relaunch_exit_monitor_daemon,
 }
 
 
