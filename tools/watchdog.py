@@ -7,7 +7,11 @@ requiring human approval.
 
 Components watched:
   1. ExitMonitor daemon       — drives ratchet/SL/trail/exit firing
-  2. Sentinel server          — divergence detection + news pull
+  2. Sentinel SUPERVISOR      — news_sentinel/supervisor.py, which itself
+                                 supervises server/dashboard/scheduler.
+                                 We do NOT touch the supervisor's children
+                                 directly — that would race against its
+                                 own restart logic.
   3. Telegram listener        — phone command channel
   4. Override server          — manual buy endpoint (8504)
   5. Engine state DB          — auto-vacuum if oversized
@@ -16,7 +20,8 @@ Components watched:
 Recovery actions (no confirmation needed):
   - Process dead    → schtasks /Run the appropriate task OR direct spawn
   - Process hung    → kill + relaunch
-  - Multiple alive  → kill all but one
+  - Multiple alive  → kill all but one (only for processes NOT covered by
+                       a sibling-side singleton lock)
   - DB > 200 MB     → WAL checkpoint + VACUUM
   - Log > 100 MB    → rotate (rename .old, start fresh)
 
@@ -55,14 +60,19 @@ AUDIT_LOG = LOG_DIR / f"watchdog-{date.today().isoformat()}.jsonl"
 
 # Per-action hourly caps (matches auto_remediate cooldown pattern)
 COOLDOWNS_PER_HOUR = {
-    "relaunch_daemon":          6,   # daemon should never die >6×/hr
-    "relaunch_sentinel":        4,
-    "relaunch_listener":        3,
-    "relaunch_override":        3,
-    "kill_duplicate_processes": 4,
-    "vacuum_engine_db":         1,
-    "rotate_logs":              2,
+    "relaunch_daemon":            6,   # daemon should never die >6×/hr
+    "relaunch_sentinel_supervisor": 3, # supervisor should be even rarer
+    "relaunch_listener":          3,
+    "relaunch_override":          3,
+    "kill_duplicate_processes":   4,
+    "vacuum_engine_db":           1,
+    "rotate_logs":                2,
 }
+
+# Path to the Sentinel side's own supervisor + its singleton lock file.
+SENTINEL_DIR = Path(r"C:\Users\dange\OneDrive\Documents\Claude Projects\news_sentinel")
+SENTINEL_SUPERVISOR_PY  = SENTINEL_DIR / "supervisor.py"
+SENTINEL_SUPERVISOR_PID = SENTINEL_DIR / "supervisor.pid"
 
 # How recently the daemon's monitor_tick must have stamped last_monitor_check
 # on every open position before we consider it alive
@@ -254,10 +264,48 @@ def daemon_alive_and_fresh() -> tuple[bool, str]:
     return True, f"daemon alive (pid={procs[0]['pid']}), {len(opens)} positions fresh"
 
 
-def sentinel_alive() -> tuple[bool, str]:
-    if _http_ok("http://localhost:8502/health", SENTINEL_TIMEOUT_SEC):
-        return True, "sentinel /health ok"
-    return False, "sentinel /health unreachable"
+def _sentinel_supervisor_pid_alive() -> int | None:
+    """Return the PID of the live Sentinel supervisor, or None if dead.
+    The supervisor.pid file is written by news_sentinel/supervisor.py and
+    contains the PID of the live supervisor."""
+    try:
+        if not SENTINEL_SUPERVISOR_PID.exists():
+            return None
+        pid = int(SENTINEL_SUPERVISOR_PID.read_text().strip())
+    except Exception:
+        return None
+    # Cross-check via WMI/Get-Process — _list_python_procs is overkill for one PID
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) "
+             "{ 'ALIVE' } else { 'DEAD' }"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if "ALIVE" in (r.stdout or ""):
+            return pid
+    except Exception:
+        pass
+    return None
+
+
+def sentinel_supervisor_alive() -> tuple[bool, str]:
+    """Check the Sentinel supervisor.py — NOT the children. The supervisor
+    owns server.py / dashboard_writer.py / scheduler.py recovery; we just
+    have to ensure the supervisor itself is up.
+
+    Also do a soft /health probe so a totally-dead Sentinel (supervisor
+    alive but server stuck for >90s) gets surfaced in logs. Don't take
+    action on /health alone — supervisor's 30s × 3 misses ≈ 90s detector
+    will handle it before our next pass."""
+    pid = _sentinel_supervisor_pid_alive()
+    if pid is None:
+        return False, "sentinel supervisor.pid missing or stale"
+    health_ok = _http_ok("http://localhost:8502/health", SENTINEL_TIMEOUT_SEC)
+    if health_ok:
+        return True, f"sentinel supervisor alive (pid={pid}); /health ok"
+    return True, (f"sentinel supervisor alive (pid={pid}); /health DOWN — "
+                  "trusting supervisor's 90s detector to restart server")
 
 
 def listener_alive() -> tuple[bool, str]:
@@ -290,31 +338,38 @@ def relaunch_daemon(dry_run: bool) -> dict:
     return {"rc": r.returncode, "stdout": r.stdout.strip(), "stderr": r.stderr.strip()}
 
 
-def relaunch_sentinel(dry_run: bool) -> dict:
-    if not _cooldown_ok("relaunch_sentinel"):
+def relaunch_sentinel_supervisor(dry_run: bool) -> dict:
+    """Restart news_sentinel/supervisor.py. The supervisor itself spawns
+    server.py / dashboard_writer.py / scheduler.py on startup, so we don't
+    need to touch them directly. We deliberately do NOT kill running
+    server/dashboard/scheduler children — if any are alive, the new
+    supervisor will detect them via PID file + port probe and leave them
+    in place."""
+    if not _cooldown_ok("relaunch_sentinel_supervisor"):
         return {"skipped": "cooldown"}
-    # Kill ALL existing sentinel server processes (zombies block port 8502).
-    # Match is specific to server.py inside the news_sentinel folder so we
-    # don't accidentally kill dashboard_writer.py or scheduler.py.
-    sentinel_procs = _list_python_procs(r"news_sentinel\server.py")
-    for p in sentinel_procs:
-        _kill(p["pid"])
+    # Clear stale supervisor.pid if it points to a dead PID — otherwise
+    # the new supervisor will refuse to start under its singleton lock.
+    if SENTINEL_SUPERVISOR_PID.exists() and _sentinel_supervisor_pid_alive() is None:
+        if dry_run:
+            return {"would": "rm stale supervisor.pid + spawn supervisor.py"}
+        try:
+            SENTINEL_SUPERVISOR_PID.unlink()
+        except Exception:
+            pass
     if dry_run:
-        return {"would": "spawn news_sentinel/server.py", "killed": len(sentinel_procs)}
-    time.sleep(2)  # let port release
+        return {"would": "spawn news_sentinel/supervisor.py"}
     python = r"C:\Users\dange\AppData\Local\Programs\Python\Python313\pythonw.exe"
-    sentinel_dir = r"C:\Users\dange\OneDrive\Documents\Claude Projects\news_sentinel"
     try:
         subprocess.Popen(
-            [python, "server.py"],
-            cwd=sentinel_dir,
-            stdout=open(os.path.join(sentinel_dir, "server.log"), "ab"),
-            stderr=open(os.path.join(sentinel_dir, "server-err.log"), "ab"),
+            [python, str(SENTINEL_SUPERVISOR_PY)],
+            cwd=str(SENTINEL_DIR),
+            stdout=open(SENTINEL_DIR / "supervisor.log", "ab"),
+            stderr=open(SENTINEL_DIR / "supervisor-err.log", "ab"),
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008,  # DETACHED_PROCESS
         )
     except Exception as e:
         return {"error": str(e)}
-    return {"ok": True, "killed_zombies": len(sentinel_procs)}
+    return {"ok": True}
 
 
 def relaunch_listener(dry_run: bool) -> dict:
@@ -350,7 +405,15 @@ def kill_duplicate_processes(dry_run: bool) -> dict:
     Kill all but the most recent. Matches must be SPECIFIC enough to avoid
     confusing sibling scripts in the same project (e.g. news_sentinel has
     server.py + dashboard_writer.py + scheduler.py — they are NOT dupes
-    of each other)."""
+    of each other).
+
+    Sentinel children (server/dashboard/scheduler) intentionally NOT in
+    this list — they each have their own singleton-lock PID file
+    (server.py uses port-bind probe, dashboard/scheduler use *.pid). If
+    a duplicate ever does appear there, the Sentinel supervisor or its
+    own re-startup logic will refuse it. Killing here would race with
+    the supervisor's own restart cycle. We do supervise the Sentinel
+    SUPERVISOR itself — it's idempotent under its supervisor.pid lock."""
     if not _cooldown_ok("kill_duplicate_processes"):
         return {"skipped": "cooldown"}
     actions = []
@@ -360,9 +423,7 @@ def kill_duplicate_processes(dry_run: bool) -> dict:
     for label, match, exclude in [
         ("daemon", "--monitor-only", "momentum-edge"),
         ("listener", "tools.telegram_listener", "momentum-edge"),
-        ("sentinel_server", r"news_sentinel\server.py", None),
-        ("sentinel_dashboard_writer", r"news_sentinel\dashboard_writer.py", None),
-        ("sentinel_scheduler", r"news_sentinel\scheduler.py", None),
+        ("sentinel_supervisor", r"news_sentinel\supervisor.py", None),
     ]:
         procs = _list_python_procs(match, must_not_match=exclude)
         if len(procs) <= 1:
@@ -441,13 +502,17 @@ def supervise(dry_run: bool = False) -> dict:
             _audit("relaunch_daemon", "fired", finding=msg, result=r)
             actions_taken.append({"action": "relaunch_daemon", "result": r})
 
-    # 2. Sentinel (always — used by other tasks 24/7)
-    ok, msg = sentinel_alive()
-    findings.append({"component": "sentinel", "ok": ok, "msg": msg})
+    # 2. Sentinel SUPERVISOR (always — owns server/dashboard/scheduler 24/7).
+    # We only restart the supervisor itself; never the children. If the
+    # supervisor is alive we trust its own 90s detector to handle a stuck
+    # /health. If supervisor.pid is dead/missing, we relaunch supervisor.py,
+    # which spawns the children on startup.
+    ok, msg = sentinel_supervisor_alive()
+    findings.append({"component": "sentinel_supervisor", "ok": ok, "msg": msg})
     if not ok:
-        r = relaunch_sentinel(dry_run)
-        _audit("relaunch_sentinel", "fired", finding=msg, result=r)
-        actions_taken.append({"action": "relaunch_sentinel", "result": r})
+        r = relaunch_sentinel_supervisor(dry_run)
+        _audit("relaunch_sentinel_supervisor", "fired", finding=msg, result=r)
+        actions_taken.append({"action": "relaunch_sentinel_supervisor", "result": r})
 
     # 3. Listener (always — user expects /commands 24/7)
     ok, msg = listener_alive()
