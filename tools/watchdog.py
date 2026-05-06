@@ -309,7 +309,7 @@ def sentinel_supervisor_alive() -> tuple[bool, str]:
 
 
 def listener_alive() -> tuple[bool, str]:
-    procs = _list_python_procs("tools.telegram_listener",
+    procs = _list_python_procs("-m tools.telegram_listener",
                                  must_not_match="momentum-edge")
     if not procs:
         return False, "no listener process"
@@ -422,7 +422,7 @@ def kill_duplicate_processes(dry_run: bool) -> dict:
     # process — anything beyond that is a zombie.
     for label, match, exclude in [
         ("daemon", "--monitor-only", "momentum-edge"),
-        ("listener", "tools.telegram_listener", "momentum-edge"),
+        ("listener", "-m tools.telegram_listener", "momentum-edge"),
         ("sentinel_supervisor", r"news_sentinel\supervisor.py", None),
     ]:
         procs = _list_python_procs(match, must_not_match=exclude)
