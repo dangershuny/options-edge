@@ -152,6 +152,18 @@ def morning_session(dry_run: bool = False) -> None:
     # 7. Place orders one at a time, respecting slots and cash
     placed = 0
     per_symbol_taken: dict[str, int] = {}
+    # Import the new 2026-05-06 gates (regime, circuit-breaker, spread,
+    # score-cross-validation). Falls back to no-op if unavailable.
+    try:
+        from tools.paper_trade import _all_new_gates as _new_gates
+    except Exception:
+        _new_gates = None  # type: ignore
+    try:
+        from risk import regime as _regime
+        _log(f"Market regime: {_regime.describe()}")
+    except Exception:
+        _regime = None  # type: ignore
+
     for c in candidates:
         if placed >= slots:
             break
@@ -162,6 +174,23 @@ def morning_session(dry_run: bool = False) -> None:
         entry = float(c.get("entry_price") or c.get("ask") or 0)
         if entry <= 0:
             continue
+
+        # 2026-05-06 gates: regime / circuit-breaker / spread / score-cross-val
+        if _new_gates is not None:
+            # Build the dict shape paper_trade gates expect
+            gate_t = {
+                "symbol": sym,
+                "option_type": c.get("type"),
+                "score": float(c.get("score") or 0),
+                "bid": float(c.get("bid") or 0),
+                "ask": float(c.get("ask") or 0),
+            }
+            ok, reason = _new_gates(gate_t, float(RISK["min_score_to_trade"]))
+            if not ok:
+                _log(f"  SKIP {sym}: {reason}")
+                continue
+            if reason:
+                _log(f"  note {sym}: {reason}")
 
         # Final pre-trade risk gate — includes live adverse-news check,
         # earnings-day hard block, OI floor.
@@ -460,6 +489,49 @@ def monitor_tick() -> None:
             _handle_exit_trigger(p, f"theta guard: {pnl_pct*100:.1f}% at low DTE")
             record_monitor_check(p["id"], datetime.now(tz=timezone.utc).isoformat())
             continue
+
+        # ── Opposing-divergence exit (added 2026-05-06) ───────────────────────
+        # If sentinel now shows a STRONG divergence in the OPPOSITE direction
+        # of the position, exit rather than waiting for SL/floor. RIOT 17P
+        # held 5/1-5/5 finally hit -50% hard floor — sentinel had been
+        # showing positive RIOT divergence since 5/4. Earlier exit on the
+        # flip would have saved most of the $106 loss.
+        try:
+            from sentinel_bridge import get_divergence
+            div = get_divergence(p["underlying"], max_age_hours=12)
+        except Exception:
+            div = None
+        if div:
+            direction = (div.get("direction") or "").lower()
+            div_score = float(div.get("divergence_score") or 0)
+            opt_type = (p["option_type"] or "").lower()
+            # Strong threshold: only fire on a confident reversal signal
+            STRONG = 1.0
+            opposing = False
+            if div_score >= STRONG:
+                if direction == "bullish_divergence" and opt_type == "put":
+                    opposing = True
+                elif direction == "bearish_divergence" and opt_type == "call":
+                    opposing = True
+            # Only trigger if position has been held long enough that
+            # sentiment had a chance to change since entry. Same-session
+            # whipsaw protection: must be open >2 hours.
+            if opposing:
+                try:
+                    entry_dt = datetime.strptime(p["entry_date"], "%Y-%m-%d").date()
+                    held_full_session = entry_dt < date.today()
+                except Exception:
+                    held_full_session = False
+                if held_full_session:
+                    _handle_exit_trigger(
+                        p, f"opposing-divergence exit: sentinel says "
+                           f"{direction} (score={div_score:.2f}) on "
+                           f"{p['underlying']} but we hold {opt_type}"
+                    )
+                    record_monitor_check(
+                        p["id"], datetime.now(tz=timezone.utc).isoformat()
+                    )
+                    continue
 
         record_monitor_check(p["id"], datetime.now(tz=timezone.utc).isoformat())
 

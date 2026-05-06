@@ -139,6 +139,125 @@ def _passes_pretrade_filters(t: dict) -> tuple[bool, str]:
     return True, ""
 
 
+# ── New gates added 2026-05-06 after 5/5 -$116 day ───────────────────────────
+
+def _regime_gate(t: dict) -> tuple[bool, str]:
+    """Block trades fighting a strong intraday SPY trend. Lets STRONG
+    sentinel divergences override soft warnings. Hard blocks at SPY ≥±1%
+    are not overridable."""
+    try:
+        from risk import regime
+    except Exception as e:
+        return True, f"regime gate import skip: {e}"
+
+    opt_type = (t.get("option_type") or "").lower()
+    sym = (t.get("symbol") or "").upper()
+
+    # Try to fetch a divergence_score for STRONG-override path
+    div_score: float | None = None
+    try:
+        from sentinel_bridge import get_divergence
+        div = get_divergence(sym, max_age_hours=24) if sym else None
+        if div:
+            div_score = float(div.get("divergence_score") or 0)
+    except Exception:
+        div_score = None
+
+    return regime.check(opt_type, divergence_score=div_score)
+
+
+def _circuit_breaker_gate(t: dict, max_same_day_losses: int = 2) -> tuple[bool, str]:
+    """Halt new entries after N same-day SL hits this session. Carryover
+    losses don't count — only positions that BOTH entered and closed today
+    with negative P&L."""
+    try:
+        from engine.state import count_same_day_losses_today
+        n = count_same_day_losses_today()
+    except Exception as e:
+        return True, f"circuit breaker check failed (allow): {e}"
+    if n >= max_same_day_losses:
+        return False, (f"same-day-loss circuit breaker: {n} fresh losses "
+                       f"already today (>= {max_same_day_losses}); halting "
+                       f"new entries until next session")
+    return True, ""
+
+
+def _spread_gate(t: dict, max_spread_ratio: float = 0.25) -> tuple[bool, str]:
+    """Refuse trades on contracts whose bid-ask spread is too wide relative
+    to mid. Checks both snapshot-recorded bid/ask AND lets _execute_trade
+    re-check against live quote (this gate is best-effort pre-screen)."""
+    try:
+        bid = float(t.get("bid") or 0)
+        ask = float(t.get("ask") or 0)
+    except Exception:
+        return True, ""
+    if bid <= 0 or ask <= 0:
+        return True, ""  # missing quote info — don't block here
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return True, ""
+    ratio = (ask - bid) / mid
+    if ratio > max_spread_ratio:
+        return False, (f"bid/ask spread too wide: bid=${bid:.2f} ask=${ask:.2f} "
+                       f"spread/mid={ratio*100:.0f}% > {max_spread_ratio*100:.0f}%")
+    return True, ""
+
+
+def _score_cross_validation_gate(t: dict, min_score: float,
+                                  contradiction_penalty: float = 20.0
+                                  ) -> tuple[bool, str]:
+    """If sentinel shows a divergence OPPOSING the trade direction, downgrade
+    the score by `contradiction_penalty`. If new score < min_score, refuse.
+    No penalty if sentinel is silent or aligned."""
+    sym = (t.get("symbol") or "").upper()
+    opt_type = (t.get("option_type") or "").lower()
+    if not sym or opt_type not in ("call", "put"):
+        return True, ""
+    try:
+        from sentinel_bridge import get_divergence
+        div = get_divergence(sym, max_age_hours=24)
+    except Exception:
+        return True, ""  # sentinel unreachable — don't block
+    if not div:
+        return True, ""
+    direction = (div.get("direction") or "").lower()
+    if not direction or direction == "neutral":
+        return True, ""
+    # Aligned cases — no penalty
+    if direction == "bullish_divergence" and opt_type == "call":
+        return True, ""
+    if direction == "bearish_divergence" and opt_type == "put":
+        return True, ""
+    # Convergence (consensus) is mildly aligned for matching direction
+    if direction == "bullish_convergence" and opt_type == "call":
+        return True, ""
+    if direction == "bearish_convergence" and opt_type == "put":
+        return True, ""
+    # Contradiction — apply penalty
+    score = float(t.get("score") or 0)
+    new_score = score - contradiction_penalty
+    if new_score < min_score:
+        return False, (f"score-cross-validation: sentinel says {direction} on "
+                       f"{sym} but trade is {opt_type}. score {score:.1f} - "
+                       f"{contradiction_penalty:.0f} penalty = {new_score:.1f} "
+                       f"< min {min_score:.1f}")
+    # Penalty applied but still above threshold — allow with note
+    return True, (f"score-cross-validation: -{contradiction_penalty:.0f} pts for "
+                  f"{direction} on {opt_type} (effective {new_score:.1f})")
+
+
+def _all_new_gates(t: dict, min_score: float) -> tuple[bool, str]:
+    """Run all 2026-05-06 entry gates in order. Short-circuit on first block."""
+    for gate in (_regime_gate, _circuit_breaker_gate, _spread_gate):
+        ok, reason = gate(t)
+        if not ok:
+            return False, reason
+    ok, reason = _score_cross_validation_gate(t, min_score)
+    if not ok:
+        return False, reason
+    return True, ""
+
+
 def _trade_qualifies(t: dict, allowed_signals: tuple[str, ...]) -> bool:
     """
     A trade qualifies for a tier if EITHER:
@@ -182,6 +301,13 @@ def _rank_trades(trades: list[dict], min_score: float,
         if not ok:
             rejected_filter.append((t.get("symbol", "?"), reason))
             continue
+        # New 2026-05-06 gates: regime / circuit-breaker / spread / cross-val
+        ok, reason = _all_new_gates(t, min_score)
+        if not ok:
+            rejected_filter.append((t.get("symbol", "?"), reason))
+            continue
+        if reason:  # pass-with-note (e.g., score-cross-validation soft penalty)
+            print(f"  note {t.get('symbol', '?')}: {reason}")
         filtered.append(t)
     if rejected_filter:
         for sym, why in rejected_filter[:8]:
@@ -262,6 +388,24 @@ def _execute_trade(
         result["status"] = "skipped"
         result["error"] = "no valid quote (market closed or illiquid)"
         return result
+
+    # Live spread re-check (snapshot bid/ask can be stale; this catches it
+    # at order time). FUBO 5/5 phantomed twice with bid=0.35/ask=0.96 on
+    # the snapshot — spread/mid 92% — would have been caught here.
+    try:
+        from risk.config import RISK as _R
+        max_ratio = float(_R.get("max_bid_ask_spread_ratio", 0.25))
+    except Exception:
+        max_ratio = 0.25
+    if quote.bid and quote.ask:
+        live_ratio = (quote.ask - quote.bid) / mid if mid else 999
+        if live_ratio > max_ratio:
+            result["status"] = "skipped"
+            result["error"] = (f"live spread too wide: bid=${quote.bid:.2f} "
+                               f"ask=${quote.ask:.2f} mid=${mid:.2f} "
+                               f"ratio={live_ratio*100:.0f}% > "
+                               f"{max_ratio*100:.0f}%")
+            return result
 
     # Cost per contract = mid * 100
     cost_per_contract = mid * 100
@@ -413,6 +557,28 @@ def run(
 
     # Load snapshot
     snap = _load_snapshot(snapshot_path)
+
+    # Refuse to run on stale data — biggest contributor to 5/5 -$116 day
+    # was a snapshot frozen at 2026-04-18 still being used on 2026-05-05.
+    try:
+        from tools.snapshot import is_snapshot_stale
+        stale, reason = is_snapshot_stale(snap, max_calendar_days=5)
+        if stale:
+            # Loud Telegram alert — operator must intervene
+            try:
+                from tools.notify import send
+                send("CRIT", "Snapshot STALE — picker halted",
+                     f"{reason}\nFile: {snapshot_path.name}\nFix: regenerate "
+                     f"snapshot or check yfinance/Alpaca clock data.")
+            except Exception:
+                pass
+            return {
+                "error": f"snapshot stale: {reason}",
+                "orders": [],
+            }
+    except ImportError:
+        pass  # snapshot module unavailable — don't block legacy callers
+
     all_trades = snap.get("trades", [])
     ranked = _rank_trades(all_trades, min_score, allowed_signals)
     if blacklist:

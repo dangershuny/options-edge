@@ -43,6 +43,102 @@ def _fmt_date() -> str:
     return date.today().isoformat()
 
 
+def _last_market_close_date() -> str:
+    """Return the most recent US market close date (YYYY-MM-DD).
+
+    Tries Alpaca's clock first (has `previous_close`), falls back to a
+    calendar-aware computation. Treats *today* as the last close after
+    16:00 ET; otherwise yesterday's date (skipping weekends + market
+    holidays defined in news_sentinel/scheduler.py).
+
+    Reading this dynamically replaces a hardcoded literal that froze at
+    2026-04-18 — the picker on 5/5 was running on 17-day-old data, which
+    was the single largest contributor to that day's loss."""
+    # 1. Alpaca clock — most authoritative. Has next_close + previous_close
+    #    on the modern clock object.
+    try:
+        from broker import alpaca
+        clock = alpaca.get_clock()
+        # Different alpaca-py versions expose this either as
+        # clock.previous_close (datetime) or clock.previous_close.date()
+        prev = getattr(clock, "previous_close", None)
+        if prev is not None:
+            try:
+                return prev.date().isoformat()
+            except AttributeError:
+                # Some versions return a date directly
+                return prev.isoformat()
+    except Exception:
+        pass
+
+    # 2. yfinance fallback: SPY's most recent daily bar
+    try:
+        import yfinance as yf
+        hist = yf.Ticker("SPY").history(period="7d", interval="1d", auto_adjust=False)
+        if hist is not None and not hist.empty:
+            last_idx = hist.index[-1]
+            try:
+                return last_idx.date().isoformat()
+            except AttributeError:
+                return str(last_idx)[:10]
+    except Exception:
+        pass
+
+    # 3. Calendar fallback: walk back from today, skip weekends + holidays
+    from datetime import timedelta
+    try:
+        from zoneinfo import ZoneInfo
+        NY = ZoneInfo("America/New_York")
+        now_et = datetime.now(tz=NY)
+    except Exception:
+        now_et = datetime.now()
+
+    # Treat today as last close iff weekday and past 16:00 ET
+    is_post_close_today = (now_et.weekday() < 5
+                           and now_et.hour >= 16)
+    cur = now_et.date() if is_post_close_today else (now_et.date() - timedelta(days=1))
+    holidays = {
+        # Through 2030 (mirrors news_sentinel/scheduler.py US_MARKET_HOLIDAYS)
+        "2026-01-01","2026-01-19","2026-02-16","2026-04-03",
+        "2026-05-25","2026-06-19","2026-07-03","2026-09-07",
+        "2026-11-26","2026-12-25",
+        "2027-01-01","2027-01-18","2027-02-15","2027-03-26",
+        "2027-05-31","2027-06-18","2027-07-05","2027-09-06",
+        "2027-11-25","2027-12-24",
+        "2028-01-17","2028-02-21","2028-04-14",
+        "2028-05-29","2028-06-19","2028-07-04","2028-09-04",
+        "2028-11-23","2028-12-25",
+        "2029-01-01","2029-01-15","2029-02-19","2029-03-30",
+        "2029-05-28","2029-06-19","2029-07-04","2029-09-03",
+        "2029-11-22","2029-12-25",
+        "2030-01-01","2030-01-21","2030-02-18","2030-04-19",
+        "2030-05-27","2030-06-19","2030-07-04","2030-09-02",
+        "2030-11-28","2030-12-25",
+    }
+    while cur.weekday() >= 5 or cur.isoformat() in holidays:
+        cur -= timedelta(days=1)
+    return cur.isoformat()
+
+
+def is_snapshot_stale(snapshot: dict, max_calendar_days: int = 5) -> tuple[bool, str]:
+    """Hard guard for downstream consumers. Returns (is_stale, reason).
+    Picker / paper_trade should refuse to run if stale and the operator
+    didn't pass an override."""
+    from datetime import timedelta
+    lcd = snapshot.get("last_close_date")
+    if not lcd:
+        return True, "snapshot has no last_close_date — refusing to trade on it"
+    try:
+        lcd_dt = datetime.strptime(lcd, "%Y-%m-%d").date()
+    except Exception:
+        return True, f"last_close_date={lcd!r} not parseable as YYYY-MM-DD"
+    age_days = (date.today() - lcd_dt).days
+    if age_days > max_calendar_days:
+        return True, (f"snapshot last_close_date={lcd} is {age_days} calendar "
+                       f"days old (>{max_calendar_days} threshold) — STALE")
+    return False, f"snapshot last_close_date={lcd} ({age_days}d old) — fresh"
+
+
 def run_and_save(tickers: list[str] | None = None,
                  mode_override: str | None = None,
                  suffix: str | None = None) -> None:
@@ -51,9 +147,16 @@ def run_and_save(tickers: list[str] | None = None,
     fname = f"{snap_date}{('_' + suffix) if suffix else ''}.json"
     snap_path = os.path.join(SNAPSHOT_DIR, fname)
 
+    last_close = _last_market_close_date()
+    try:
+        from datetime import datetime as _dt
+        lcd_pretty = _dt.strptime(last_close, "%Y-%m-%d").strftime("%a %b %d %Y")
+    except Exception:
+        lcd_pretty = last_close
+
     print(f"\n{'═'*72}")
     print(f"  OPTIONS EDGE — Trade Recommendation Snapshot")
-    print(f"  Date      : {snap_date}  (last market close: Fri Apr 18 2026)")
+    print(f"  Date      : {snap_date}  (last market close: {lcd_pretty})")
     print(f"  Generated : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # Mode: explicit override (for A/B comparisons) OR auto-select from portfolio.
@@ -133,7 +236,7 @@ def run_and_save(tickers: list[str] | None = None,
     snapshot = {
         "snapshot_date": snap_date,
         "generated_at":  datetime.now().isoformat(),
-        "last_close_date": "2026-04-18",  # last trading day
+        "last_close_date": last_close,  # dynamically computed; see _last_market_close_date
         "risk_settings": {k: RISK[k] for k in (
             "portfolio_size", "max_cost_per_trade", "min_score_to_trade"
         )},

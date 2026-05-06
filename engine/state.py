@@ -215,12 +215,86 @@ def revert_to_open(position_id: int) -> None:
 
 def mark_phantom(position_id: int) -> None:
     """Engine has the row but Alpaca has no position — record never landed.
-    Soft-delete: keep the row for audit but stop monitor_tick processing it."""
+    Soft-delete: keep the row for audit but stop monitor_tick processing it.
+
+    Fires a Telegram WARN so silent broker rejections (FUBO 5/5) surface
+    immediately rather than after EOD analysis. Idempotent on the alert
+    side: if this row is already phantom, skip the alert."""
+    occ = None
+    score = None
+    entry_order_id = None
     with _db() as c:
+        row = c.execute(
+            "SELECT occ_symbol, score, entry_order_id, status "
+            "FROM positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+        if row is None:
+            return
+        if row["status"] == "phantom":
+            return  # already phantomed; don't double-alert
+        occ = row["occ_symbol"]
+        score = row["score"]
+        entry_order_id = row["entry_order_id"]
         c.execute(
             "UPDATE positions SET status = 'phantom', exit_queued = 0 WHERE id = ?",
             (position_id,),
         )
+
+    # Fire WARN — order placed but never landed at broker. Best-effort,
+    # never blocks the DB update.
+    try:
+        from tools.notify import send
+        score_str = f"score={float(score):.0f} " if score is not None else ""
+        order_str = f"order={entry_order_id[:8]}" if entry_order_id else "order=?"
+        send(
+            "WARN",
+            f"PHANTOM ORDER: {occ} (id={position_id})",
+            f"{score_str}{order_str} — engine recorded entry but broker has "
+            f"no position. Likely cause: limit didn't fill, broker rejected, "
+            f"or wide bid-ask spread. Check Alpaca dashboard.",
+        )
+    except Exception:
+        pass
+
+
+# ── Same-day-loss circuit breaker ─────────────────────────────────────────────
+
+def count_same_day_losses_today(today_iso: str | None = None) -> int:
+    """Count positions that BOTH entered AND closed today with negative P&L.
+    Used by the entry-side circuit-breaker: after 2 same-day SL hits, halt
+    new entries for the rest of the session.
+
+    Carryover losses (entered prior day, closed today) DON'T count — those
+    just mean a stop did its job on a stale position.
+    """
+    if today_iso is None:
+        today_iso = date.today().isoformat()
+    init_db()
+    with _db() as c:
+        row = c.execute(
+            "SELECT COUNT(*) AS n FROM positions "
+            "WHERE status = 'closed' "
+            "  AND date(entry_date) = ? "
+            "  AND date(exit_date)  = ? "
+            "  AND COALESCE(realized_pl, 0) < 0",
+            (today_iso, today_iso),
+        ).fetchone()
+        return int(row["n"] if row else 0)
+
+
+def count_phantoms_today(today_iso: str | None = None) -> int:
+    """Count rows phantomed today (orders placed but never landed)."""
+    if today_iso is None:
+        today_iso = date.today().isoformat()
+    init_db()
+    with _db() as c:
+        row = c.execute(
+            "SELECT COUNT(*) AS n FROM positions "
+            "WHERE status = 'phantom' AND date(entry_date) = ?",
+            (today_iso,),
+        ).fetchone()
+        return int(row["n"] if row else 0)
 
 
 def list_closing() -> list[dict]:
