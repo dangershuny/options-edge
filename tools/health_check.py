@@ -65,7 +65,30 @@ def check_sentinel_server(timeout: float = 2.0) -> dict:
 
 
 def check_override_server(timeout: float = 2.0) -> dict:
-    """Override HTTP server on localhost:8504 — manual buy endpoint."""
+    """Override HTTP server on localhost:8504 — manual buy endpoint.
+
+    Returns OK when the OptionsEdge-OverrideServer scheduled task is
+    explicitly disabled (operator turned it off intentionally — don't
+    fight that with a remediation loop). Today the disabled task spawned
+    75 restart attempts that all hit cooldown — pure noise."""
+    # Short-circuit if task is intentionally disabled
+    try:
+        r = subprocess.run(
+            ["schtasks", "/Query", "/TN", "OptionsEdge-OverrideServer",
+             "/FO", "LIST", "/V"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            for line in (r.stdout or "").splitlines():
+                s = line.strip()
+                if s.startswith("Scheduled Task State:"):
+                    state = s.split(":", 1)[1].strip().lower()
+                    if state == "disabled":
+                        return _check("override_server", OK,
+                                       detail="task disabled — not supervised")
+                    break
+    except Exception:
+        pass  # if schtasks lookup fails, fall through to the live probe
     try:
         with urlopen("http://localhost:8504/health", timeout=timeout) as r:
             r.read()

@@ -61,6 +61,7 @@ from engine.state import (
     available_cash_for_new_trade, update_peak, OpenPositionRecord,
     mark_closing, revert_to_open, mark_phantom, list_closing,
     update_sl, record_monitor_check, increment_sl_reset,
+    find_phantom_for_occ, unphantom,
 )
 from engine.news_monitor import (
     check_position_news, describe_signal, news_check_due,
@@ -370,12 +371,38 @@ def reconcile_with_broker() -> None:
                      f"reverting to open (next trigger will re-fire)")
             # else: still PENDING/ACCEPTED/PARTIAL — leave alone
 
-    # 3. Untracked positions
+    # 3. Untracked positions — merge into recent phantoms when possible.
+    # Bug observed 5/6: paper_trade.py records a row with status='open' on
+    # submit, broker doesn't fill within the limit window so reconcile
+    # marks it phantom — but THEN the broker fills it later (or another
+    # tier's parallel limit fills). Result: broker has the position but
+    # the only engine row is phantom-flagged, so monitor_tick ignores it
+    # and we sit unmonitored until backfill_positions runs.
+    #
+    # Fix: when an untracked broker position is found, look for a recent
+    # phantom row with the same OCC. If yes, un-phantom it (and update qty
+    # to broker truth) so monitor_tick picks it up immediately.
     tracked = {r["occ_symbol"] for r in list_open()}
     for sym, p in live_positions.items():
-        if sym not in tracked:
-            _log(f"  reconcile: untracked broker position {sym} qty={p.qty} "
-                 f"— run `python -m tools.backfill_positions` to manage")
+        if sym in tracked:
+            continue
+        phantom = find_phantom_for_occ(sym, max_age_days=2)
+        if phantom is not None:
+            broker_qty = abs(int(p.qty)) if p.qty is not None else None
+            if unphantom(phantom["id"], broker_qty=broker_qty):
+                _log(f"  reconcile: MERGED phantom {sym} (id={phantom['id']}) "
+                     f"-> 'open' qty={broker_qty} (broker filled after phantom mark)")
+                try:
+                    from tools.notify import send
+                    send("INFO",
+                         f"Phantom merged: {sym}",
+                         f"Phantom row id={phantom['id']} restored to 'open' "
+                         f"qty={broker_qty} after broker fill confirmed.")
+                except Exception:
+                    pass
+                continue
+        _log(f"  reconcile: untracked broker position {sym} qty={p.qty} "
+             f"— no matching phantom; run `python -m tools.backfill_positions`")
 
 
 # ── Intraday monitor ─────────────────────────────────────────────────────────
@@ -418,7 +445,33 @@ def monitor_tick() -> None:
         except BrokerError as e:
             _log(f"  quote err {p['occ_symbol']}: {e}")
             continue
-        mark = q.mid or q.bid
+
+        # ── Quote-staleness fallback (added 2026-05-06 after COMP held into
+        # close because Alpaca's data feed went stale for 60+ min during
+        # afternoon. Daemon kept reading 5-6 min old quotes; SL never fired
+        # even though real price was breaching). When quote is older than
+        # STALE_QUOTE_SEC, evaluate SL against the BID (conservative
+        # liquidation value) instead of mid. If SL breaches under that
+        # conservative read, fire an urgent exit so we don't sit underwater
+        # waiting for the data feed to recover.
+        STALE_QUOTE_SEC = 120
+        quote_ts = getattr(q, "timestamp", None) or getattr(q, "ts", None)
+        quote_stale = False
+        if quote_ts is not None:
+            try:
+                if isinstance(quote_ts, str):
+                    quote_ts = datetime.fromisoformat(quote_ts.replace("Z", "+00:00"))
+                age_sec = (datetime.now(tz=timezone.utc) - quote_ts).total_seconds()
+                quote_stale = age_sec > STALE_QUOTE_SEC
+            except Exception:
+                quote_stale = False
+
+        if quote_stale and q.bid and q.bid > 0:
+            mark = q.bid
+            _log(f"  {p['occ_symbol']}: quote STALE ({age_sec:.0f}s) — "
+                 f"falling back to bid=${q.bid:.2f} for SL evaluation")
+        else:
+            mark = q.mid or q.bid
         if mark <= 0:
             continue
         entry = float(p["entry_price"])

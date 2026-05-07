@@ -53,6 +53,16 @@ COOLDOWNS = {
 
 
 def _audit(action: str, result: dict) -> None:
+    """Append to the daily remediation audit log.
+
+    Skips cooldown-skipped attempts: those represent "we wanted to remediate
+    but the per-hour cap said no." Logging them inflates the daily count
+    without communicating anything actionable. Today (5/6) had 159 audit
+    entries; only 7 actually fired. The other 152 were noise that made it
+    look like the system was thrashing when in reality the cooldown was
+    correctly suppressing repeat attempts."""
+    if result.get("skipped") == "cooldown_exhausted":
+        return
     rec = {
         "ts": datetime.now(tz=timezone.utc).isoformat(),
         "action": action,

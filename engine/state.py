@@ -297,6 +297,49 @@ def count_phantoms_today(today_iso: str | None = None) -> int:
         return int(row["n"] if row else 0)
 
 
+def find_phantom_for_occ(occ_symbol: str, max_age_days: int = 2) -> dict | None:
+    """Return the most recent phantom row for `occ_symbol` if its entry_date
+    is within `max_age_days` of today, else None.
+
+    Used by reconcile_with_broker: when a broker position appears that has
+    no tracked engine row, we first check if there's a recent phantom for
+    the same OCC. If yes, the phantom was a paper_trade row whose order
+    eventually filled — un-phantom it instead of treating it as untracked.
+    """
+    init_db()
+    cutoff = (date.today() - timedelta(days=max_age_days)).isoformat()
+    with _db() as c:
+        row = c.execute(
+            "SELECT * FROM positions "
+            "WHERE occ_symbol = ? AND status = 'phantom' "
+            "  AND date(entry_date) >= ? "
+            "ORDER BY id DESC LIMIT 1",
+            (occ_symbol, cutoff),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def unphantom(position_id: int, broker_qty: int | None = None) -> bool:
+    """Restore a phantom row back to status='open'. Optionally update qty
+    to match broker truth (when 2 paper_trade tier limits both filled,
+    the broker may show qty=2 while the phantom row had qty=1).
+    Returns True if the row was updated."""
+    with _db() as c:
+        if broker_qty is not None:
+            cur = c.execute(
+                "UPDATE positions SET status = 'open', qty = ?, exit_queued = 0 "
+                "WHERE id = ? AND status = 'phantom'",
+                (int(broker_qty), position_id),
+            )
+        else:
+            cur = c.execute(
+                "UPDATE positions SET status = 'open', exit_queued = 0 "
+                "WHERE id = ? AND status = 'phantom'",
+                (position_id,),
+            )
+        return cur.rowcount > 0
+
+
 def list_closing() -> list[dict]:
     """Rows that have submitted a SELL and are awaiting fill confirmation."""
     init_db()
