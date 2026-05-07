@@ -245,26 +245,22 @@ THETA_DECAY_DTE_TRIGGER = 10     # with <10 DTE remaining
 RATCHET_TIERS_OPTIONS: list[tuple[float, float]] = [
     # (peak_unrealized_pct, locked_stop_pct)
     #
-    # 2026-05-06 retune: tighter at every tier so we lock more of each
-    # peak. Forensic on 4/24-5/5: of 15 closed trades, 4 fired trailing
-    # stops (all winners) and the rest hit SL (all losers). The trailing
-    # stops fired at +56% / +57% / +94% — captured but with significant
-    # give-back from the peak (RIOT 20C peak was 1.03, exit 0.87 = 16%
-    # of the peak gain donated). Earlier, tighter tiers reduce that.
+    # 2026-05-06 v2: aggressive — first tier fires at peak +5% locking
+    # breakeven. Rationale: with d1 median return -3% and overall win rate
+    # 43%, most positions never run far. Capital preservation dominates.
+    # Locking BE on a +5% pop saves us from the case where a position
+    # kisses +5% and then collapses to -50% on a midday reversal.
     #
-    # New schedule:
-    #   peak +20% → lock breakeven  (was none until +25%)
-    #   peak +35% → lock +20%       (was +25% trigger giving -5% lock)
-    #   peak +50% → lock +35%       (was +30% lock — now +35%)
-    #   peak +75% → lock +60%       (was +55% lock)
-    #   peak +100% → lock +85%      (was +80%)
-    #   peak +150% → lock +130%     (was +120%)
-    #   peak +200% → lock +175%     (was +165%)
-    #   peak +300% → lock +260%     (was +250%)
-    (0.20, +0.00),   # peak +20% → defend breakeven (NEW first tier)
-    (0.35, +0.20),   # peak +35% → lock +20%
-    (0.50, +0.35),   # peak +50% → lock +35%
-    (0.75, +0.60),   # peak +75% → lock +60%
+    # Whipsaw risk: a position that touches +5% and immediately reverts
+    # ~5% will exit at BE. With option spreads of 5-10% on penny names
+    # this can fire on noise. Acceptable trade — we'd rather exit flat
+    # on chop than ride to a -12% SL hit.
+    (0.05, +0.00),   # peak +5%   → lock BE       (NEW — fires aggressively)
+    (0.10, +0.05),   # peak +10%  → lock +5%
+    (0.20, +0.12),   # peak +20%  → lock +12%
+    (0.35, +0.25),   # peak +35%  → lock +25%
+    (0.50, +0.38),   # peak +50%  → lock +38%
+    (0.75, +0.60),   # peak +75%  → lock +60%
     (1.00, +0.85),   # peak +100% → lock +85%
     (1.50, +1.30),   # peak +150% → lock +130%
     (2.00, +1.75),   # peak +200% → lock +175%

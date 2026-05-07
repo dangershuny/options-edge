@@ -219,17 +219,46 @@ def merge_returns(snapshots: list[dict],
     return enriched
 
 
+def _avg_ranks(values: list[float]) -> list[float]:
+    """Return ranks 1..n with TIES averaged. The naive {value: rank}
+    dict approach (a) silently drops duplicates and (b) gives every
+    duplicate the same arbitrary rank. For signals like short_delta or
+    pin_delta where most rows are 0 with a few non-zero values, the
+    naive method computes a bogus rho near ±1. This implementation
+    matches scipy.stats.spearmanr's tie handling."""
+    indexed = sorted(enumerate(values), key=lambda x: x[1])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(indexed):
+        j = i
+        while j + 1 < len(indexed) and indexed[j+1][1] == indexed[i][1]:
+            j += 1
+        avg_rank = (i + j + 2) / 2  # average of (i+1) .. (j+1)
+        for k in range(i, j + 1):
+            ranks[indexed[k][0]] = avg_rank
+        i = j + 1
+    return ranks
+
+
 def spearman_rho(pairs: list[tuple[float, float]]) -> float | None:
-    """Spearman rank correlation. Returns None if n<3."""
+    """Spearman rank correlation with proper tie handling. Computes
+    Pearson correlation on the average-ranked values. Returns None if
+    n<3 or if either rank list is constant (no variance → undefined)."""
     n = len(pairs)
     if n < 3:
         return None
     xs = [p[0] for p in pairs]
     ys = [p[1] for p in pairs]
-    x_rank = {v: i+1 for i, v in enumerate(sorted(xs))}
-    y_rank = {v: i+1 for i, v in enumerate(sorted(ys))}
-    d2 = sum((x_rank[x] - y_rank[y])**2 for x, y in zip(xs, ys))
-    return 1 - (6 * d2) / (n * (n*n - 1))
+    rx = _avg_ranks(xs)
+    ry = _avg_ranks(ys)
+    mean_x = sum(rx) / n
+    mean_y = sum(ry) / n
+    cov = sum((rx[i] - mean_x) * (ry[i] - mean_y) for i in range(n))
+    var_x = sum((r - mean_x) ** 2 for r in rx)
+    var_y = sum((r - mean_y) ** 2 for r in ry)
+    if var_x == 0 or var_y == 0:
+        return None  # constant signal — Spearman undefined
+    return cov / ((var_x * var_y) ** 0.5)
 
 
 def analyze(rows: list[dict], horizons: list[int]) -> dict:

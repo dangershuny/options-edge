@@ -91,23 +91,30 @@ def short_interest_score_delta(short: dict | None, opt_type: str, vol_signal: st
     """
     Score adjustment from short interest.
 
-    SQUEEZE_SETUP + BUY CALL → +7  (squeeze-covering demand amplifies upside)
-    ELEVATED + BUY CALL      → +3
-    SQUEEZE_SETUP + BUY PUT  → -4  (you're fighting squeeze potential)
-    Otherwise                → 0
+    2026-05-06 BACKTEST RETUNE: signal_edge_backtest showed
+    short_signal=SQUEEZE_SETUP at 52.6% win rate / +12.8% avg return at d1
+    (n=38) — the strongest non-PINNED category in the dataset. Boosting
+    its weight from +7 to +15 to reflect realized predictive power.
+
+    SQUEEZE_SETUP + BUY CALL → +15 (was +7)
+    ELEVATED     + BUY CALL → +5  (was +3)
+    SQUEEZE_SETUP + BUY PUT → -8  (was -4) — strengthen the don't-fight-it
+                                            penalty symmetrically
+    Otherwise               → 0
     """
     if not short or not isinstance(short, dict):
         return 0.0
     sig = short.get("signal")
     opt = (opt_type or "").lower()
-    if vol_signal not in ("BUY VOL", "FLOW BUY"):
+    if vol_signal not in ("BUY VOL", "FLOW BUY", "DIRECTIONAL BUY",
+                           "MOMENTUM BUY"):
         return 0.0
     if opt == "call" and sig == "SQUEEZE_SETUP":
-        return 7.0
+        return 15.0
     if opt == "call" and sig == "ELEVATED":
-        return 3.0
+        return 5.0
     if opt == "put" and sig == "SQUEEZE_SETUP":
-        return -4.0
+        return -8.0
     return 0.0
 
 

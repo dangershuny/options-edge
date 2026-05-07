@@ -232,7 +232,14 @@ def score_contract(
         if g_sig == "EXPLOSIVE":
             score += 5
         elif g_sig == "PINNED":
-            score -= 5
+            # 2026-05-06 BACKTEST REVERSAL: was -5 penalty, now +15 bonus.
+            # signal_edge_backtest report (n=17 PINNED contracts at d1):
+            # 82.4% win rate, +29.8% avg return — the strongest single
+            # categorical edge in the entire dataset. The old -5 penalty
+            # was based on an intuition (pinning compresses options) but
+            # the realized data says PINNED regimes coincide with the
+            # best directional resolution we get. Bet on the data.
+            score += 15
 
     # ── Contrarian dampeners (lessons from Apr 20 snapshot losses) ────────────
     # 1. Peak fear / peak greed: extreme IV rank + aligned directional signal
@@ -373,6 +380,16 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
 
     skew = calculate_skew(chain_full, price)
     gex  = calculate_gex(chain_full, price)
+
+    # 2026-05-06 BACKTEST GATE: skew_signal=BEARISH ticker-wide → 0% win rate
+    # at d1 across 9 contracts (-21% avg return). Skip the entire ticker
+    # rather than analyze every contract individually. signal_edge_backtest
+    # report has the receipts. Reversible by deleting this block.
+    if skew and skew.get("skew_signal") == "BEARISH":
+        return None, news, (
+            f"{symbol} skew_signal=BEARISH — backtest blocks entry "
+            f"(0% wr / -21% avg over n=9 in current dataset)"
+        ), None
 
     # ── Ticker-level enrichments (one yfinance / EDGAR call per ticker) ──────
     # Every helper returns a SAFE-DEFAULT dict on failure, so None-guards below
