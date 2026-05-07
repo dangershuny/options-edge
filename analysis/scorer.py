@@ -514,18 +514,20 @@ def analyze_ticker(symbol: str) -> tuple[pd.DataFrame | None, list[dict], str | 
                                                  option_type=opt_type)
         div_scale = 0.5 if drift_delta != 0 else 1.0
 
-        # Sentiment velocity — accelerating sentiment in our direction is
-        # worth +5, against us is -3. Caps at |velocity| ≥ 0.4. Independent
-        # of divergence events so it fires on quiet names with quiet drift.
+        # Sentiment velocity — accelerating sentiment in our direction.
+        # 2026-05-06 throttle: aligned +2 (was +5), opposed -1.5 (was -3).
+        # Sentinel signals were over-weighted in the composite; per
+        # post-mortem they contributed to selecting losers. Now matches
+        # momentum-edge's small-signal-per-input pattern.
         velocity_delta = 0.0
         if sent_velocity is not None and abs(sent_velocity) >= 0.05:
             v_norm = max(min(sent_velocity / 0.4, 1.0), -1.0)
             aligned = ((opt_type == "call" and v_norm > 0)
                        or (opt_type == "put" and v_norm < 0))
             if aligned:
-                velocity_delta = round(abs(v_norm) * 5.0, 1)
+                velocity_delta = round(abs(v_norm) * 2.0, 1)
             else:
-                velocity_delta = round(-abs(v_norm) * 3.0, 1)
+                velocity_delta = round(-abs(v_norm) * 1.5, 1)
 
         # Composite sentiment — gentle tilt (±4 max) when no divergence event
         # is firing. Suppresses itself when div_delta is already active to

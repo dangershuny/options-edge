@@ -226,7 +226,8 @@ def composite_sentiment_delta(sentiment: dict | None, vol_signal: str,
     # Aligned: bullish composite + call, or bearish composite + put
     aligned = ((direction_score > 0 and ot == "call") or
                (direction_score < 0 and ot == "put"))
-    magnitude = min(abs(direction_score) * 8.0, 4.0)  # cap at ±4
+    # 2026-05-06 throttle: ±2 cap (was ±4) — see divergence_score_adjustment
+    magnitude = min(abs(direction_score) * 4.0, 2.0)
     # For BUY VOL / BUY-path signals only — SELL VOL spreads have different logic
     if vol_signal in ("BUY VOL", "FLOW BUY", "DIRECTIONAL BUY",
                        "MOMENTUM BUY"):
@@ -266,8 +267,9 @@ def fresh_8k_delta(catalysts: dict | None, vol_signal: str,
     if vol_signal not in ("BUY VOL", "FLOW BUY", "DIRECTIONAL BUY",
                            "MOMENTUM BUY", "REVERSION BUY"):
         return 0.0
-    # Multiple 8-Ks in 72h = cluster of news → bigger bump, capped at +9
-    return float(min(count * 3, 9))
+    # 2026-05-06 throttle: capped at +5 (was +9). Matches momentum-edge's
+    # +10 catalyst contribution but in the smaller-cap-per-signal regime.
+    return float(min(count * 2, 5))
 
 
 def sentiment_velocity(ticker: str, window_hours: int = 12) -> float | None:
@@ -370,9 +372,17 @@ def divergence_score_adjustment(divergence: dict | None, vol_signal: str,
     direction = divergence["direction"]
     div_score = float(divergence.get("divergence_score", 0))
     strength = min(div_score / 1.5, 1.0)
-    # Base ceiling: 15. Upgraded to 20 when backed by a recent 8-K filing
-    # (material-event filing → concrete catalyst, not pure chatter).
-    base_ceiling = 20.0 if divergence.get("has_recent_8k") else 15.0
+    # Base ceiling: 5 (was 15). Upgraded to 8 (was 20) when backed by a
+    # recent 8-K filing.
+    #
+    # 2026-05-06 throttle: cut weights ~3x to match momentum-edge's sentinel
+    # footprint (~10 max divergence + ~5 8-K + ~3 sentiment composite +
+    # ~3 velocity = ~20 total sentinel contribution, vs the prior ~45 which
+    # let sentinel-driven entries dominate scoring). Forensic showed sentinel-
+    # heavy entries (yesterday's BNTX/GM/WFC puts) had 24% win rate. Until
+    # signal quality improves, sentinel matters less. Score stays decorative;
+    # gates (regime, spread, direction-halt) drive the actual eligibility.
+    base_ceiling = 8.0 if divergence.get("has_recent_8k") else 5.0
     # Then scale by freshness — pre-market signals get full weight, stale
     # signals get downweighted. Combines to ~26 max for a fresh 8-K-backed
     # divergence and ~9 for a stale chatter-only one.

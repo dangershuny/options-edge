@@ -244,13 +244,31 @@ THETA_DECAY_DTE_TRIGGER = 10     # with <10 DTE remaining
 # the floor stop ratchets up to the locked level and stays there.
 RATCHET_TIERS_OPTIONS: list[tuple[float, float]] = [
     # (peak_unrealized_pct, locked_stop_pct)
-    (0.25, -0.05),   # peak +25% → lock at -5%   (was -12% SL)
-    (0.50, +0.30),   # peak +50% → lock at +30%  (USER REQUEST: defend +50%)
-    (0.75, +0.55),   # peak +75% → lock at +55%
-    (1.00, +0.80),   # peak +100% → lock at +80%
-    (1.50, +1.20),   # peak +150% → lock at +120%
-    (2.00, +1.65),   # peak +200% → lock at +165%
-    (3.00, +2.50),   # peak +300% → lock at +250%
+    #
+    # 2026-05-06 retune: tighter at every tier so we lock more of each
+    # peak. Forensic on 4/24-5/5: of 15 closed trades, 4 fired trailing
+    # stops (all winners) and the rest hit SL (all losers). The trailing
+    # stops fired at +56% / +57% / +94% — captured but with significant
+    # give-back from the peak (RIOT 20C peak was 1.03, exit 0.87 = 16%
+    # of the peak gain donated). Earlier, tighter tiers reduce that.
+    #
+    # New schedule:
+    #   peak +20% → lock breakeven  (was none until +25%)
+    #   peak +35% → lock +20%       (was +25% trigger giving -5% lock)
+    #   peak +50% → lock +35%       (was +30% lock — now +35%)
+    #   peak +75% → lock +60%       (was +55% lock)
+    #   peak +100% → lock +85%      (was +80%)
+    #   peak +150% → lock +130%     (was +120%)
+    #   peak +200% → lock +175%     (was +165%)
+    #   peak +300% → lock +260%     (was +250%)
+    (0.20, +0.00),   # peak +20% → defend breakeven (NEW first tier)
+    (0.35, +0.20),   # peak +35% → lock +20%
+    (0.50, +0.35),   # peak +50% → lock +35%
+    (0.75, +0.60),   # peak +75% → lock +60%
+    (1.00, +0.85),   # peak +100% → lock +85%
+    (1.50, +1.30),   # peak +150% → lock +130%
+    (2.00, +1.75),   # peak +200% → lock +175%
+    (3.00, +2.60),   # peak +300% → lock +260%
 ]
 
 

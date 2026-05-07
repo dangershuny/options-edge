@@ -222,6 +222,16 @@ RISK: dict = {
                                         # symmetrically skip BUY PUT if > +abs(this)
     "trend_lookback_days":         5,
 
+    # ── Direction halt (added 2026-05-06 after 0-for-6 puts in 2 weeks) ───────
+    # Forensic on 15 closed trades shows puts are 0/6 (-$345); calls are
+    # 3/9 (-$27). Until a backtest demonstrates puts are at least break-even
+    # in the current regime, refuse all put entries. The regime gate (P1-C
+    # from 5/5) helps on extreme rally days but doesn't catch chop-day
+    # afternoon-rally crushes. This is a blanket halt — reversible the
+    # moment a backtest shows put picks have edge again.
+    "block_puts":              True,
+    "block_calls":             False,    # symmetric switch for completeness
+
     # ── Live news-monitor exit (intraday) ─────────────────────────────────────
     # Every N seconds during the session, pull fresh headlines for every open
     # underlying. If a material article's sentiment runs *against* the

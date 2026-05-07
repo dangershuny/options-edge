@@ -246,9 +246,31 @@ def _score_cross_validation_gate(t: dict, min_score: float,
                   f"{direction} on {opt_type} (effective {new_score:.1f})")
 
 
+def _direction_halt_gate(t: dict) -> tuple[bool, str]:
+    """RISK['block_puts']/['block_calls'] hard halt. Built 2026-05-06 after
+    forensic showed puts 0/6 over 2 weeks (-$345). Blanket direction halt
+    until backtest demonstrates the blocked direction has edge again."""
+    try:
+        from risk.config import RISK
+    except Exception:
+        return True, ""
+    opt_type = (t.get("option_type") or "").lower()
+    if opt_type == "put" and bool(RISK.get("block_puts", False)):
+        return False, ("PUTS BLOCKED globally (RISK['block_puts']=True; "
+                       "0-for-6 over 4/24-5/5; flip to False after backtest "
+                       "shows edge)")
+    if opt_type == "call" and bool(RISK.get("block_calls", False)):
+        return False, "CALLS BLOCKED globally (RISK['block_calls']=True)"
+    return True, ""
+
+
 def _all_new_gates(t: dict, min_score: float) -> tuple[bool, str]:
-    """Run all 2026-05-06 entry gates in order. Short-circuit on first block."""
-    for gate in (_regime_gate, _circuit_breaker_gate, _spread_gate):
+    """Run all 2026-05-06 entry gates in order. Short-circuit on first block.
+    Direction halt runs first because it's a hard switch — no point
+    computing regime/spread/cross-validation if we're not taking the
+    direction at all."""
+    for gate in (_direction_halt_gate, _regime_gate, _circuit_breaker_gate,
+                 _spread_gate):
         ok, reason = gate(t)
         if not ok:
             return False, reason
