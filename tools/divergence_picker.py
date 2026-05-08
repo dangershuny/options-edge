@@ -112,19 +112,37 @@ def pick_contract_for_ticker(ticker: str, target_type: str,
     if eligible.empty:
         return {"ticker": ticker, "error": f"no {target_type} BUY VOL contracts after filter"}
 
-    # Apply existing pre-trade filters (price, etc.) via paper_trade helper
-    from tools.paper_trade import _passes_pretrade_filters
+    # Apply pre-trade filters (price, trend, etc.) AND the 2026-05-06 entry
+    # gates (block_puts, regime, circuit-breaker, spread, score-cross-val).
+    # Bug observed 2026-05-07: BCRX put entered through this path because
+    # only _passes_pretrade_filters was called, not _all_new_gates — the
+    # block_puts flag had no effect on divergence-driven entries. Now both
+    # gates run; either can reject.
+    from tools.paper_trade import _passes_pretrade_filters, _all_new_gates
+    from risk.config import RISK
+    min_score_for_gates = float(RISK.get("min_score_to_trade", 60))
     rows = []
+    rejected: list[tuple[str, str]] = []
     for _, r in eligible.iterrows():
         d = r.to_dict()
         d["option_type"] = d["type"]
         d["stock_price_at_snap"] = d.get("stock_price")
         ok, reason = _passes_pretrade_filters(d)
         if not ok:
+            rejected.append((d.get("type", "?"), reason))
+            continue
+        ok, reason = _all_new_gates(d, min_score_for_gates)
+        if not ok:
+            rejected.append((d.get("type", "?"), reason))
             continue
         rows.append(r)
     if not rows:
-        return {"ticker": ticker, "error": "all contracts blocked by pre-trade filters"}
+        # Surface the most informative reason in the error so the caller
+        # logs the actual gate that fired (block_puts, regime, etc.)
+        why = "all contracts blocked by pre-trade filters"
+        if rejected:
+            why = f"all blocked: {rejected[0][1]} (and {len(rejected)-1} more)"
+        return {"ticker": ticker, "error": why}
 
     # Pick the highest-scoring one. (The scorer is anti-correlated overall,
     # but WITHIN a divergence-flagged ticker its job is "best contract for

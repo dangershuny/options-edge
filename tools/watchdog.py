@@ -229,7 +229,16 @@ def daemon_alive_and_fresh() -> tuple[bool, str]:
     """Daemon = ExitMonitor's --monitor-only --monitor-seconds 15 process.
     Considered healthy if (a) at least one such python proc exists AND
     (b) every 'open' position in engine_state.db has last_monitor_check
-    within MONITOR_FRESHNESS_THRESHOLD_SEC."""
+    within MONITOR_FRESHNESS_THRESHOLD_SEC.
+
+    Bootstrap exception (added 2026-05-07 after watchdog fired
+    relaunch_daemon 7× in 7 min at market open): if a stale check is
+    "ancient" (last tick before today's pre-open at 09:00 ET), that's
+    expected overnight gap — not daemon failure. The daemon JUST started
+    and needs a tick or two to catch up. Don't kill it before its first
+    tick lands. Only flag stale when the gap is "modern" (this session
+    but >threshold) — that's a real hang.
+    """
     procs = _list_python_procs("--monitor-only", must_not_match="momentum-edge")
     if not procs:
         return False, "no daemon process"
@@ -245,22 +254,47 @@ def daemon_alive_and_fresh() -> tuple[bool, str]:
         return True, f"daemon alive (pid={procs[0]['pid']}); no open positions to monitor"
 
     now = datetime.now(tz=timezone.utc)
-    stale = []
+    # Today's 09:00 ET (1 hour before RTH open) — anything before that is
+    # "ancient" (yesterday or earlier) and expected after an overnight gap.
+    todays_open_et = datetime.now(tz=NY).replace(
+        hour=9, minute=0, second=0, microsecond=0
+    )
+    todays_open_utc = todays_open_et.astimezone(timezone.utc)
+
+    modern_stale = []   # this session, >threshold — real hang
+    ancient_stale = []  # last tick was yesterday/earlier — bootstrap
     for r in opens:
         last = r.get("last_monitor_check")
         if not last:
-            stale.append({"occ": r["occ_symbol"], "age_sec": -1})
+            # Never monitored — could be a fresh entry; treat as ancient
+            # (give daemon a tick to pick it up rather than thrashing)
+            ancient_stale.append({"occ": r["occ_symbol"], "age_sec": -1,
+                                   "reason": "never monitored"})
             continue
         try:
             last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
-            age = (now - last_dt).total_seconds()
-            if age > MONITOR_FRESHNESS_THRESHOLD_SEC:
-                stale.append({"occ": r["occ_symbol"], "age_sec": int(age)})
         except Exception:
-            stale.append({"occ": r["occ_symbol"], "age_sec": -1})
+            ancient_stale.append({"occ": r["occ_symbol"], "age_sec": -1,
+                                   "reason": "unparseable"})
+            continue
+        age = (now - last_dt).total_seconds()
+        if age <= MONITOR_FRESHNESS_THRESHOLD_SEC:
+            continue  # fresh
+        if last_dt < todays_open_utc:
+            ancient_stale.append({"occ": r["occ_symbol"],
+                                   "age_sec": int(age)})
+        else:
+            modern_stale.append({"occ": r["occ_symbol"],
+                                  "age_sec": int(age)})
 
-    if stale:
-        return False, f"stale monitor checks: {stale}"
+    if modern_stale:
+        return False, f"stale monitor checks (this session): {modern_stale}"
+    if ancient_stale:
+        # Daemon is alive, just hasn't caught up to overnight-gapped
+        # positions yet. Don't fire relaunch — let the next tick land.
+        return True, (f"daemon alive (pid={procs[0]['pid']}), "
+                       f"bootstrap-stale (waiting for first tick): "
+                       f"{ancient_stale}")
     return True, f"daemon alive (pid={procs[0]['pid']}), {len(opens)} positions fresh"
 
 
