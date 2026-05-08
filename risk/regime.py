@@ -6,6 +6,11 @@ three hit SL same session. The puts may have had directionally-correct
 divergence signals over a longer horizon, but on an SPY rally day the
 intraday momentum steamrolled them inside hours.
 
+Asymmetric gate (2026-05-08): operator removed the CALL soft-block.
+Reasoning: a mildly-down SPY day still produces decent individual
+long-side setups (sector rotations, single-name news, etc.). Don't
+filter out an entire signal class because the index drifted -0.5%.
+
 Gate logic (defaults; overridable via RISK):
 
     SPY intraday return        | calls allowed?  | puts allowed?
@@ -13,9 +18,13 @@ Gate logic (defaults; overridable via RISK):
     +1.0% or more              | yes             | NO (block)
     +0.3% to +1.0%             | yes             | only if div ≥ STRONG_DIV
     -0.3% to +0.3% (chop)      | yes             | yes
-    -0.3% to -1.0%             | only if div ≥   | yes
-                                  STRONG_DIV     |
+    -0.3% to -1.0%             | YES (no block)  | yes
     -1.0% or worse             | NO (block)      | yes
+
+The CALL HARD block at SPY ≤ -1% is retained — at that magnitude
+selloffs are usually market-wide and individual long-side setups tend
+to follow. PUT soft+hard blocks unchanged (rally days still penalize
+shorts), though `block_puts=True` in RISK currently overrides anyway.
 
 "Intraday return" = (last_price / prev_close) - 1, freshly fetched at
 entry-decision time (cached for 60s so repeated calls within a tier loop
@@ -166,18 +175,16 @@ def check(opt_type: str,
         return False, (f"regime hard-block: CALL vs SPY {spy*100:+.2f}% "
                        f"(<= -{HARD_BLOCK_PCT*100:.2f}%)")
 
-    # Soft blocks (override allowed if divergence is strong)
+    # Soft blocks (override allowed if divergence is strong).
+    # 2026-05-08: CALL soft-block removed at operator's direction. A mild
+    # SPY drawdown shouldn't filter out the entire long-side signal set —
+    # individual setups can still rip. The CALL hard block at SPY ≤ -1%
+    # above is retained for catastrophic regimes where everything follows.
     if ot == "put" and spy >= SOFT_BLOCK_PCT:
         if div >= STRONG_DIV_SCORE:
             return True, (f"regime soft-warn (SPY +{spy*100:.2f}%) "
                           f"OVERRIDDEN by div_score={div:.2f}")
         return False, (f"regime soft-block: PUT vs SPY +{spy*100:.2f}% "
-                       f"and divergence {div:.2f} < {STRONG_DIV_SCORE}")
-    if ot == "call" and spy <= -SOFT_BLOCK_PCT:
-        if div >= STRONG_DIV_SCORE:
-            return True, (f"regime soft-warn (SPY {spy*100:+.2f}%) "
-                          f"OVERRIDDEN by div_score={div:.2f}")
-        return False, (f"regime soft-block: CALL vs SPY {spy*100:+.2f}% "
                        f"and divergence {div:.2f} < {STRONG_DIV_SCORE}")
 
     return True, f"regime ok (SPY {spy*100:+.2f}%, label={r.label})"
