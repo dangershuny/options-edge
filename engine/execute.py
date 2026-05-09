@@ -62,6 +62,7 @@ from engine.state import (
     mark_closing, revert_to_open, mark_phantom, list_closing,
     update_sl, record_monitor_check, increment_sl_reset,
     find_phantom_for_occ, unphantom,
+    list_live_rows_for_occ, force_mark_closed,
 )
 from engine.news_monitor import (
     check_position_news, describe_signal, news_check_due,
@@ -70,6 +71,19 @@ from engine.news_monitor import (
 
 def _log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+# ── Session-scoped circuit breakers ──────────────────────────────────────────
+# OCC symbols whose SELL got rejected with a non-recoverable broker error
+# (e.g., PDT protection 40310100). monitor_tick skips these for the rest of
+# the session so we don't burn cycles re-firing exits the broker won't accept.
+# Reset on daemon restart; CRIT Telegram fires once per OCC entry.
+_PDT_BLOCKED_OCCS: set[str] = set()
+# OCCs where we've recently submitted a SELL — back off from re-firing within
+# RETRY_BACKOFF_SEC even if the trigger condition still holds. Keeps logs
+# clean and avoids stacking duplicate orders during fill confirmation.
+_RECENT_EXIT_ATTEMPT: dict[str, datetime] = {}
+RETRY_BACKOFF_SEC = 30
 
 
 # ── Morning session ──────────────────────────────────────────────────────────
@@ -404,6 +418,29 @@ def reconcile_with_broker() -> None:
         _log(f"  reconcile: untracked broker position {sym} qty={p.qty} "
              f"— no matching phantom; run `python -m tools.backfill_positions`")
 
+    # 4. Dual-live-record dedupe (added 2026-05-08 after CHPT id=35 closed
+    # but id=36 created later for same OCC). When >1 row for the same OCC
+    # is in open/closing status, only one can correspond to the broker's
+    # single position. Keep the highest-id row (most recent — likeliest
+    # source of truth from the latest reconcile/backfill) and force-close
+    # the older ones with realized_pl=0.
+    seen_occs: dict[str, list[dict]] = {}
+    for r in list_open():
+        seen_occs.setdefault(r["occ_symbol"], []).append(r)
+    for occ, rows in seen_occs.items():
+        if len(rows) <= 1:
+            continue
+        if occ not in live_positions:
+            continue  # no broker position — leave for the phantom path
+        # Keep the most recent (highest id); close the rest as duplicates
+        sorted_rows = sorted(rows, key=lambda r: r["id"], reverse=True)
+        keep = sorted_rows[0]
+        for dup in sorted_rows[1:]:
+            if force_mark_closed(dup["id"],
+                                  reason=f"duplicate of id={keep['id']}"):
+                _log(f"  reconcile: dedup-closed {occ} id={dup['id']} "
+                     f"(duplicate of id={keep['id']})")
+
 
 # ── Intraday monitor ─────────────────────────────────────────────────────────
 
@@ -440,6 +477,11 @@ def monitor_tick() -> None:
     today_iso = date.today().isoformat()
 
     for p in open_positions:
+        # Skip OCCs the broker has already rejected for PDT this session —
+        # don't burn cycles or log noise. The CRIT alert from _execute_exit
+        # surfaced the issue; operator handles manually.
+        if p["occ_symbol"] in _PDT_BLOCKED_OCCS:
+            continue
         try:
             q = alpaca.get_quote(p["occ_symbol"])
         except BrokerError as e:
@@ -474,7 +516,40 @@ def monitor_tick() -> None:
             mark = q.mid or q.bid
         if mark <= 0:
             continue
+
+        # ── Outlier-print rejection (added 2026-05-08 after BCRX/CHPT) ──────
+        # Bug: at 09:35 ET on 5/8, opening-auction quotes printed BCRX mid
+        # at $1.77 (entry $0.75 → bogus +136% peak) and CHPT mid at $1.47
+        # (entry $0.40 → bogus +267%). update_peak accepted them, ratcheted
+        # SL to +85% / +175%, and locked the positions into instant-fire SL
+        # for the rest of the session. Real first-real-trade prints arrived
+        # within minutes but peak was already poisoned (only_tighter=True).
+        #
+        # Two checks that ensure we don't poison peak with garbage:
+        #   1. Ask far above bid → ask is stale/bogus; use bid as mark
+        #   2. mark would jump >2× the prior peak → require confirmation
+        #      via bid; reject if bid doesn't support the jump
         entry = float(p["entry_price"])
+        prior_peak = float(p["trailing_peak"] or entry)
+        if q.bid and q.ask and q.bid > 0 and q.ask > q.bid * 4.0:
+            old_mark = mark
+            mark = q.bid
+            _log(f"  {p['occ_symbol']}: ask=${q.ask:.2f} > 4x bid=${q.bid:.2f} "
+                 f"(likely outlier ask) — using bid mark=${mark:.2f} "
+                 f"instead of mid=${old_mark:.2f}")
+        if prior_peak > 0 and mark > prior_peak * 2.0:
+            # Suspicious jump. Confirm via bid — the bid won't print 2x
+            # without a real move underneath.
+            bid_supports = q.bid and q.bid > prior_peak * 1.5
+            if not bid_supports:
+                _log(f"  {p['occ_symbol']}: REJECT outlier mark=${mark:.2f} "
+                     f"(prior peak ${prior_peak:.2f}, "
+                     f"bid=${q.bid or 0:.2f} doesn't confirm). "
+                     f"Skipping peak/ratchet/SL eval for this tick.")
+                record_monitor_check(p["id"],
+                                      datetime.now(tz=timezone.utc).isoformat())
+                continue
+
         pnl_pct = (mark / entry) - 1
 
         # Update trailing peak
@@ -645,28 +720,65 @@ def _execute_exit(position: dict, reason: str, urgent: bool = False) -> None:
     stores exit_order_id so reconcile_with_broker can finalize once Alpaca
     confirms the fill, or revert to 'open' if the limit order expires.
     """
+    occ = position["occ_symbol"]
+
+    # Backoff: if we just submitted a SELL on this OCC, don't re-fire within
+    # RETRY_BACKOFF_SEC. Lets the broker's accept/reject land via reconcile.
+    last = _RECENT_EXIT_ATTEMPT.get(occ)
+    if last and (datetime.now(tz=timezone.utc) - last).total_seconds() < RETRY_BACKOFF_SEC:
+        return
+
     try:
-        q = alpaca.get_quote(position["occ_symbol"])
+        q = alpaca.get_quote(occ)
     except BrokerError as e:
-        _log(f"  quote fail for exit {position['occ_symbol']}: {e}")
+        _log(f"  quote fail for exit {occ}: {e}")
         return
     # Exit at mid (or bid-side for urgent) — avoid paying the spread twice
     px = round(q.bid if urgent else q.mid, 2)
     if px <= 0:
         px = round(q.mid or q.ask, 2)
     try:
-        o = alpaca.sell_option(position["occ_symbol"], int(position["qty"]),
-                               limit_price=px)
+        o = alpaca.sell_option(occ, int(position["qty"]), limit_price=px)
     except BrokerError as e:
-        _log(f"  SELL REJECT {position['occ_symbol']}: {e}")
+        msg = str(e)
+        # PDT (pattern-day-trading) rejection — non-recoverable mid-session.
+        # Stop firing exits on this OCC for the rest of the session and CRIT.
+        # Bug observed 5/8: BCRX/CHPT exits got PDT-rejected at 09:35 ET, the
+        # daemon kept retrying every 25s for 3 hours, position bled from
+        # -2.7% to -77% before one rejection finally cleared. Don't repeat.
+        is_pdt = ("40310100" in msg
+                  or "pattern day trading" in msg.lower()
+                  or "day trading" in msg.lower())
+        if is_pdt:
+            _PDT_BLOCKED_OCCS.add(occ)
+            _log(f"  PDT REJECT {occ} — blocking further exits this session")
+            try:
+                from tools.notify import send
+                send(
+                    "CRIT",
+                    f"PDT rejection: {occ}",
+                    f"Broker refused SELL with code 40310100. Will NOT retry "
+                    f"until next session. Position id={position['id']} stays "
+                    f"open. Manual review required — Alpaca dashboard or "
+                    f"override_buy.\n\nReject msg: {msg[:200]}",
+                )
+            except Exception:
+                pass
+            _RECENT_EXIT_ATTEMPT[occ] = datetime.now(tz=timezone.utc)
+            return
+        # Non-PDT broker error — fall through to normal log; next tick may retry
+        _log(f"  SELL REJECT {occ}: {e}")
+        _RECENT_EXIT_ATTEMPT[occ] = datetime.now(tz=timezone.utc)
         return
+
     mark_closing(position["id"], o.id, reason)
+    _RECENT_EXIT_ATTEMPT[occ] = datetime.now(tz=timezone.utc)
     _log(f"  SELL submitted {o.id} @ ${px:.2f} — {reason} (awaiting fill)")
     try:
         from tools.notify import send
         send(
             "INFO",
-            f"close submitted {position['occ_symbol']} @ ${px:.2f}",
+            f"close submitted {occ} @ ${px:.2f}",
             f"qty={position['qty']} reason={reason}",
         )
     except Exception:

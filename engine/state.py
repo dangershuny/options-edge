@@ -340,6 +340,36 @@ def unphantom(position_id: int, broker_qty: int | None = None) -> bool:
         return cur.rowcount > 0
 
 
+def list_live_rows_for_occ(occ_symbol: str) -> list[dict]:
+    """Return all rows for `occ_symbol` whose status is open / closing.
+    Used by reconcile to detect dual-live-record drift (more than one
+    engine row tracking the same broker position)."""
+    init_db()
+    with _db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM positions "
+            "WHERE occ_symbol = ? AND status IN ('open','closing') "
+            "ORDER BY id DESC",
+            (occ_symbol,),
+        )]
+
+
+def force_mark_closed(position_id: int, reason: str = "duplicate row merged") -> bool:
+    """Hard-close a duplicate row that doesn't represent a real broker
+    position. Sets status='closed' with realized_pl=0 and a clear reason.
+    Distinct from record_close because no actual fill occurred — this
+    is purely a bookkeeping cleanup for the dual-record drift bug."""
+    with _db() as c:
+        cur = c.execute(
+            "UPDATE positions SET status = 'closed', exit_queued = 0, "
+            "realized_pl = 0, exit_reason = ?, "
+            "exit_date = COALESCE(exit_date, ?) "
+            "WHERE id = ? AND status IN ('open','closing')",
+            (reason, date.today().isoformat(), position_id),
+        )
+        return cur.rowcount > 0
+
+
 def list_closing() -> list[dict]:
     """Rows that have submitted a SELL and are awaiting fill confirmation."""
     init_db()
