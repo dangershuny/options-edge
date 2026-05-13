@@ -25,6 +25,7 @@ Run modes:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time as _time
@@ -77,13 +78,64 @@ def _log(msg: str) -> None:
 # OCC symbols whose SELL got rejected with a non-recoverable broker error
 # (e.g., PDT protection 40310100). monitor_tick skips these for the rest of
 # the session so we don't burn cycles re-firing exits the broker won't accept.
-# Reset on daemon restart; CRIT Telegram fires once per OCC entry.
-_PDT_BLOCKED_OCCS: set[str] = set()
+# CRIT Telegram fires once per OCC entry.
+#
+# 2026-05-13: Persisted to disk so daemon restart (which happened every
+# 3 minutes on 5/12 due to watchdog dup-kill cycle) doesn't wipe the set.
+# Today QS got "blocking further exits this session" logged 5 times — the
+# in-memory set worked but every restart wiped it. Disk-backed now.
+_PDT_BLOCKED_FILE = Path(__file__).resolve().parent.parent / "logs" / "pdt_blocked_occs.json"
+
+
+def _pdt_load() -> set[str]:
+    try:
+        if _PDT_BLOCKED_FILE.exists():
+            data = json.loads(_PDT_BLOCKED_FILE.read_text(encoding="utf-8"))
+            today = date.today().isoformat()
+            # Auto-expire entries from prior trading days. A new session
+            # gets a fresh slate — PDT counter rolls in 5 days.
+            return {occ for occ, d in data.items() if d == today}
+    except Exception:
+        pass
+    return set()
+
+
+def _pdt_save(blocked: set[str]) -> None:
+    try:
+        today = date.today().isoformat()
+        _PDT_BLOCKED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _PDT_BLOCKED_FILE.write_text(
+            json.dumps({occ: today for occ in blocked}),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+_PDT_BLOCKED_OCCS: set[str] = _pdt_load()
 # OCCs where we've recently submitted a SELL — back off from re-firing within
 # RETRY_BACKOFF_SEC even if the trigger condition still holds. Keeps logs
 # clean and avoids stacking duplicate orders during fill confirmation.
 _RECENT_EXIT_ATTEMPT: dict[str, datetime] = {}
 RETRY_BACKOFF_SEC = 30
+
+# Day-trade buying-power guard. Alpaca paper account at multiplier=1 (cash
+# account simulation) enforces PDT: a same-day buy+sell on the same
+# security is a "day trade." Hit 4 day-trades in a rolling 5-day window
+# and the account flags Pattern Day Trader. Alpaca rejects the 4th
+# attempt with code 40310100 BEFORE flagging.
+#
+# Observed 5/12: 3 day-trades got us to count=3 (we're 1 away from PDT).
+# Today the daemon would have attempted 2 more same-day SL exits on
+# QUBT 12.5C and 13C, both PDT-rejected.
+#
+# Guard: when daytrade_count >= DAYTRADE_LIMIT_FOR_SAMEDAY_EXIT and the
+# position was entered today, QUEUE the exit instead of firing it. The
+# queued exit flushes at tomorrow's market open as a non-same-day exit
+# (no PDT count incurred). Saves us from making the 4th day-trade and
+# getting flagged.
+DAYTRADE_LIMIT_FOR_SAMEDAY_EXIT = 3   # paper account threshold
+DAYTRADE_HARD_LIMIT             = 4   # PDT flag triggers here
 
 
 # ── Morning session ──────────────────────────────────────────────────────────
@@ -709,9 +761,44 @@ def _handle_exit_trigger(position: dict, reason: str) -> None:
     if not allowed:
         _log(f"  {position['occ_symbol']}: {reason} — QUEUED ({why})")
         queue_exit(position["id"], reason)
-    else:
-        _log(f"  {position['occ_symbol']}: {reason} — EXITING NOW")
-        _execute_exit(position, reason, urgent=True)
+        return
+
+    # 2026-05-13 — Day-trade guard. If position was entered today AND
+    # broker's daytrade_count is already at the cash-account limit,
+    # this exit would BE the 4th day-trade → PDT flag → guaranteed
+    # rejection. Queue the exit instead of firing it; it flushes at
+    # tomorrow's open as a non-same-day exit (no PDT count incurred).
+    if entry_date == date.today():
+        try:
+            acct = alpaca.get_account()
+            # Look up raw daytrade_count (only present on the underlying
+            # alpaca client account, not on our adapter snapshot)
+            from broker.alpaca import _trading_client
+            raw = _trading_client().get_account()
+            dt_count = int(getattr(raw, "daytrade_count", 0) or 0)
+            if dt_count >= DAYTRADE_LIMIT_FOR_SAMEDAY_EXIT:
+                _log(f"  {position['occ_symbol']}: {reason} — QUEUED "
+                     f"(daytrade_count={dt_count} ≥ {DAYTRADE_LIMIT_FOR_SAMEDAY_EXIT}, "
+                     f"avoiding 4th day-trade / PDT flag)")
+                queue_exit(position["id"], reason + f" (deferred: dt_count={dt_count})")
+                try:
+                    from tools.notify import send
+                    send("WARN",
+                         f"Same-day exit deferred: {position['occ_symbol']}",
+                         f"Day-trade count {dt_count}/{DAYTRADE_HARD_LIMIT} — "
+                         f"exit queued for tomorrow's open to avoid PDT flag. "
+                         f"Trigger was: {reason}")
+                except Exception:
+                    pass
+                return
+        except Exception as e:
+            # If we can't read daytrade_count, fall through to normal
+            # exit path and let the PDT circuit breaker catch a reject.
+            _log(f"  {position['occ_symbol']}: daytrade_count probe failed ({e}); "
+                 f"proceeding with exit attempt")
+
+    _log(f"  {position['occ_symbol']}: {reason} — EXITING NOW")
+    _execute_exit(position, reason, urgent=True)
 
 
 def _execute_exit(position: dict, reason: str, urgent: bool = False) -> None:
@@ -750,8 +837,21 @@ def _execute_exit(position: dict, reason: str, urgent: bool = False) -> None:
                   or "pattern day trading" in msg.lower()
                   or "day trading" in msg.lower())
         if is_pdt:
+            already_blocked = occ in _PDT_BLOCKED_OCCS
             _PDT_BLOCKED_OCCS.add(occ)
-            _log(f"  PDT REJECT {occ} — blocking further exits this session")
+            _pdt_save(_PDT_BLOCKED_OCCS)   # persist so daemon restart preserves it
+            if already_blocked:
+                # We already blocked this OCC earlier this session — the
+                # daemon must have restarted and lost the in-memory set
+                # before today's disk-persistence fix landed. Log the
+                # collision quietly and stop processing — no need to
+                # re-CRIT the operator who already has the first alert.
+                _log(f"  PDT REJECT {occ} — already in disk-blocked set; "
+                     f"silenced duplicate")
+                _RECENT_EXIT_ATTEMPT[occ] = datetime.now(tz=timezone.utc)
+                return
+            _log(f"  PDT REJECT {occ} — blocking further exits this session "
+                 f"(persisted to {_PDT_BLOCKED_FILE.name})")
             try:
                 from tools.notify import send
                 send(
@@ -845,6 +945,41 @@ def main():
         if args.monitor_seconds <= 0:
             print("--monitor-only requires --monitor-seconds N (e.g., 15)")
             return 2
+
+        # ── Daemon singleton lock (added 2026-05-13) ───────────────────────
+        # Bug: on 5/12 the watchdog's kill_duplicate_processes was killing
+        # the daemon every 3 min because the bat retry-loop + my Claude
+        # shell were spawning extra bats with their own daemon children.
+        # Result: PDT-blocked set wiped on every restart; SL fired
+        # repeatedly + got rejected repeatedly.
+        #
+        # Fix: write a PID file at startup. Refuse to start if another
+        # daemon is alive. Sentinel's supervisor.py uses the same pattern.
+        from pathlib import Path as _Path
+        DAEMON_PID = _Path(__file__).resolve().parent.parent / "logs" / "exit_daemon.pid"
+        try:
+            if DAEMON_PID.exists():
+                existing = int(DAEMON_PID.read_text().strip())
+                # Check if PID is alive
+                try:
+                    os.kill(existing, 0)  # raises if dead
+                    print(f"--monitor-only: another daemon is alive (pid={existing}); "
+                          f"refusing to start duplicate. Delete {DAEMON_PID} if stale.")
+                    return 0
+                except (OSError, ProcessLookupError):
+                    pass  # stale; overwrite below
+            DAEMON_PID.parent.mkdir(parents=True, exist_ok=True)
+            DAEMON_PID.write_text(str(os.getpid()))
+            import atexit
+            def _cleanup_pid():
+                try:
+                    if DAEMON_PID.exists() and DAEMON_PID.read_text().strip() == str(os.getpid()):
+                        DAEMON_PID.unlink()
+                except Exception:
+                    pass
+            atexit.register(_cleanup_pid)
+        except Exception as e:
+            print(f"daemon singleton lock failed (non-fatal): {e}")
         # fall through to the monitor loop below
     else:
         morning_session(dry_run=args.dry_run)

@@ -454,6 +454,27 @@ def kill_duplicate_processes(dry_run: bool) -> dict:
     # Each rule: (label, must_match_substring, must_not_match_substring)
     # Substrings are chosen so each rule matches EXACTLY ONE legitimate
     # process — anything beyond that is a zombie.
+    # ── Daemon dedup honors the exit_daemon.pid file ───────────────────────
+    # 2026-05-13 fix: the daemon now writes logs/exit_daemon.pid at startup
+    # (singleton lock added in engine.execute). The PID in that file is the
+    # legitimate, in-charge daemon — kill ANYTHING else matching the cmd
+    # pattern, even if it has a higher PID. This stops the watchdog from
+    # killing the rightful daemon in favor of a duplicate bat-spawned by
+    # external noise (which used to wipe _PDT_BLOCKED_OCCS every restart).
+    daemon_pid_file = REPO_ROOT / "logs" / "exit_daemon.pid"
+    canonical_daemon_pid: int | None = None
+    if daemon_pid_file.exists():
+        try:
+            pid = int(daemon_pid_file.read_text().strip())
+            # Verify the PID is alive AND running our daemon cmd
+            for p in _list_python_procs("--monitor-only",
+                                          must_not_match="momentum-edge"):
+                if p["pid"] == pid:
+                    canonical_daemon_pid = pid
+                    break
+        except Exception:
+            pass
+
     for label, match, exclude in [
         ("daemon", "--monitor-only", "momentum-edge"),
         ("listener", "-m tools.telegram_listener", "momentum-edge"),
@@ -462,9 +483,14 @@ def kill_duplicate_processes(dry_run: bool) -> dict:
         procs = _list_python_procs(match, must_not_match=exclude)
         if len(procs) <= 1:
             continue
-        # Keep highest PID (typically most recent), kill rest
-        sorted_procs = sorted(procs, key=lambda p: p["pid"], reverse=True)
-        for p in sorted_procs[1:]:
+        if label == "daemon" and canonical_daemon_pid is not None:
+            # Keep the PID-file-blessed daemon; kill everything else
+            to_kill = [p for p in procs if p["pid"] != canonical_daemon_pid]
+        else:
+            # No PID file — fall back to old behavior (highest PID wins)
+            sorted_procs = sorted(procs, key=lambda p: p["pid"], reverse=True)
+            to_kill = sorted_procs[1:]
+        for p in to_kill:
             if not dry_run:
                 _kill(p["pid"])
             actions.append({"label": label, "killed": p["pid"]})
