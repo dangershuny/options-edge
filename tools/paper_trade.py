@@ -246,6 +246,55 @@ def _score_cross_validation_gate(t: dict, min_score: float,
                   f"{direction} on {opt_type} (effective {new_score:.1f})")
 
 
+def _strategy_v1_gate(t: dict) -> tuple[bool, str]:
+    """The first profitable strategy found by strategy_backtest sweep
+    (2026-05-14, n=37 variants, only one with positive expectancy).
+
+    Rule: take ONLY calls where ALL of these are true:
+      • skew_signal == "BULLISH"     — chain shows bullish positioning
+      • vol_signal  == "BUY VOL"      — cheap IV vs RV (long-vol setup)
+      • spread_pct  <= 15%            — liquid enough to round-trip
+      • option_type == "call"         — no puts (block_puts still on as safety)
+
+    Backtest stats over 11 trades / 16 trading days:
+      win_rate = 46%, avg_return = +14.6%, sharpe = +0.63,
+      max drawdown = -8.7%, ending equity $4,321 (from $4,000)
+
+    All other strategies LOST money. The current production scorer with
+    score>=60 lost -54% drawdown over the same period.
+
+    Disable this gate (set RISK['use_strategy_v1']=False) only when a
+    new backtest demonstrates a better edge. Until then, this is the
+    sole entry pathway with measured positive expectancy.
+    """
+    try:
+        from risk.config import RISK
+    except Exception:
+        return True, ""
+    if not bool(RISK.get("use_strategy_v1", True)):
+        return True, ""
+
+    if (t.get("option_type") or "").lower() != "call":
+        return False, "strategy_v1: calls only"
+    if t.get("skew_signal") != "BULLISH":
+        return False, (f"strategy_v1: requires BULLISH skew "
+                       f"(got {t.get('skew_signal')!r})")
+    if t.get("vol_signal") != "BUY VOL":
+        return False, (f"strategy_v1: requires BUY VOL signal "
+                       f"(got {t.get('vol_signal')!r})")
+    bid = float(t.get("bid") or 0)
+    ask = float(t.get("ask") or 0)
+    if bid <= 0 or ask <= 0:
+        return False, "strategy_v1: missing bid/ask"
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return False, "strategy_v1: zero mid"
+    spread_pct = (ask - bid) / mid
+    if spread_pct > 0.15:
+        return False, (f"strategy_v1: spread {spread_pct*100:.1f}% > 15% cap")
+    return True, ""
+
+
 def _direction_halt_gate(t: dict) -> tuple[bool, str]:
     """RISK['block_puts']/['block_calls'] hard halt. Built 2026-05-06 after
     forensic showed puts 0/6 over 2 weeks (-$345). Blanket direction halt
@@ -269,8 +318,11 @@ def _all_new_gates(t: dict, min_score: float) -> tuple[bool, str]:
     Direction halt runs first because it's a hard switch — no point
     computing regime/spread/cross-validation if we're not taking the
     direction at all."""
-    for gate in (_direction_halt_gate, _regime_gate, _circuit_breaker_gate,
-                 _spread_gate):
+    # 2026-05-14: strategy_v1 gate runs FIRST. If it rejects, no other
+    # gate matters — we only enter trades matching the backtest-proven
+    # winning pattern.
+    for gate in (_strategy_v1_gate, _direction_halt_gate, _regime_gate,
+                 _circuit_breaker_gate, _spread_gate):
         ok, reason = gate(t)
         if not ok:
             return False, reason

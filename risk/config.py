@@ -232,6 +232,17 @@ RISK: dict = {
     "block_puts":              True,
     "block_calls":             False,    # symmetric switch for completeness
 
+    # ── Strategy v1 — the only profitable pattern in our data (2026-05-14) ────
+    # 37-strategy sweep across 744 candidates / 594k chain_surface rows.
+    # Only ONE variant ended above starting equity:
+    #   • calls only
+    #   • skew_signal == BULLISH AND vol_signal == BUY VOL
+    #   • spread_pct <= 15%
+    #   • 5-day max hold, -12% mid-SL, NO aggressive ratchet
+    # 11 trades, 46% wr, +14.6% avg, Sharpe +0.63, max DD -8.7%.
+    # See tools/strategy_backtest.py and logs/strategy_backtest_report.md.
+    "use_strategy_v1":         True,
+
     # ── Live news-monitor exit (intraday) ─────────────────────────────────────
     # Every N seconds during the session, pull fresh headlines for every open
     # underlying. If a material article's sentiment runs *against* the
