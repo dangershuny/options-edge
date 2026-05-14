@@ -629,9 +629,52 @@ def render_report(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# ── A/B test helper ─────────────────────────────────────────────────────────
+
+def ab_test(rows: list[dict], surface: dict,
+            baseline_name: str = "35_bullskew_AND_buyvol",
+            challengers: list[tuple] | None = None) -> str:
+    """Run the current production strategy_v1 (baseline) head-to-head
+    against one or more proposed variants. Prints a side-by-side
+    comparison. Use to vet any tweak BEFORE deploying it live."""
+    baseline_tuple = next((s for s in STRATEGIES if s[0] == baseline_name), None)
+    if baseline_tuple is None:
+        raise ValueError(f"baseline {baseline_name} not in STRATEGIES")
+    if not challengers:
+        return "no challenger strategies supplied"
+
+    print(f"\n── A/B Test ──")
+    print(f"  baseline: {baseline_name}")
+    print(f"  challengers: {[c[0] for c in challengers]}\n")
+    results = [run_strategy(baseline_tuple[0], baseline_tuple[1],
+                              baseline_tuple[2], rows, surface)]
+    for name, sel, ext in challengers:
+        results.append(run_strategy(name, sel, ext, rows, surface))
+
+    out = ["# A/B Test\n", "| strategy | n | win% | avg ret | sharpe | dd | end equity |",
+           "|---|---:|---:|---:|---:|---:|---:|"]
+    for r in results:
+        if r["n"] == 0:
+            out.append(f"| `{r['name']}` | 0 | — | — | — | — | — |")
+            continue
+        wr = f"{r['win_rate']*100:.0f}%" if r['win_rate'] is not None else "—"
+        ar = f"{r['avg_return']*100:+.1f}%" if r['avg_return'] is not None else "—"
+        sh = f"{r['sharpe']:+.2f}" if r['sharpe'] is not None else "—"
+        dd = f"{r['max_drawdown_pct']*100:.1f}%"
+        out.append(f"| `{r['name']}` | {r['n']} | {wr} | {ar} | {sh} | "
+                   f"{dd} | ${r['ending_equity']:,.0f} |")
+    txt = "\n".join(out) + "\n"
+    print(txt)
+    return txt
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strategy", help="run only this named strategy")
+    ap.add_argument("--ab", nargs="+",
+                    help="A/B test mode: run current strategy_v1 baseline "
+                          "head-to-head against these named strategies. "
+                          "Example: --ab 30_bullskew_tight20 32_bullskew_tight15_nosl")
     args = ap.parse_args()
 
     print("loading snapshots...")
@@ -640,6 +683,15 @@ def main() -> int:
     print("loading chain_surface...")
     surface = load_chain_surface()
     print(f"  {len(surface):,} (date, occ) entries")
+
+    if args.ab:
+        challengers = [s for s in STRATEGIES if s[0] in args.ab]
+        missing = set(args.ab) - {s[0] for s in challengers}
+        if missing:
+            print(f"unknown strategies: {missing}")
+            return 2
+        ab_test(rows, surface, challengers=challengers)
+        return 0
 
     selected = STRATEGIES
     if args.strategy:

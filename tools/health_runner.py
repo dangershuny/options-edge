@@ -171,10 +171,40 @@ def write_eod_summary() -> None:
     else:
         md.write_text("# Daily health log\n" + summary, encoding="utf-8")
 
+    # ── Strategy v1 tracker — embed in EOD summary so divergence from
+    #    backtest is surfaced daily without us having to remember to look.
+    strategy_block = ""
+    try:
+        from tools.strategy_tracker import (
+            load_trades, compute_headline, compare_to_baseline,
+            BACKTEST_BASELINE,
+        )
+        for sid in BACKTEST_BASELINE:
+            tr = load_trades(strategy_id=sid)
+            h = compute_headline(tr)
+            if h.get("n_closed", 0) == 0 and h.get("n_open", 0) == 0:
+                continue
+            comp = compare_to_baseline(sid, h)
+            n = h.get("n_closed", 0)
+            wr = f"{h.get('win_rate', 0)*100:.0f}%" if n else "—"
+            avg = f"{h.get('avg_return', 0)*100:+.1f}%" if n else "—"
+            eq = h.get("ending_equity", 0)
+            strategy_block += (
+                f"\n\n[{sid}] {n} closed / {h.get('n_open', 0)} open  "
+                f"wr={wr} avg={avg} equity=${eq:,.0f}"
+            )
+            if comp:
+                wr_d = comp.get("win_rate", {}).get("delta")
+                if wr_d is not None and abs(wr_d) > 0.15:
+                    strategy_block += f"\n  WARN: win rate {wr_d*100:+.0f}% vs backtest"
+    except Exception:
+        pass
+
     body = (
         f"equity={eq_str}\n"
         f"entries={n_entries} exits={n_exits} pl=${realized_pl:+,.0f}\n"
         f"remediations={n_remediations} open_proposals={n_open_proposals}"
+        f"{strategy_block}"
     )
     send("INFO", f"EOD {today_iso}", body)
 

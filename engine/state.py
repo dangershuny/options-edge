@@ -134,6 +134,17 @@ def init_db() -> None:
             c.execute("ALTER TABLE positions ADD COLUMN sl_resets_today INTEGER DEFAULT 0")
         if "sl_reset_date" not in cols:
             c.execute("ALTER TABLE positions ADD COLUMN sl_reset_date TEXT")
+        # 2026-05-14 — strategy tracking for the strategy_v1 deployment.
+        # We tag each entry with the strategy that selected it, plus a JSON
+        # snapshot of every signal value at decision time. This lets the
+        # strategy_tracker tool compute per-signal performance breakdowns
+        # without depending on snapshot files staying intact on disk.
+        if "strategy_id" not in cols:
+            c.execute("ALTER TABLE positions ADD COLUMN strategy_id TEXT")
+        if "strategy_version" not in cols:
+            c.execute("ALTER TABLE positions ADD COLUMN strategy_version TEXT")
+        if "entry_context_json" not in cols:
+            c.execute("ALTER TABLE positions ADD COLUMN entry_context_json TEXT")
 
 
 # ── Position lifecycle ───────────────────────────────────────────────────────
@@ -352,6 +363,48 @@ def list_live_rows_for_occ(occ_symbol: str) -> list[dict]:
             "ORDER BY id DESC",
             (occ_symbol,),
         )]
+
+
+def tag_strategy(position_id: int, strategy_id: str, version: str,
+                  entry_context: dict) -> bool:
+    """Tag a position with the strategy that selected it + a JSON-encoded
+    snapshot of every signal value at decision time. Used by the
+    strategy_tracker tool to compute per-signal performance.
+
+    Safe to call after record_open returns the position id. Idempotent —
+    re-tagging overwrites the prior tag (useful if a row is reused via
+    unphantom)."""
+    import json as _json
+    with _db() as c:
+        cur = c.execute(
+            "UPDATE positions SET strategy_id = ?, strategy_version = ?, "
+            "entry_context_json = ? WHERE id = ?",
+            (strategy_id, version,
+             _json.dumps(entry_context, default=str), position_id),
+        )
+        return cur.rowcount > 0
+
+
+def list_strategy_trades(strategy_id: str | None = None,
+                          status: tuple[str, ...] = ("closed",)) -> list[dict]:
+    """Return positions filtered by strategy_id + status. Used by the
+    strategy_tracker. When strategy_id is None, returns all rows."""
+    init_db()
+    where = []
+    params: list = []
+    if strategy_id is not None:
+        where.append("strategy_id = ?")
+        params.append(strategy_id)
+    if status:
+        placeholders = ",".join("?" * len(status))
+        where.append(f"status IN ({placeholders})")
+        params.extend(status)
+    sql = "SELECT * FROM positions"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY entry_date, id"
+    with _db() as c:
+        return [dict(r) for r in c.execute(sql, params)]
 
 
 def force_mark_closed(position_id: int, reason: str = "duplicate row merged") -> bool:

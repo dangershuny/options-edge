@@ -541,14 +541,16 @@ def _execute_trade(
         # never block submission, so it's wrapped + logged silently.
         try:
             from risk.exits import apply_safety_floors
-            from engine.state import record_open, OpenPositionRecord
+            from engine.state import (
+                record_open, OpenPositionRecord, tag_strategy,
+            )
             sl_pct, tp_pct = apply_safety_floors(
                 score=float(trade.get("score") or 0),
                 dte=(expiry - date.today()).days,
                 has_catalyst_in_window=bool(trade.get("catalyst_summary")),
                 held_overnight=True,
             )
-            record_open(OpenPositionRecord(
+            position_id = record_open(OpenPositionRecord(
                 occ_symbol=occ,
                 underlying=symbol,
                 option_type=opt_type,
@@ -564,6 +566,33 @@ def _execute_trade(
                 sl_pct=sl_pct,
                 tp_pct=tp_pct,
             ))
+
+            # Strategy tagging — record which strategy selected this trade
+            # plus the full signal context at entry. Lets strategy_tracker
+            # compute per-signal performance breakdowns later, without
+            # depending on snapshot files remaining intact.
+            try:
+                from risk.config import RISK
+                strat_id = "strategy_v1" if RISK.get("use_strategy_v1") else "scorer_legacy"
+                strat_version = "v1.0"  # bump when the gate rule changes
+                # Capture every signal the strategy could be tweaked against
+                entry_context = {
+                    k: trade.get(k) for k in (
+                        "symbol", "strike", "expiry", "type", "option_type",
+                        "bid", "ask", "score", "dte",
+                        "vol_signal", "flow_signal", "skew_signal", "gex_signal",
+                        "iv_pct", "rv_pct", "iv_rv_spread", "iv_rank",
+                        "insider_signal", "short_signal", "blocks_signal",
+                        "sentiment_delta", "sentiment_composite",
+                        "news_drift_delta", "has_recent_8k", "recent_8k_count",
+                        "trend_pct", "trend_3d", "rsi14",
+                        "stock_price",
+                    ) if k in trade
+                }
+                if position_id:
+                    tag_strategy(position_id, strat_id, strat_version, entry_context)
+            except Exception as e:
+                result.setdefault("warnings", []).append(f"tag_strategy: {e}")
         except Exception as e:
             # state failure must not break submission
             result["state_record_warning"] = f"record_open failed: {e}"
