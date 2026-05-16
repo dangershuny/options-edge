@@ -243,6 +243,18 @@ RISK: dict = {
     # See tools/strategy_backtest.py and logs/strategy_backtest_report.md.
     "use_strategy_v1":         True,
 
+    # ── PDT day-trade-limit handling (2026-05-15) ─────────────────────────────
+    # Alpaca paper account at multiplier=1 enforces PDT: 4 day-trades
+    # (same-day buy+sell on same security) in 5-day rolling window flags
+    # the account. We hit daytrade_count=3 on 5/12 and queued the next 4th
+    # exit, losing ~$87 to overnight slippage when QUBT pair kept falling.
+    #
+    # Better: refuse new entries when daytrade_count >= threshold. Costs
+    # skipping ~1 trade on limit-bound days; saves the overnight bleed.
+    # Set to False to revert to the queue-overnight-only behavior.
+    "skip_entries_at_pdt_limit":   True,
+    "pdt_entry_skip_threshold":    3,    # at this count, skip new entries
+
     # ── Live news-monitor exit (intraday) ─────────────────────────────────────
     # Every N seconds during the session, pull fresh headlines for every open
     # underlying. If a material article's sentiment runs *against* the

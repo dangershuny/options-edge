@@ -246,6 +246,45 @@ def _score_cross_validation_gate(t: dict, min_score: float,
                   f"{direction} on {opt_type} (effective {new_score:.1f})")
 
 
+def _pdt_limit_gate(t: dict) -> tuple[bool, str]:
+    """Refuse new entries when the Alpaca account's daytrade_count is at
+    the cash-account limit (3 in rolling 5-day window).
+
+    Built 2026-05-15 after observing that queued-overnight exits leaked
+    significant slippage (QUBT pair lost ~$87 overnight after queue).
+    The day-trade GUARD avoids the PDT flag but doesn't avoid the loss.
+    Better to not enter at all when we're at the limit.
+
+    Cost: skip ~1 trade per limit-bound day under strategy_v1's rate.
+    Benefit: never get caught holding a same-day SL hit overnight.
+
+    Set RISK['skip_entries_at_pdt_limit'] = False to disable.
+    """
+    try:
+        from risk.config import RISK
+    except Exception:
+        return True, ""
+    if not bool(RISK.get("skip_entries_at_pdt_limit", True)):
+        return True, ""
+
+    threshold = int(RISK.get("pdt_entry_skip_threshold", 3))
+    try:
+        from broker.alpaca import _trading_client
+        raw = _trading_client().get_account()
+        dt_count = int(getattr(raw, "daytrade_count", 0) or 0)
+    except Exception:
+        # If we can't read the count, fail open — let other gates decide
+        return True, ""
+
+    if dt_count >= threshold:
+        return False, (
+            f"PDT limit: daytrade_count={dt_count} >= {threshold} — "
+            f"refusing new entries to avoid same-day exit risk. "
+            f"Count rolls down as old day-trades age out of the 5-day window."
+        )
+    return True, ""
+
+
 def _strategy_v1_gate(t: dict) -> tuple[bool, str]:
     """The first profitable strategy found by strategy_backtest sweep
     (2026-05-14, n=37 variants, only one with positive expectancy).
@@ -318,11 +357,11 @@ def _all_new_gates(t: dict, min_score: float) -> tuple[bool, str]:
     Direction halt runs first because it's a hard switch — no point
     computing regime/spread/cross-validation if we're not taking the
     direction at all."""
-    # 2026-05-14: strategy_v1 gate runs FIRST. If it rejects, no other
-    # gate matters — we only enter trades matching the backtest-proven
-    # winning pattern.
-    for gate in (_strategy_v1_gate, _direction_halt_gate, _regime_gate,
-                 _circuit_breaker_gate, _spread_gate):
+    # 2026-05-15: PDT-limit gate runs FIRST — refusing ALL entries when
+    # at limit is cheaper than evaluating each candidate. Then strategy_v1
+    # narrows to the backtest-proven pattern.
+    for gate in (_pdt_limit_gate, _strategy_v1_gate, _direction_halt_gate,
+                 _regime_gate, _circuit_breaker_gate, _spread_gate):
         ok, reason = gate(t)
         if not ok:
             return False, reason

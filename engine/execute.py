@@ -153,6 +153,37 @@ def morning_session(dry_run: bool = False) -> None:
         _log("ACCOUNT BLOCKED — halting.")
         return
 
+    # ── PDT pre-flight (2026-05-15) ───────────────────────────────────────────
+    # If daytrade_count is at the threshold, surface a WARN so the operator
+    # knows TODAY'S situation before any trades happen. New entries will be
+    # refused by the pdt_limit_gate; any positions held from earlier sessions
+    # that hit SL today will fire as non-same-day exits (no day-trade count
+    # incurred). The note here is purely for operator awareness.
+    try:
+        from broker.alpaca import _trading_client as _tc
+        raw = _tc().get_account()
+        dt_count = int(getattr(raw, "daytrade_count", 0) or 0)
+        threshold = int(RISK.get("pdt_entry_skip_threshold", 3))
+        if dt_count >= threshold:
+            _log(f"PDT PRE-FLIGHT: daytrade_count={dt_count} >= {threshold} — "
+                 f"new entries will be skipped today; carry-over exits run normally")
+            try:
+                from tools.notify import send
+                send("WARN",
+                     f"PDT limit: daytrade_count={dt_count}",
+                     f"At PDT threshold ({dt_count}/{threshold}). "
+                     f"New entries SKIPPED today by pdt_limit_gate. "
+                     f"Carry-over positions still exit normally (non-same-day "
+                     f"SELLs don't count as day-trades). Count rolls down as "
+                     f"old day-trades age out of the 5-day window.")
+            except Exception:
+                pass
+        elif dt_count >= threshold - 1:
+            # One away — friendly heads-up
+            _log(f"PDT PRE-FLIGHT: daytrade_count={dt_count} (one away from {threshold} limit)")
+    except Exception as e:
+        _log(f"PDT pre-flight probe failed (non-fatal): {e}")
+
     mode = auto_select_mode(acct.equity)
     apply_mode(mode)
     RISK["portfolio_size"] = acct.equity  # live value, not file value
