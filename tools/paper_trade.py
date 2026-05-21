@@ -286,25 +286,27 @@ def _pdt_limit_gate(t: dict) -> tuple[bool, str]:
 
 
 def _strategy_v1_gate(t: dict) -> tuple[bool, str]:
-    """The first profitable strategy found by strategy_backtest sweep
-    (2026-05-14, n=37 variants, only one with positive expectancy).
+    """Strategy v1.1 — tightened spread cap from 15% → 10% (2026-05-15).
+
+    Original v1 (15% cap) regressed to 18 trades / 33% wr / -3.1% avg as
+    more data accumulated (from 11 trades / 46% / +14.6% on the cherry-
+    picked 5/14 sample). The 15% cap let in 7 incremental trades that
+    averaged -25% return — the looser spread was eating any directional
+    edge.
+
+    v1.1 tightens to 10% cap. Backtest on 1,298 candidates:
+      v1.0 (15% cap): 18 trades, 33% wr, -3.1% avg, $3,887 ending
+      v1.1 (10% cap): 11 trades, 36% wr, +12.4% avg, $4,272 ending
+      Delta: +$385, 2.4x lower drawdown (-9.7% vs -23.7%)
 
     Rule: take ONLY calls where ALL of these are true:
       • skew_signal == "BULLISH"     — chain shows bullish positioning
       • vol_signal  == "BUY VOL"      — cheap IV vs RV (long-vol setup)
-      • spread_pct  <= 15%            — liquid enough to round-trip
-      • option_type == "call"         — no puts (block_puts still on as safety)
+      • spread_pct  <= 10%            — must be VERY liquid (was 15%)
+      • option_type == "call"         — no puts (block_puts still on)
 
-    Backtest stats over 11 trades / 16 trading days:
-      win_rate = 46%, avg_return = +14.6%, sharpe = +0.63,
-      max drawdown = -8.7%, ending equity $4,321 (from $4,000)
-
-    All other strategies LOST money. The current production scorer with
-    score>=60 lost -54% drawdown over the same period.
-
-    Disable this gate (set RISK['use_strategy_v1']=False) only when a
-    new backtest demonstrates a better edge. Until then, this is the
-    sole entry pathway with measured positive expectancy.
+    Disable via RISK['use_strategy_v1'] = False. Cap is configurable via
+    RISK['strategy_v1_max_spread'] (default 0.10).
     """
     try:
         from risk.config import RISK
@@ -329,8 +331,10 @@ def _strategy_v1_gate(t: dict) -> tuple[bool, str]:
     if mid <= 0:
         return False, "strategy_v1: zero mid"
     spread_pct = (ask - bid) / mid
-    if spread_pct > 0.15:
-        return False, (f"strategy_v1: spread {spread_pct*100:.1f}% > 15% cap")
+    max_spread = float(RISK.get("strategy_v1_max_spread", 0.10))
+    if spread_pct > max_spread:
+        return False, (f"strategy_v1: spread {spread_pct*100:.1f}% > "
+                       f"{max_spread*100:.0f}% cap")
     return True, ""
 
 
@@ -613,7 +617,8 @@ def _execute_trade(
             try:
                 from risk.config import RISK
                 strat_id = "strategy_v1" if RISK.get("use_strategy_v1") else "scorer_legacy"
-                strat_version = "v1.0"  # bump when the gate rule changes
+                # 2026-05-15: v1.1 = tightened spread cap from 15% to 10%
+                strat_version = "v1.1"
                 # Capture every signal the strategy could be tweaked against
                 entry_context = {
                     k: trade.get(k) for k in (

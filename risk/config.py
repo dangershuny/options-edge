@@ -242,6 +242,7 @@ RISK: dict = {
     # 11 trades, 46% wr, +14.6% avg, Sharpe +0.63, max DD -8.7%.
     # See tools/strategy_backtest.py and logs/strategy_backtest_report.md.
     "use_strategy_v1":         True,
+    "strategy_v1_max_spread":  0.10,   # v1.1: tightened from 0.15 (5/15 A/B winner)
 
     # ── PDT day-trade-limit handling (2026-05-15) ─────────────────────────────
     # Alpaca paper account at multiplier=1 enforces PDT: 4 day-trades

@@ -293,6 +293,47 @@ def make_no_sl():
     return rule
 
 
+def make_force_exit_at_day(exit_day: int, sl: float = -0.12):
+    """Force exit at day N, with optional SL fallback. Used for testing
+    short-horizon strategies (e.g., PINNED gex is a d1 edge)."""
+    def rule(row, n, peak, cur_bid, cur_mid, sl_pct, trail_lock):
+        entry_mid = _entry_basis(row)
+        if entry_mid <= 0:
+            return None
+        mid_pnl = (cur_mid / entry_mid) - 1
+        if mid_pnl <= sl:
+            return {"exit_px": cur_bid, "reason": f"SL {sl*100:+.0f}% hit (mid)"}
+        if n >= exit_day:
+            return {"exit_px": cur_bid, "reason": f"forced exit at d{exit_day}"}
+        return None
+    return rule
+
+
+def make_spread_aware_sl(mid_sl: float, bid_sl: float):
+    """Exit on the TIGHTER of two conditions: mid pnl <= mid_sl OR
+    bid pnl <= bid_sl. Catches wide-spread names where the bid
+    collapses well before mid does. Insight from 5/11-5/15 trades
+    where all 9 losers had mid SL trigger at -12% but bid realized
+    -23% to -94%."""
+    def rule(row, n, peak, cur_bid, cur_mid, sl_pct, trail_lock):
+        entry_mid = _entry_basis(row)
+        if entry_mid <= 0:
+            return None
+        # Entry ask is what we actually paid
+        ask_s = float(row.get("ask") or 0)
+        if ask_s <= 0:
+            ask_s = entry_mid
+        mid_pnl = (cur_mid / entry_mid) - 1
+        bid_pnl_vs_paid = (cur_bid / ask_s) - 1
+        if mid_pnl <= mid_sl:
+            return {"exit_px": cur_bid, "reason": f"mid SL {mid_sl*100:+.0f}%"}
+        if bid_pnl_vs_paid <= bid_sl:
+            return {"exit_px": cur_bid,
+                    "reason": f"bid SL {bid_sl*100:+.0f}% (vs paid)"}
+        return None
+    return rule
+
+
 # ── Strategies (selector + exit) ─────────────────────────────────────────────
 
 def s_baseline_current(row): return row.get("score", 0) >= 60
@@ -490,6 +531,52 @@ STRATEGIES = [
     ("35_bullskew_AND_buyvol",
      lambda r: r.get("option_type")=="call" and r.get("skew_signal")=="BULLISH"
                and r.get("vol_signal")=="BUY VOL"
+               and (_spread_pct(r) or 1) <= 0.15,
+     make_sl_only(-0.12)),
+
+    # ── 2026-05-15 TWEAK CANDIDATES — A/B vs current production ─────────────
+    # Production baseline: 35_bullskew_AND_buyvol (above) — 11 trades, 46%
+    # wr, +14.6% avg. Tweaks to test:
+
+    # T1: looser — drop BUY VOL requirement (BULLISH skew + tight spread only)
+    ("T1_bullskew_tight15_only",
+     lambda r: r.get("option_type")=="call"
+               and r.get("skew_signal")=="BULLISH"
+               and (_spread_pct(r) or 1) <= 0.15,
+     make_sl_only(-0.12)),
+
+    # T2: tighter spread (15% → 10%)
+    ("T2_bullskew_buyvol_tight10",
+     lambda r: r.get("option_type")=="call" and r.get("skew_signal")=="BULLISH"
+               and r.get("vol_signal")=="BUY VOL"
+               and (_spread_pct(r) or 1) <= 0.10,
+     make_sl_only(-0.12)),
+
+    # T3: spread-aware SL — mid -12% OR bid -25%, whichever first
+    ("T3_bullskew_buyvol_spread_aware_sl",
+     lambda r: r.get("option_type")=="call" and r.get("skew_signal")=="BULLISH"
+               and r.get("vol_signal")=="BUY VOL"
+               and (_spread_pct(r) or 1) <= 0.15,
+     make_spread_aware_sl(mid_sl=-0.12, bid_sl=-0.25)),
+
+    # T4: tighter mid SL (-12% → -8%)
+    ("T4_bullskew_buyvol_sl8",
+     lambda r: r.get("option_type")=="call" and r.get("skew_signal")=="BULLISH"
+               and r.get("vol_signal")=="BUY VOL"
+               and (_spread_pct(r) or 1) <= 0.15,
+     make_sl_only(-0.08)),
+
+    # T5: PINNED gex d1 winner — short hold (force exit at d1)
+    ("T5_pinned_d1hold",
+     lambda r: r.get("option_type")=="call" and r.get("gex_signal")=="PINNED"
+               and (_spread_pct(r) or 1) <= 0.20,
+     make_force_exit_at_day(1, sl=-0.12)),
+
+    # T6: hybrid — bullskew+buyvol OR (bullskew + PINNED gex)
+    ("T6_bullskew_with_pinned_or_buyvol",
+     lambda r: r.get("option_type")=="call" and r.get("skew_signal")=="BULLISH"
+               and (r.get("vol_signal")=="BUY VOL"
+                    or r.get("gex_signal")=="PINNED")
                and (_spread_pct(r) or 1) <= 0.15,
      make_sl_only(-0.12)),
 

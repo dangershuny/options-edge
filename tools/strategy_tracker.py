@@ -59,12 +59,17 @@ PER_TRADE_CSV = REPO_ROOT / "logs" / "strategy_tracker_trades.csv"
 # behaving as the backtest projected — investigate before tweaking.
 BACKTEST_BASELINE = {
     "strategy_v1": {
+        # v1.1 baseline (2026-05-15 retune, 1,298 candidates):
+        # tightened spread cap 15% → 10%. 11 trades, 36% wr, +12.4% avg.
+        # If live performance drops to v1.0-era stats (33% wr / -3% avg)
+        # the WARN in EOD will fire — strategy_version=v1.1 in DB rows
+        # lets the tracker distinguish trades made under each rule.
         "n_trades": 11,
-        "win_rate": 0.46,
-        "avg_return": 0.146,
-        "median_return": -0.237,
-        "max_drawdown": -0.087,
-        "sharpe": 0.63,
+        "win_rate": 0.36,
+        "avg_return": 0.124,
+        "median_return": -0.05,
+        "max_drawdown": -0.097,
+        "sharpe": 0.54,
     },
 }
 
