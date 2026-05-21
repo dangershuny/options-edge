@@ -218,6 +218,129 @@ def filter_effectiveness(today: date) -> dict:
 
 # ── Cumulative backtest refresh ─────────────────────────────────────────────
 
+def refresh_strategy_ab() -> dict:
+    """Re-run strategy_backtest with all accumulated data and capture
+    A/B comparison vs the current production baseline. Surfaces any
+    variant that beats production by a significance threshold so the
+    EOD proposal pass can flag it for human approval.
+
+    Significance threshold (must satisfy BOTH):
+      - n_trades >= 12 (enough samples)
+      - ending_equity delta >= $200 (material improvement)
+
+    Returns:
+      {
+        baseline: {name, n, win_rate, avg_return, ending_equity, ...},
+        challengers: [ {...}, ... ],
+        candidates_for_proposal: [ {name, delta, ...}, ... ],
+      }
+    """
+    out = {"baseline": {}, "challengers": [], "candidates_for_proposal": []}
+    try:
+        from tools.strategy_backtest import (
+            load_snapshots, load_chain_surface, run_strategy, STRATEGIES,
+        )
+    except Exception as e:
+        out["error"] = f"import failed: {e}"
+        return out
+    try:
+        rows = load_snapshots()
+        surface = load_chain_surface()
+    except Exception as e:
+        out["error"] = f"data load failed: {e}"
+        return out
+
+    # 2026-05-16: baseline tracks the live production rule. v1.1 = T2
+    # (bullish skew + BUY VOL + spread <=10%). If we ship v1.2+ via a
+    # new gate change in paper_trade.py, update this name to match.
+    baseline_name = "T2_bullskew_buyvol_tight10"
+    baseline_tuple = next((s for s in STRATEGIES if s[0] == baseline_name), None)
+    if baseline_tuple is None:
+        out["error"] = f"baseline {baseline_name} not in STRATEGIES"
+        return out
+
+    try:
+        baseline = run_strategy(*baseline_tuple, rows=rows, surface=surface)
+    except Exception as e:
+        out["error"] = f"baseline run failed: {e}"
+        return out
+    out["baseline"] = {
+        "name": baseline["name"], "n": baseline["n"],
+        "win_rate": baseline["win_rate"], "avg_return": baseline["avg_return"],
+        "ending_equity": baseline["ending_equity"],
+        "max_drawdown": baseline["max_drawdown_pct"],
+        "sharpe": baseline["sharpe"],
+    }
+
+    # Run T-series challengers (the candidate tweaks)
+    for name, sel, ext in STRATEGIES:
+        if not name.startswith("T"):
+            continue
+        try:
+            r = run_strategy(name, sel, ext, rows, surface)
+        except Exception:
+            continue
+        c = {
+            "name": r["name"], "n": r["n"],
+            "win_rate": r["win_rate"], "avg_return": r["avg_return"],
+            "ending_equity": r["ending_equity"],
+            "max_drawdown": r["max_drawdown_pct"],
+            "sharpe": r["sharpe"],
+            "delta_vs_baseline": r["ending_equity"] - baseline["ending_equity"],
+        }
+        out["challengers"].append(c)
+        # Significance gate
+        if (r["n"] >= 12 and
+            r["ending_equity"] - baseline["ending_equity"] >= 200):
+            out["candidates_for_proposal"].append(c)
+
+    out["challengers"].sort(key=lambda c: -c["delta_vs_baseline"])
+    out["candidates_for_proposal"].sort(key=lambda c: -c["delta_vs_baseline"])
+    return out
+
+
+def refresh_correlation_findings(horizon: int = 1) -> dict:
+    """Run correlation_miner and capture top combinations beating baseline
+    win rate by a material margin. EOD pass uses this to flag emergent
+    patterns before they show up in our strategies."""
+    out = {"horizon": horizon, "top_combos": []}
+    try:
+        from tools.correlation_miner import (
+            build_trade_pairs, _wr, _avg,
+            pairwise_numeric_x_categorical, univariate_categorical,
+            univariate_numeric,
+        )
+        from tools.strategy_backtest import load_snapshots, load_chain_surface
+    except Exception as e:
+        out["error"] = f"import failed: {e}"
+        return out
+    try:
+        rows = load_snapshots()
+        surface = load_chain_surface()
+        pairs = build_trade_pairs(rows, surface, horizon=horizon)
+    except Exception as e:
+        out["error"] = f"data load failed: {e}"
+        return out
+    if len(pairs) < 30:
+        out["note"] = f"only {len(pairs)} pairs — too few for confidence"
+        return out
+
+    baseline_wr = _wr([p["pnl"] for p in pairs])
+    out["baseline_wr"] = baseline_wr
+    out["n_pairs"] = len(pairs)
+
+    # Combine all finding kinds and pick top lifts with adequate n
+    all_findings = []
+    all_findings += univariate_numeric(pairs, baseline_wr)
+    all_findings += univariate_categorical(pairs, baseline_wr)
+    all_findings += pairwise_numeric_x_categorical(pairs, baseline_wr)
+    # Require n >= 15 to take the lift seriously
+    sig = [f for f in all_findings if f["n"] >= 15 and abs(f.get("lift", 0)) >= 0.10]
+    sig.sort(key=lambda f: -abs(f.get("lift", 0)))
+    out["top_combos"] = sig[:10]
+    return out
+
+
 def refresh_backtests() -> dict:
     """Re-run the two backtests against current snapshot/sentinel data, capture
     headline metrics so we can see if they're trending."""
@@ -457,6 +580,58 @@ def generate_proposals(report: dict) -> list[dict]:
         except Exception:
             pass
 
+    # 7. Strategy A/B winners (built 2026-05-16). If a candidate variant
+    # beats the production baseline by significance threshold, propose it.
+    ab = report.get("strategy_ab", {})
+    for c in ab.get("candidates_for_proposal", []):
+        proposals.append({
+            "id": f"strategy_ab_winner_{c['name']}_{today}",
+            "risk": "MED",
+            "title": f"Strategy A/B: `{c['name']}` beats baseline by "
+                     f"${c['delta_vs_baseline']:+.0f}",
+            "rationale": (
+                f"n={c['n']} trades. "
+                f"win_rate={c['win_rate']*100:.0f}% (vs baseline "
+                f"{ab['baseline']['win_rate']*100:.0f}%), "
+                f"avg={c['avg_return']*100:+.1f}% (vs "
+                f"{ab['baseline']['avg_return']*100:+.1f}%), "
+                f"sharpe={c['sharpe']:+.2f}. "
+                f"Sample size meets significance gate (>=12)."
+            ),
+            "suggested_action": (
+                f"Review tools/strategy_backtest.py STRATEGIES for "
+                f"`{c['name']}` definition. If acceptable, update "
+                f"_strategy_v1_gate in tools/paper_trade.py to match, "
+                f"bump strat_version, update BACKTEST_BASELINE in "
+                f"strategy_tracker.py to new expectations."
+            ),
+        })
+
+    # 8. Correlation miner — emerging combos beating baseline by >=15pts
+    for hz_key in ("correlations_d1", "correlations_d5"):
+        cm = report.get(hz_key, {})
+        for combo in cm.get("top_combos", [])[:3]:
+            lift = combo.get("lift", 0) * 100
+            if abs(lift) < 15:
+                continue
+            proposals.append({
+                "id": f"correlation_{hz_key}_{abs(hash(combo['rule']))%10000}_{today}",
+                "risk": "LOW",
+                "title": f"Correlation finding ({hz_key.split('_')[-1]}): "
+                         f"`{combo['rule']}`",
+                "rationale": (
+                    f"n={combo['n']}, win rate {combo['win_rate']*100:.0f}% "
+                    f"(lift {lift:+.0f}pts vs baseline). "
+                    f"avg return {combo['avg_return']*100:+.1f}%."
+                ),
+                "suggested_action": (
+                    "Add this combo as a candidate strategy variant in "
+                    "tools/strategy_backtest.py STRATEGIES and A/B test "
+                    "against production baseline. If it beats baseline by "
+                    "$200+ at n>=12, MED-risk proposal will follow."
+                ),
+            })
+
     return proposals
 
 
@@ -625,6 +800,11 @@ def run(target_date: date | None = None) -> dict:
     report["filter_effectiveness"] = filter_effectiveness(today)
     print("  refreshing backtests (~30s)...")
     report["backtests"] = refresh_backtests()
+    print("  running strategy A/B vs production baseline...")
+    report["strategy_ab"] = refresh_strategy_ab()
+    print("  mining correlations on accumulated data...")
+    report["correlations_d1"] = refresh_correlation_findings(horizon=1)
+    report["correlations_d5"] = refresh_correlation_findings(horizon=5)
     report["health"] = health_activity(today)
 
     proposals = generate_proposals(report)
