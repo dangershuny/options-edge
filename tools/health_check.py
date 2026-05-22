@@ -350,6 +350,14 @@ def check_scheduled_tasks() -> dict:
         name = row.get("TaskName", "")
         if "OptionsEdge" not in name:
             continue
+        # 2026-05-22: skip disabled tasks — the operator intentionally turned
+        # them off, the stale Last Result from before disable shouldn't count
+        # as failure. Today's 38 spurious rerun_failed_tasks remediations all
+        # traced to OptionsEdge-OverrideServer (disabled since 5/1, Last
+        # Result -1073741510 from a Ctrl+C exit).
+        task_state = (row.get("Scheduled Task State") or "").strip().lower()
+        if task_state == "disabled":
+            continue
         last_result = (row.get("Last Result") or "").strip()
         # Exit codes: 0=success, 267009=running, 267011=never run, 267014=ready
         if last_result in ("0", "267009", "267011", "267014"):

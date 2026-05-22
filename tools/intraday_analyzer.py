@@ -260,6 +260,24 @@ def check_spread_widening(open_positions: list[dict], alerted: set[str],
 
 # ── Check 5: daemon alive ────────────────────────────────────────────────────
 
+def _pid_alive_windows(pid: int) -> bool:
+    """Cross-platform PID-alive check. On Windows os.kill(pid, 0) is
+    unreliable (raises even for live processes due to signal model
+    differences), so use PowerShell Get-Process instead — same pattern
+    the watchdog uses successfully."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) "
+             "{ 'ALIVE' } else { 'DEAD' }"],
+            capture_output=True, text=True, timeout=8,
+        )
+        return "ALIVE" in (r.stdout or "")
+    except Exception:
+        return False
+
+
 def check_daemon_alive(alerted: set[str], dry_run: bool) -> None:
     pid_file = LOG_DIR / "exit_daemon.pid"
     if not pid_file.exists():
@@ -274,14 +292,21 @@ def check_daemon_alive(alerted: set[str], dry_run: bool) -> None:
         return
     try:
         pid = int(pid_file.read_text().strip())
-        os.kill(pid, 0)
     except Exception:
+        _send_alert(
+            f"daemon_pid_unreadable_{datetime.now().strftime('%H')}", "CRIT",
+            "Exit daemon PID file unreadable",
+            f"Could not parse {pid_file}.", alerted, dry_run,
+        )
+        return
+    # Windows-correct liveness probe
+    if not _pid_alive_windows(pid):
         _send_alert(
             f"daemon_dead_{datetime.now().strftime('%H')}", "CRIT",
             "Exit daemon PID is stale (process dead)",
-            f"PID file says {pid_file.read_text().strip()} but no such "
-            f"process exists. Watchdog should recover within 1 min. "
-            f"If positions are open, monitor manually until then.",
+            f"PID file says {pid} but Get-Process reports DEAD. "
+            f"Watchdog should recover within 1 min. If positions are "
+            f"open, monitor manually until then.",
             alerted, dry_run,
         )
 

@@ -217,7 +217,16 @@ RISK: dict = {
     # is rebuilt, these filters cap the worst behaviors that drove today's loss:
     #   - penny names: $0.05 stock tick → option halves; bid/ask spreads chew us
     #   - directional: every BUY CALL placed into a -3%+ 5-day downtrend lost
-    "min_underlying_price":     5.00,   # skip trades where stock < $5
+    # 2026-05-22: lowered from $5 to $2. Strategy_v1's own gates (skew +
+    # vol_signal + spread<=10%) are the actual quality controls now;
+    # the $5 floor was a legacy "scorer-era + cash-account" heuristic.
+    # Today (5/22) it blocked BBAI ($4.28, a documented strategy_v1 backtest
+    # winner at +41%) and LAES ($3.55) before strategy_v1's gate even saw
+    # them. The $2 floor still excludes true penny names where tick
+    # widening and chain thinning get problematic. Kill-switch: set back
+    # to 5.00 here to restore prior behavior.
+    "min_underlying_price":     2.00,   # was 5.00
+
     "max_adverse_trend_pct":   -0.03,   # skip BUY CALL if 5-day return < this;
                                         # symmetrically skip BUY PUT if > +abs(this)
     "trend_lookback_days":         5,

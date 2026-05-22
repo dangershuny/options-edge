@@ -534,6 +534,32 @@ STRATEGIES = [
                and (_spread_pct(r) or 1) <= 0.15,
      make_sl_only(-0.12)),
 
+    # ── 2026-05-22 TWEAK CANDIDATES — does removing legacy $5 floor help? ──
+    # BBAI is in our backtest history as a +41% strategy_v1 winner but the
+    # legacy min_underlying_price=$5 filter blocks BBAI ($4.28) and LAES
+    # ($3.55) BEFORE strategy_v1's gate sees them. Today (5/22) both were
+    # rejected on the price floor with no other gates evaluated.
+
+    # T7: strategy_v1.1 rules (same as production T2) — baseline alias
+    # for readability. (Identical to T2 above; included for clarity.)
+
+    # T8: v1.1 + allow underlying >= $2 (instead of $5)
+    ("T8_bullskew_buyvol_tight10_under5ok",
+     lambda r: r.get("option_type")=="call" and r.get("skew_signal")=="BULLISH"
+               and r.get("vol_signal")=="BUY VOL"
+               and (_spread_pct(r) or 1) <= 0.10
+               and float(r.get("stock_price") or 0) >= 2.0,
+     make_sl_only(-0.12)),
+
+    # T9: v1.1 + only sub-$5 underlyings (the inverted test — if T8 wins
+    # because of the sub-$5 names, T9 should also win)
+    ("T9_bullskew_buyvol_tight10_under5_only",
+     lambda r: r.get("option_type")=="call" and r.get("skew_signal")=="BULLISH"
+               and r.get("vol_signal")=="BUY VOL"
+               and (_spread_pct(r) or 1) <= 0.10
+               and 2.0 <= float(r.get("stock_price") or 0) < 5.0,
+     make_sl_only(-0.12)),
+
     # ── 2026-05-15 TWEAK CANDIDATES — A/B vs current production ─────────────
     # Production baseline: 35_bullskew_AND_buyvol (above) — 11 trades, 46%
     # wr, +14.6% avg. Tweaks to test:
