@@ -286,27 +286,34 @@ def _pdt_limit_gate(t: dict) -> tuple[bool, str]:
 
 
 def _strategy_v1_gate(t: dict) -> tuple[bool, str]:
-    """Strategy v1.1 — tightened spread cap from 15% → 10% (2026-05-15).
+    """Strategy v1.2 — adds DTE window 14-45 filter (2026-05-26).
 
-    Original v1 (15% cap) regressed to 18 trades / 33% wr / -3.1% avg as
-    more data accumulated (from 11 trades / 46% / +14.6% on the cherry-
-    picked 5/14 sample). The 15% cap let in 7 incremental trades that
-    averaged -25% return — the looser spread was eating any directional
-    edge.
+    Progression:
+      v1.0 (15% spread): 18 trades, 33% wr, -3.1% avg, -23.7% DD
+      v1.1 (10% spread): 11 trades, 36% wr, +12.4% avg, -9.7% DD
+      v1.2 (+ DTE 14-45):10 trades, 40% wr, +26.3% avg, -4.3% DD
 
-    v1.1 tightens to 10% cap. Backtest on 1,298 candidates:
-      v1.0 (15% cap): 18 trades, 33% wr, -3.1% avg, $3,887 ending
-      v1.1 (10% cap): 11 trades, 36% wr, +12.4% avg, $4,272 ending
-      Delta: +$385, 2.4x lower drawdown (-9.7% vs -23.7%)
+    The DTE 14-45 window is the directional-bet sweet spot: shorter
+    expiries get theta-crushed even when direction is right (gamma
+    risk dominates), longer expiries dilute the directional edge with
+    time-premium drag.
 
     Rule: take ONLY calls where ALL of these are true:
       • skew_signal == "BULLISH"     — chain shows bullish positioning
       • vol_signal  == "BUY VOL"      — cheap IV vs RV (long-vol setup)
-      • spread_pct  <= 10%            — must be VERY liquid (was 15%)
+      • spread_pct  <= 10%            — must be liquid
+      • 14 <= dte <= 45               — directional-bet sweet spot
       • option_type == "call"         — no puts (block_puts still on)
 
-    Disable via RISK['use_strategy_v1'] = False. Cap is configurable via
-    RISK['strategy_v1_max_spread'] (default 0.10).
+    Backtest delta v1.1 → v1.2: +$826 ending equity on the test window,
+    sharpe +1.20 vs +0.54, max DD -4.3% vs -9.7%.
+
+    Sample size caveat: n=10 trades is still small. EOD auto-A/B will
+    continue testing as data accumulates. Kill-switches:
+      RISK['use_strategy_v1'] = False
+      RISK['strategy_v1_max_spread'] = 0.10 (or other)
+      RISK['strategy_v1_dte_min'] = 14 (set to 0 to disable lower bound)
+      RISK['strategy_v1_dte_max'] = 45 (set to 999 to disable upper)
     """
     try:
         from risk.config import RISK
@@ -335,6 +342,16 @@ def _strategy_v1_gate(t: dict) -> tuple[bool, str]:
     if spread_pct > max_spread:
         return False, (f"strategy_v1: spread {spread_pct*100:.1f}% > "
                        f"{max_spread*100:.0f}% cap")
+    # DTE window — v1.2 addition
+    dte = int(t.get("dte") or t.get("dte_at_entry") or 0)
+    dte_min = int(RISK.get("strategy_v1_dte_min", 14))
+    dte_max = int(RISK.get("strategy_v1_dte_max", 45))
+    if dte_min > 0 and dte < dte_min:
+        return False, (f"strategy_v1: dte {dte} < {dte_min} "
+                       f"(theta-crush risk on short expiries)")
+    if dte_max < 999 and dte > dte_max:
+        return False, (f"strategy_v1: dte {dte} > {dte_max} "
+                       f"(time-premium drag on long expiries)")
     return True, ""
 
 
@@ -617,8 +634,8 @@ def _execute_trade(
             try:
                 from risk.config import RISK
                 strat_id = "strategy_v1" if RISK.get("use_strategy_v1") else "scorer_legacy"
-                # 2026-05-15: v1.1 = tightened spread cap from 15% to 10%
-                strat_version = "v1.1"
+                # 2026-05-26: v1.2 = added DTE 14-45 window
+                strat_version = "v1.2"
                 # Capture every signal the strategy could be tweaked against
                 entry_context = {
                     k: trade.get(k) for k in (

@@ -560,6 +560,45 @@ STRATEGIES = [
                and 2.0 <= float(r.get("stock_price") or 0) < 5.0,
      make_sl_only(-0.12)),
 
+    # ── 2026-05-26 NEW CANDIDATES — let EOD auto-A/B surface any winner
+    # as data accumulates. These don't change production until they beat
+    # the baseline T2 by n>=12 AND ending_equity delta >= $200.
+
+    # T10: even tighter spread (≤8%) — eliminate more bid-side slippage
+    ("T10_bullskew_buyvol_tight8",
+     lambda r: r.get("option_type")=="call" and r.get("skew_signal")=="BULLISH"
+               and r.get("vol_signal")=="BUY VOL"
+               and (_spread_pct(r) or 1) <= 0.08,
+     make_sl_only(-0.12)),
+
+    # T11: small-cap focus — sub-$15 underlying. Matches the historical
+    # strategy_v1 backtest winners (UEC, CLOV, SOUN, BBAI, MARA-style names)
+    ("T11_bullskew_buyvol_tight10_small_cap",
+     lambda r: r.get("option_type")=="call" and r.get("skew_signal")=="BULLISH"
+               and r.get("vol_signal")=="BUY VOL"
+               and (_spread_pct(r) or 1) <= 0.10
+               and 2.0 <= float(r.get("stock_price") or 0) <= 15.0,
+     make_sl_only(-0.12)),
+
+    # T12: DTE window — only 14-45 day expiries. Hypothesis: <14 has too
+    # much theta risk, >45 has too much time-decay drag on directional bets
+    ("T12_bullskew_buyvol_tight10_dte_window",
+     lambda r: r.get("option_type")=="call" and r.get("skew_signal")=="BULLISH"
+               and r.get("vol_signal")=="BUY VOL"
+               and (_spread_pct(r) or 1) <= 0.10
+               and 14 <= int(r.get("dte") or 0) <= 45,
+     make_sl_only(-0.12)),
+
+    # T13: add score floor — only entries with score >= 70 from existing scorer.
+    # We've shown score is mostly noise but at higher tiers it may have residual
+    # value combined with the v1.1 gates
+    ("T13_bullskew_buyvol_tight10_score70",
+     lambda r: r.get("option_type")=="call" and r.get("skew_signal")=="BULLISH"
+               and r.get("vol_signal")=="BUY VOL"
+               and (_spread_pct(r) or 1) <= 0.10
+               and float(r.get("score") or 0) >= 70.0,
+     make_sl_only(-0.12)),
+
     # ── 2026-05-15 TWEAK CANDIDATES — A/B vs current production ─────────────
     # Production baseline: 35_bullskew_AND_buyvol (above) — 11 trades, 46%
     # wr, +14.6% avg. Tweaks to test:

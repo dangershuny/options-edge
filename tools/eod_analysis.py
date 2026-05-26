@@ -250,10 +250,9 @@ def refresh_strategy_ab() -> dict:
         out["error"] = f"data load failed: {e}"
         return out
 
-    # 2026-05-16: baseline tracks the live production rule. v1.1 = T2
-    # (bullish skew + BUY VOL + spread <=10%). If we ship v1.2+ via a
-    # new gate change in paper_trade.py, update this name to match.
-    baseline_name = "T2_bullskew_buyvol_tight10"
+    # 2026-05-26: baseline updated to T12 (v1.2 = + DTE 14-45 window).
+    # If we ship v1.3+ via another gate change, update this name to match.
+    baseline_name = "T12_bullskew_buyvol_tight10_dte_window"
     baseline_tuple = next((s for s in STRATEGIES if s[0] == baseline_name), None)
     if baseline_tuple is None:
         out["error"] = f"baseline {baseline_name} not in STRATEGIES"

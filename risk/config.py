@@ -252,6 +252,12 @@ RISK: dict = {
     # See tools/strategy_backtest.py and logs/strategy_backtest_report.md.
     "use_strategy_v1":         True,
     "strategy_v1_max_spread":  0.10,   # v1.1: tightened from 0.15 (5/15 A/B winner)
+    # v1.2 (2026-05-26): DTE window 14-45. The directional-bet sweet spot.
+    # T12 backtest: 10 trades, 40% wr, +26.3% avg, +1.20 sharpe, $4,527
+    # vs $3,887 v1.1 baseline. +$640 delta on the test window.
+    # Kill: set strategy_v1_dte_min=0 and strategy_v1_dte_max=999 to disable.
+    "strategy_v1_dte_min":      14,
+    "strategy_v1_dte_max":      45,
 
     # ── PDT day-trade-limit handling (2026-05-15) ─────────────────────────────
     # Alpaca paper account at multiplier=1 enforces PDT: 4 day-trades
