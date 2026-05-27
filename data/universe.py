@@ -87,4 +87,25 @@ UNIVERSE: list[str] = [
 
     # ── Other catalyst-prone small ────────────────────────────────────────
     "FUBO",
+
+    # ── 2026-05-26: Liquid mega-cap expansion (Path A) ────────────────────
+    # The original thesis ("retail-driven small-caps have edge") produced
+    # -30% mean d3 return across 18 dates of data. That's structural
+    # universe failure, not strategy failure. Adding the most-liquid US
+    # equity options to give the picker a less hostile universe:
+    #
+    #   - Penny-tick options on these names typically run 1-3% spread
+    #     (vs 30%+ on small-caps), cutting round-trip cost by ~10pts
+    #   - Daily option volume is 100×-1000× higher → no stale-quote noise
+    #   - Earnings + Fed events still produce mispricing windows
+    #
+    # No ETFs yet (SPY/QQQ require separate plumbing for the
+    # insider/8-K/news features). Stock-only mega-caps with active
+    # options chains and tight quotes:
+    "AAPL", "MSFT", "AMZN", "GOOGL", "AVGO",
+    "ORCL", "CRM",
+    "JPM", "BAC", "GS",
+    "LLY", "UNH",
+    "WMT", "COST",
+    "XOM",
 ]

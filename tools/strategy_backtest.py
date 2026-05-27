@@ -461,6 +461,13 @@ def s_tight15_cheap(row):
     return 0.20 <= mid <= 1.00
 
 
+# Liquid mega-cap whitelist (used by T14a / T14b)
+LIQUID_SYMS = {"AAPL","MSFT","AMZN","GOOGL","AVGO","ORCL","CRM",
+                "JPM","BAC","GS","LLY","UNH","WMT","COST","XOM",
+                # also accept existing mega-cap-behavior names
+                "TSLA","NVDA","AMD","META","PLTR","COIN","MSTR"}
+
+
 STRATEGIES = [
     # Baseline / current production
     ("01_baseline_score60", s_baseline_current, make_sl_only(-0.12)),
@@ -532,6 +539,88 @@ STRATEGIES = [
      lambda r: r.get("option_type")=="call" and r.get("skew_signal")=="BULLISH"
                and r.get("vol_signal")=="BUY VOL"
                and (_spread_pct(r) or 1) <= 0.15,
+     make_sl_only(-0.12)),
+
+    # ── 2026-05-26: PATH A + PATH B candidates after the ML CV verdict ─────
+    # Cross-validation killed the ML approach (single-split fluke). The
+    # actual finding: universe mean d3 return is -30%, so the picker is
+    # fishing in a poisoned pond. Two structural responses:
+    #
+    #   Path A (T14): pivot to LIQUID mega-cap underlyings (1-3% spreads
+    #                 vs 30%+) to remove ~10pts of round-trip cost. No
+    #                 historical data yet (universe just expanded) — this
+    #                 strategy returns 0 trades on the backtest until
+    #                 data accumulates. Wire it now so the moment data
+    #                 lands, it starts firing.
+    #
+    #   Path B (T15): tighten v1.2 further within the existing universe.
+    #                 spread <= 5% (was 10%), DTE >= 30 (was 14), and
+    #                 mid >= $0.50 to ensure enough cushion per contract.
+
+    # T14a: liquid mega-cap calls with BULLISH skew + BUY VOL + spread<=5%
+    ("T14a_liquid_strict_v12",
+     lambda r, _L=LIQUID_SYMS: (
+         r.get("option_type") == "call"
+         and r.get("symbol") in _L
+         and r.get("skew_signal") == "BULLISH"
+         and r.get("vol_signal") == "BUY VOL"
+         and (_spread_pct(r) or 1) <= 0.05
+         and 14 <= int(r.get("dte") or 0) <= 45),
+     make_sl_only(-0.12)),
+
+    # T14b: liquid mega-cap calls with relaxed signal (any vol_signal),
+    # since BUY VOL is rare on liquid names (IV is efficient). Test
+    # whether liquidity alone + bullish positioning produces edge.
+    ("T14b_liquid_relaxed",
+     lambda r, _L=LIQUID_SYMS: (
+         r.get("option_type") == "call"
+         and r.get("symbol") in _L
+         and r.get("skew_signal") in ("BULLISH", "NEUTRAL")
+         and (_spread_pct(r) or 1) <= 0.05
+         and 14 <= int(r.get("dte") or 0) <= 45),
+     make_sl_only(-0.12)),
+
+    # T15: tightened v1.3 — spread<=5%, DTE>=30, mid>=$0.50
+    ("T15_v13_strict",
+     lambda r: (
+         r.get("option_type") == "call"
+         and r.get("skew_signal") == "BULLISH"
+         and r.get("vol_signal") == "BUY VOL"
+         and (_spread_pct(r) or 1) <= 0.05
+         and 30 <= int(r.get("dte") or 0) <= 45
+         and ((float(r.get("bid") or 0) + float(r.get("ask") or 0)) / 2.0) >= 0.50),
+     make_sl_only(-0.12)),
+
+    # T15a: same as T15 but DTE relaxed back to 14+. Most strategy_v1.2
+    # historical winners had DTE 14-30 (5-day max_hold within their life).
+    ("T15a_v13_spread5_dte14",
+     lambda r: (
+         r.get("option_type") == "call"
+         and r.get("skew_signal") == "BULLISH"
+         and r.get("vol_signal") == "BUY VOL"
+         and (_spread_pct(r) or 1) <= 0.05
+         and 14 <= int(r.get("dte") or 0) <= 45
+         and ((float(r.get("bid") or 0) + float(r.get("ask") or 0)) / 2.0) >= 0.30),
+     make_sl_only(-0.12)),
+
+    # T15b: just tighten spread to 5%, keep all other v1.2 rules
+    ("T15b_v13_spread5_only",
+     lambda r: (
+         r.get("option_type") == "call"
+         and r.get("skew_signal") == "BULLISH"
+         and r.get("vol_signal") == "BUY VOL"
+         and (_spread_pct(r) or 1) <= 0.05
+         and 14 <= int(r.get("dte") or 0) <= 45),
+     make_sl_only(-0.12)),
+
+    # T15c: spread<=7% (less aggressive than T15b's 5%)
+    ("T15c_v13_spread7",
+     lambda r: (
+         r.get("option_type") == "call"
+         and r.get("skew_signal") == "BULLISH"
+         and r.get("vol_signal") == "BUY VOL"
+         and (_spread_pct(r) or 1) <= 0.07
+         and 14 <= int(r.get("dte") or 0) <= 45),
      make_sl_only(-0.12)),
 
     # ── 2026-05-22 TWEAK CANDIDATES — does removing legacy $5 floor help? ──
