@@ -340,6 +340,60 @@ def refresh_correlation_findings(horizon: int = 1) -> dict:
     return out
 
 
+def refresh_shadow_simulate() -> dict:
+    """Advance the shadow ledger every EOD: plant any new strategy_v1.2
+    qualifying contracts from today's snapshots, then walk every open
+    position one more tick forward using today's intraday data.
+
+    The shadow ledger tracks contracts the picker WOULD HAVE entered
+    if PDT/other constraints hadn't blocked them. Provides a stream of
+    'what could have been' realized P&L for the production rule.
+
+    Wired into EOD on 2026-05-27 — runs nightly without operator
+    intervention. Same pattern: closed positions left alone, open
+    positions advanced as new chain_surface/snapshot data lands."""
+    out = {"planted_today": 0, "open_after": 0, "closed_after": 0,
+           "realized_so_far": 0.0}
+    try:
+        from tools.shadow_simulate import (
+            load_ledger, save_ledger, advance_all, find_todays_qualifying,
+        )
+    except Exception as e:
+        out["error"] = f"import failed: {e}"
+        return out
+    try:
+        ledger = load_ledger()
+        existing_keys = {(p["symbol"], p["strike"], p["expiry"],
+                           p["entry_date"]) for p in ledger}
+        new = find_todays_qualifying()
+        added = 0
+        for n in new:
+            key = (n["symbol"], n["strike"], n["expiry"], n["entry_date"])
+            if key in existing_keys:
+                continue
+            ledger.append(n)
+            added += 1
+        out["planted_today"] = added
+        ledger = advance_all(ledger)
+        save_ledger(ledger)
+        out["open_after"] = sum(1 for p in ledger if p["status"] == "open")
+        out["closed_after"] = sum(1 for p in ledger if p["status"] == "closed")
+        out["realized_so_far"] = sum(p.get("realized_dollar", 0)
+                                       for p in ledger
+                                       if p["status"] == "closed")
+        # Today's newly-closed (if any)
+        today_iso = date.today().isoformat()
+        closed_today = [p for p in ledger
+                          if p["status"] == "closed"
+                          and p.get("exit_date", "")[:10] == today_iso]
+        out["closed_today"] = len(closed_today)
+        out["realized_today_dollar"] = sum(p.get("realized_dollar", 0)
+                                              for p in closed_today)
+    except Exception as e:
+        out["error"] = f"shadow_simulate run failed: {e}"
+    return out
+
+
 def refresh_backtests() -> dict:
     """Re-run the two backtests against current snapshot/sentinel data, capture
     headline metrics so we can see if they're trending."""
@@ -747,6 +801,25 @@ def render_markdown(report: dict, proposals: list[dict]) -> str:
                          f"{hm['open_proposals']}")
         lines.append("")
 
+    # Shadow ledger — strategy_v1.2 trades we WOULD HAVE taken
+    sl = report.get("shadow_ledger") or {}
+    if sl and "error" not in sl:
+        lines.append("## Shadow ledger (strategy_v1.2 unconstrained)")
+        lines.append(f"- Planted today: {sl.get('planted_today', 0)}")
+        lines.append(f"- Total open: {sl.get('open_after', 0)}")
+        lines.append(f"- Total closed: {sl.get('closed_after', 0)}")
+        lines.append(f"- Realized so far: ${sl.get('realized_so_far', 0):+,.2f}")
+        if sl.get("closed_today"):
+            lines.append(f"- **Closed TODAY: {sl['closed_today']} positions, "
+                         f"${sl.get('realized_today_dollar', 0):+,.2f} realized**")
+        lines.append(f"- Full per-position detail: "
+                     f"`logs/shadow_ledger.md`")
+        lines.append("")
+    elif sl.get("error"):
+        lines.append("## Shadow ledger")
+        lines.append(f"_error: {sl['error']}_")
+        lines.append("")
+
     # PROPOSALS — the part the user actually wants when they get home
     lines.append("## Proposals for review")
     if not proposals:
@@ -774,6 +847,16 @@ def render_telegram_summary(report: dict, proposals: list[dict]) -> str:
         f"Exits filled: {len(report.get('exits_filled', []))}\n"
         f"Queued exits: {len(report.get('queued_exits', []))}\n"
     )
+    # Shadow ledger one-liner — what would v1.2 have done if unconstrained
+    sl = report.get("shadow_ledger") or {}
+    if sl and "error" not in sl:
+        head += (f"Shadow: +{sl.get('planted_today', 0)} planted today, "
+                 f"{sl.get('open_after', 0)} open / "
+                 f"{sl.get('closed_after', 0)} closed total, "
+                 f"realized ${sl.get('realized_so_far', 0):+.0f}\n")
+        if sl.get("closed_today"):
+            head += (f"  Shadow closes today: {sl['closed_today']} "
+                     f"(${sl.get('realized_today_dollar', 0):+.0f})\n")
     if not proposals:
         return head + "\nNo proposals — quiet day."
     n_high = sum(1 for p in proposals if p["risk"] == "HIGH")
@@ -804,6 +887,8 @@ def run(target_date: date | None = None) -> dict:
     print("  mining correlations on accumulated data...")
     report["correlations_d1"] = refresh_correlation_findings(horizon=1)
     report["correlations_d5"] = refresh_correlation_findings(horizon=5)
+    print("  advancing shadow ledger (plant today + walk forward)...")
+    report["shadow_ledger"] = refresh_shadow_simulate()
     report["health"] = health_activity(today)
 
     proposals = generate_proposals(report)
