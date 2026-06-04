@@ -623,6 +623,44 @@ STRATEGIES = [
          and 14 <= int(r.get("dte") or 0) <= 45),
      make_sl_only(-0.12)),
 
+    # ── 2026-05-28: EARLIER-ENTRY relaxations from 5/27 near-miss analysis ──
+    # Yesterday: 2 full v1.2 qualifiers (QS, CLF). 27 near-misses (3-of-4).
+    # The interesting subset:
+    #   - 5 PLUG/BBAI contracts missed only because skew=NEUTRAL
+    #   - 3 contracts (PATH, S) missed only because vol=MOMENTUM_BUY
+    # PLUG 4C 6/18 is in our shadow ledger as a +48% winner — it fits this
+    # exact pattern. Test relaxing each constraint:
+
+    # T16: allow skew BULLISH OR NEUTRAL (catches PLUG/BBAI sooner)
+    ("T16_skew_bullish_or_neutral",
+     lambda r: (
+         r.get("option_type") == "call"
+         and r.get("skew_signal") in ("BULLISH", "NEUTRAL")
+         and r.get("vol_signal") == "BUY VOL"
+         and (_spread_pct(r) or 1) <= 0.10
+         and 14 <= int(r.get("dte") or 0) <= 45),
+     make_sl_only(-0.12)),
+
+    # T17: allow vol BUY VOL OR MOMENTUM BUY (catches directional plays)
+    ("T17_vol_buyvol_or_momentum",
+     lambda r: (
+         r.get("option_type") == "call"
+         and r.get("skew_signal") == "BULLISH"
+         and r.get("vol_signal") in ("BUY VOL", "MOMENTUM BUY")
+         and (_spread_pct(r) or 1) <= 0.10
+         and 14 <= int(r.get("dte") or 0) <= 45),
+     make_sl_only(-0.12)),
+
+    # T18: BOTH relaxations combined
+    ("T18_skew_and_vol_relaxed",
+     lambda r: (
+         r.get("option_type") == "call"
+         and r.get("skew_signal") in ("BULLISH", "NEUTRAL")
+         and r.get("vol_signal") in ("BUY VOL", "MOMENTUM BUY")
+         and (_spread_pct(r) or 1) <= 0.10
+         and 14 <= int(r.get("dte") or 0) <= 45),
+     make_sl_only(-0.12)),
+
     # ── 2026-05-22 TWEAK CANDIDATES — does removing legacy $5 floor help? ──
     # BBAI is in our backtest history as a +41% strategy_v1 winner but the
     # legacy min_underlying_price=$5 filter blocks BBAI ($4.28) and LAES
