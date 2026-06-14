@@ -204,6 +204,52 @@ def _surface_lookup(occ_key: str) -> dict[str, dict]:
     return out
 
 
+def _chain_surface_walk(occ_key: str, after_dt: datetime,
+                         until_dt: datetime) -> list[tuple[str, dict]]:
+    """Fallback walker: query chain_surface for daily bid/ask history of
+    an OCC between two timestamps. Used when the snapshot tick index
+    has no forward data for a contract (i.e., it dropped out of the
+    picker's scored universe). Each chain_surface row becomes a
+    pseudo-tick at 'YYYY-MM-DD 16:00' (end-of-day).
+
+    2026-06-14 fix: shadow ledger was frozen 17 days because original
+    advance_position_intraday only saw snapshot universe ticks. Many
+    OCCs (PLUG/BBAI/SG) stop being scored after entry day so never
+    appeared in subsequent snapshots — walker had no data to advance
+    them. chain_surface tracks all listed contracts daily."""
+    out: list[tuple[str, dict]] = []
+    if not DB_PATH.exists():
+        return out
+    sym, opt_abbr, strike, expiry = occ_key.split("|")
+    after_date = after_dt.date().isoformat()
+    until_date = until_dt.date().isoformat()
+    try:
+        with sqlite3.connect(DB_PATH) as c:
+            c.row_factory = sqlite3.Row
+            for r in c.execute(
+                "SELECT snapshot_date, bid, ask, last_price FROM chain_surface "
+                "WHERE symbol=? AND substr(option_type,1,1)=? "
+                "  AND strike=? AND expiry=? "
+                "  AND snapshot_date > ? AND snapshot_date <= ? "
+                "ORDER BY snapshot_date",
+                (sym, opt_abbr, float(strike), expiry,
+                 after_date, until_date),
+            ):
+                bid = float(r["bid"] or 0); ask = float(r["ask"] or 0)
+                last = float(r["last_price"] or 0)
+                mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else (last or 0)
+                if mid <= 0:
+                    continue
+                ts = f"{r['snapshot_date']} 16:00"
+                out.append((ts, {
+                    "bid": bid, "ask": ask, "mid": mid, "last": last,
+                    "_source": "chain_surface",
+                }))
+    except Exception:
+        pass
+    return out
+
+
 def advance_position_intraday(pos: dict, ticks: list[tuple[str, dict]]) -> dict:
     """Walk this position forward through every snapshot tick (intraday
     granularity) starting AFTER entry_ts. Returns updated position with
@@ -214,7 +260,8 @@ def advance_position_intraday(pos: dict, ticks: list[tuple[str, dict]]) -> dict:
       - SL hit (mid_pnl <= -12%) → close at this tick's bid + timestamp
       - max_hold reached (5 trading days after entry) → close at last
         available bid + timestamp on day 5
-      - Future ticks missing → leave open"""
+      - When snapshot ticks run out before max_hold (contract dropped
+        from picker universe), fall back to chain_surface daily bid"""
     if pos["status"] != "open":
         return pos
     entry_ts = pos.get("entry_ts") or f"{pos['entry_date']} 09:35"
@@ -232,15 +279,32 @@ def advance_position_intraday(pos: dict, ticks: list[tuple[str, dict]]) -> dict:
     last_tick_bid: float | None = None
     last_tick_ts: str | None = None
     last_seen_ts: str | None = None
+
+    # Build the walk: snapshot ticks for the OCC + chain_surface fallback
+    # for days where the contract didn't appear in any snapshot. This
+    # was the 2026-06-14 fix that unfroze the ledger.
+    snapshot_walk: list[tuple[str, dict]] = []
+    snapshot_dates: set[str] = set()
     for ts, by_occ in ticks:
         tick_dt = _snapshot_dt(ts)
         if tick_dt <= entry_dt:
-            continue   # tick at/before entry — skip
+            continue
         if tick_dt > max_hold_cutoff:
-            break       # past max_hold cutoff — bail (will close below)
+            break
         c = by_occ.get(occ)
         if not c:
-            continue   # contract not in this snapshot
+            continue
+        snapshot_walk.append((ts, c))
+        snapshot_dates.add(ts.split(" ")[0])
+
+    chain_walk = _chain_surface_walk(occ, entry_dt, max_hold_cutoff)
+    # Only add chain_surface days that aren't already covered by snapshots
+    chain_walk = [(ts, c) for ts, c in chain_walk
+                  if ts.split(" ")[0] not in snapshot_dates]
+
+    combined = sorted(snapshot_walk + chain_walk, key=lambda x: x[0])
+
+    for ts, c in combined:
         bid = float(c.get("bid") or 0)
         ask = float(c.get("ask") or 0)
         if bid <= 0 or ask <= 0:
@@ -257,9 +321,10 @@ def advance_position_intraday(pos: dict, ticks: list[tuple[str, dict]]) -> dict:
             "ts": ts, "bid": bid, "ask": ask, "mid": mid,
             "mid_pnl": round(mid_pnl, 4),
             "bid_pnl_vs_paid": round(bid_pnl_vs_paid, 4),
+            "source": c.get("_source", "snapshot"),
         })
         if mid_pnl <= SL_MID_PCT:
-            held_hours = (tick_dt - entry_dt).total_seconds() / 3600.0
+            held_hours = (_snapshot_dt(ts) - entry_dt).total_seconds() / 3600.0
             pos["status"] = "closed"
             pos["exit_ts"] = ts
             pos["exit_date"] = ts.split(" ")[0]

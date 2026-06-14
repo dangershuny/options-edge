@@ -194,7 +194,21 @@ def run_and_save(tickers: list[str] | None = None,
             print("  Discovery returned no results.")
             return
         tickers = disc["symbol"].tolist()
-        print(f"  Discovery found: {', '.join(tickers)}\n")
+        print(f"  Discovery found: {', '.join(tickers)}")
+        # 2026-06-14 (Path A activator): discovery ranks by IV-RV mismatch
+        # so AAPL/MSFT/etc. (IV ≈ RV efficient) never make the top-15.
+        # The universe expansion shipped 2026-05-26 was therefore inert —
+        # liquid mega-caps were in UNIVERSE but never reached the scorer.
+        # Force-include them as an always-scan tier so Path A actually
+        # collects data going forward.
+        LIQUID_ALWAYS_SCAN = ["AAPL", "MSFT", "AMZN", "GOOGL", "AVGO",
+                               "ORCL", "CRM", "JPM", "BAC", "GS",
+                               "LLY", "UNH", "WMT", "COST", "XOM"]
+        added = [s for s in LIQUID_ALWAYS_SCAN if s not in tickers]
+        if added:
+            tickers = tickers + added
+            print(f"  +Liquid always-scan: {', '.join(added)}")
+        print()
     else:
         print(f"  Scanning: {', '.join(tickers)}\n")
 
