@@ -263,13 +263,21 @@ def refresh_strategy_ab() -> dict:
     except Exception as e:
         out["error"] = f"baseline run failed: {e}"
         return out
+    # 2026-06-14: defensive .get() — run_strategy omits ending_equity et al.
+    # when n=0 (no trades met the rule). Without this guard the EOD task
+    # crashed every Friday strict variants matched nothing.
     out["baseline"] = {
         "name": baseline["name"], "n": baseline["n"],
-        "win_rate": baseline["win_rate"], "avg_return": baseline["avg_return"],
-        "ending_equity": baseline["ending_equity"],
-        "max_drawdown": baseline["max_drawdown_pct"],
-        "sharpe": baseline["sharpe"],
+        "win_rate": baseline.get("win_rate"),
+        "avg_return": baseline.get("avg_return"),
+        "ending_equity": baseline.get("ending_equity"),
+        "max_drawdown": baseline.get("max_drawdown_pct"),
+        "sharpe": baseline.get("sharpe"),
     }
+    # If baseline got 0 trades on this dataset, A/B is meaningless
+    if not baseline["n"]:
+        out["note"] = f"baseline {baseline_name} produced 0 trades — skip"
+        return out
 
     # Run T-series challengers (the candidate tweaks)
     for name, sel, ext in STRATEGIES:
@@ -279,18 +287,22 @@ def refresh_strategy_ab() -> dict:
             r = run_strategy(name, sel, ext, rows, surface)
         except Exception:
             continue
+        # Skip variants with 0 trades — no metrics to compare
+        if not r["n"]:
+            continue
         c = {
             "name": r["name"], "n": r["n"],
-            "win_rate": r["win_rate"], "avg_return": r["avg_return"],
-            "ending_equity": r["ending_equity"],
-            "max_drawdown": r["max_drawdown_pct"],
-            "sharpe": r["sharpe"],
-            "delta_vs_baseline": r["ending_equity"] - baseline["ending_equity"],
+            "win_rate": r.get("win_rate"),
+            "avg_return": r.get("avg_return"),
+            "ending_equity": r.get("ending_equity"),
+            "max_drawdown": r.get("max_drawdown_pct"),
+            "sharpe": r.get("sharpe"),
+            "delta_vs_baseline": r.get("ending_equity", 0) - baseline.get("ending_equity", 0),
         }
         out["challengers"].append(c)
         # Significance gate
         if (r["n"] >= 12 and
-            r["ending_equity"] - baseline["ending_equity"] >= 200):
+            c["delta_vs_baseline"] >= 200):
             out["candidates_for_proposal"].append(c)
 
     out["challengers"].sort(key=lambda c: -c["delta_vs_baseline"])
