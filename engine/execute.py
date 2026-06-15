@@ -687,29 +687,21 @@ def monitor_tick() -> None:
             record_monitor_check(p["id"], datetime.now(tz=timezone.utc).isoformat())
             continue
 
-        # ── Stale-quote tighter SL (added 2026-05-26 after 5/22 MARA pattern)
-        # When the data feed is deeply stale (>5 min) and we've already been
-        # using bid as mark via the stale-quote fallback above, fire SL at a
-        # TIGHTER threshold (-8% bid vs paid). Rationale: stale quotes hide
-        # how far underwater we really are. The feed lag itself is the risk
-        # — get out earlier rather than wait for mid to catch down.
-        # quote_stale is True iff age_sec was successfully computed above.
-        DEEPLY_STALE_SEC = 300        # 5 minutes
-        STALE_TIGHTER_SL = -0.08      # -8% bid vs paid (was waiting on -12% mid)
-        if quote_stale:
-            try:
-                stale_age = age_sec  # type: ignore[name-defined]
-            except NameError:
-                stale_age = 0
-            if (stale_age > DEEPLY_STALE_SEC and q.bid and q.bid > 0):
-                bid_pnl_vs_entry = (q.bid / entry) - 1
-                if bid_pnl_vs_entry <= STALE_TIGHTER_SL:
-                    _handle_exit_trigger(
-                        p, f"stale-quote tighter SL: bid pnl {bid_pnl_vs_entry*100:+.1f}% "
-                           f"<= {STALE_TIGHTER_SL*100:+.0f}% (feed stale {stale_age:.0f}s)"
-                    )
-                    record_monitor_check(p["id"], datetime.now(tz=timezone.utc).isoformat())
-                    continue
+        # ── Stale-quote tighter SL DISABLED 2026-06-14 ──────────────────────
+        # Original intent (5/22 MARA): when data feed is stale, exit before
+        # bid crashes further. But the implementation compared bid_pnl_vs_
+        # entry (which is always negative by the spread amount on day 1) to
+        # -8%. Result: every entry on a small-cap option with normal spread
+        # was killed within hours by this path. All 3 live trades 5/29-6/1
+        # (SOFI, SOFI, NIO) died this way.
+        #
+        # The MARA scenario is ALREADY covered by the stale-quote fallback
+        # above (mark = q.bid when stale), so the standard -12% SL fires
+        # on bid when feed is stale. No tighter acceleration needed.
+        #
+        # If a future case shows we DO need acceleration, the right design
+        # is mid-based pnl (not bid-vs-entry) + a much longer staleness
+        # threshold (30+ min) + a deeper trigger (-15% mid).
 
         # Trailing stop (kept as a safety net; ratchet usually fires first)
         tr = trailing_stop_state(entry, peak, mark)
